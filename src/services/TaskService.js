@@ -1,0 +1,282 @@
+const { v4: uuidv4 } = require('uuid');
+const { Op } = require('sequelize');
+const db = require('../models');
+const { TASK_STATUS } = require('../config/constants');
+const NotificationService = require('./NotificationService');
+const EmailService = require('./EmailService');
+const { computeReminderAt } = require('../utils/taskDates');
+
+/** Deep-link payload for Header → `/projects/:id?task=` (projectId + taskId). */
+function taskNotifyRef(projectId, taskId) {
+  return { refTable: 'project_tasks', refId: `${projectId}:${taskId}` };
+}
+
+// TODO/IN_PROGRESS/REJECTED can also go straight to DONE — ad-hoc tasks (type
+// 'issue') don't need the submit->review pipeline, they're a single owner marking
+// their own work complete. The submit/review chain stays available for tasks that
+// do use it (a reviewerId is set).
+const VALID_TRANSITIONS = {
+  [TASK_STATUS.TODO]: [TASK_STATUS.IN_PROGRESS, TASK_STATUS.SUBMITTED, TASK_STATUS.DONE],
+  [TASK_STATUS.IN_PROGRESS]: [TASK_STATUS.SUBMITTED, TASK_STATUS.DONE],
+  // Content submit lands on "submitted"; strategist approve/reject can go straight
+  // from there (or via in_review). Done→approved heals older content tasks that
+  // were closed on submit before approval existed as a task status.
+  [TASK_STATUS.SUBMITTED]: [TASK_STATUS.IN_REVIEW, TASK_STATUS.APPROVED, TASK_STATUS.REJECTED],
+  [TASK_STATUS.IN_REVIEW]: [TASK_STATUS.APPROVED, TASK_STATUS.REJECTED, TASK_STATUS.DONE],
+  // After reject, assignee can reopen (in_progress) or resubmit straight to review.
+  [TASK_STATUS.REJECTED]: [TASK_STATUS.IN_PROGRESS, TASK_STATUS.SUBMITTED, TASK_STATUS.DONE],
+  [TASK_STATUS.APPROVED]: [TASK_STATUS.DONE],
+  [TASK_STATUS.DONE]: [TASK_STATUS.APPROVED],
+};
+
+class TaskService {
+  async listForProject(projectId, orgId, stageKey, type) {
+    const where = { projectId };
+    if (type) {
+      where.type = type;
+    } else if (stageKey) {
+      // Current-stage workflow tasks + all ad-hoc issues (so "Add Task" items
+      // stay visible inside the project even after the stage advances).
+      where[Op.or] = [
+        { stageKey },
+        { type: 'issue' },
+      ];
+    }
+    return db.Task.findAll({
+      where,
+      include: [
+        { model: db.User, as: 'assignee', attributes: ['id', 'name', 'avatarUrl'] },
+        { model: db.User, as: 'reviewer', attributes: ['id', 'name', 'avatarUrl'] },
+        { model: db.User, as: 'creator', attributes: ['id', 'name'] },
+      ],
+      order: type ? [['createdAt', 'DESC']] : [['createdAt', 'ASC']],
+    });
+  }
+
+  async getById(taskId, orgId, projectId) {
+    const task = await db.Task.findOne({
+      where: { id: taskId, orgId, projectId },
+      include: [
+        { model: db.User, as: 'assignee', attributes: ['id', 'name', 'avatarUrl'] },
+        { model: db.User, as: 'reviewer', attributes: ['id', 'name', 'avatarUrl'] },
+        { model: db.User, as: 'creator', attributes: ['id', 'name'] },
+        {
+          model: db.Project,
+          as: 'project',
+          attributes: ['id', 'name', 'currentStageKey'],
+          include: [{ model: db.Client, as: 'client', attributes: ['id', 'name'] }],
+        },
+        {
+          model: db.TaskEvent,
+          as: 'events',
+          include: [{ model: db.User, as: 'actor', attributes: ['id', 'name'] }],
+          separate: true,
+          order: [['createdAt', 'ASC'], ['id', 'ASC']],
+        },
+      ],
+    });
+    if (!task) {
+      const err = new Error('Task not found.');
+      err.status = 404;
+      throw err;
+    }
+    return task;
+  }
+
+  async create(orgId, projectId, data, createdBy) {
+    const project = await db.Project.findOne({ where: { id: projectId, orgId } });
+    if (!project) {
+      const err = new Error('Project not found.');
+      err.status = 404;
+      throw err;
+    }
+
+    const remarks = data.remarks != null ? String(data.remarks).trim() || null : null;
+    // Manual reminder dates are ignored — always auto 24h before due date.
+    const reminderAt = computeReminderAt(data.dueAt);
+
+    // Assigner (User A) becomes the reviewer when they hand work to someone else
+    // (User B). Self-assigned / unassigned tasks skip the review pipeline.
+    let reviewerId = data.reviewerId || null;
+    if (!reviewerId && data.assigneeId && data.assigneeId !== createdBy) {
+      reviewerId = createdBy;
+    }
+
+    const task = await db.Task.create({
+      id: uuidv4(),
+      orgId,
+      projectId,
+      stageKey: data.stageKey || project.currentStageKey,
+      type: data.type,
+      title: data.title,
+      assigneeId: data.assigneeId,
+      reviewerId,
+      dueAt: data.dueAt || null,
+      remarks,
+      reminderAt,
+      pageName: data.pageName,
+      createdBy,
+      // New tasks always start as todo — status advances via transitions.
+      status: TASK_STATUS.TODO,
+    });
+
+    // Notify the assignee — email + in-app, fire-and-forget (mirrors the
+    // project-assignment notification pattern in ProjectController#setAssignment).
+    if (task.assigneeId) {
+      db.User.findByPk(task.assigneeId).then((assignee) => {
+        if (!assignee) return;
+        if (assignee.email) {
+          EmailService.sendTaskAssigned(assignee.email, assignee.name, task.title, project.name, task.dueAt);
+        }
+        const parts = [`You've been assigned a task on ${project.name}.`, 'Status: To do.'];
+        if (task.dueAt) parts.push(`Due ${task.dueAt}.`);
+        if (task.reminderAt) parts.push(`Auto reminder on ${task.reminderAt} (24h before due).`);
+        if (remarks) parts.push(`Remarks: ${remarks.length > 120 ? `${remarks.slice(0, 120)}…` : remarks}`);
+        NotificationService.notify(assignee.id, orgId, {
+          type: 'task_assigned',
+          title: `New task assigned: "${task.title}"`,
+          body: parts.join(' '),
+          ...taskNotifyRef(project.id, task.id),
+        });
+      }).catch(() => {});
+    }
+
+    return this.getById(task.id, orgId, projectId);
+  }
+
+  async transition(taskId, orgId, newStatus, actor, reasonCategory, note) {
+    const task = await db.Task.findOne({
+      where: { id: taskId, orgId },
+      include: [
+        { model: db.User, as: 'assignee', attributes: ['id', 'name'] },
+        { model: db.User, as: 'reviewer', attributes: ['id', 'name'] },
+      ],
+    });
+    if (!task) {
+      const err = new Error('Task not found.');
+      err.status = 404;
+      throw err;
+    }
+
+    const allowed = VALID_TRANSITIONS[task.status] || [];
+    if (!allowed.includes(newStatus)) {
+      const err = new Error(`Cannot transition from "${task.status}" to "${newStatus}".`);
+      err.status = 400;
+      throw err;
+    }
+
+    const isAdmin = ['super_admin', 'admin'].includes(actor?.role?.key)
+      || !!actor?.role?.permissions?.['projects.manage'];
+    // Heal older tasks created before assigner was auto-set as reviewer.
+    if (!task.reviewerId && task.createdBy && task.assigneeId && task.createdBy !== task.assigneeId) {
+      await task.update({ reviewerId: task.createdBy });
+    }
+    const effectiveReviewerId = task.reviewerId || task.createdBy || null;
+    const usesReviewPipeline = !!(effectiveReviewerId && task.assigneeId && effectiveReviewerId !== task.assigneeId);
+
+    // Submit: assignee (or admin). Approve/reject: reviewer / assigner / admin.
+    if (newStatus === TASK_STATUS.SUBMITTED && usesReviewPipeline) {
+      if (!isAdmin && task.assigneeId !== actor.id) {
+        const err = new Error('Only the assignee can submit this task for review.');
+        err.status = 403;
+        throw err;
+      }
+    }
+    // Assigned tasks with a separate reviewer must go submit → approve, not skip
+    // straight to done (self-assigned / no-reviewer tasks still can).
+    if (newStatus === TASK_STATUS.DONE && usesReviewPipeline && !isAdmin) {
+      const err = new Error('Submit this task for review first — it has a separate reviewer.');
+      err.status = 400;
+      throw err;
+    }
+
+    if ([TASK_STATUS.APPROVED, TASK_STATUS.REJECTED].includes(newStatus) && usesReviewPipeline) {
+      if (!isAdmin && effectiveReviewerId !== actor.id) {
+        // Strategist/PM on the project may also review (content/blog parity).
+        const assignment = await db.ProjectAssignment.findOne({
+          where: {
+            projectId: task.projectId,
+            userId: actor.id,
+            roleSlot: { [db.Sequelize.Op.in]: ['project_strategist', 'project_manager'] },
+          },
+        });
+        if (!assignment) {
+          const err = new Error('Only the assigner/reviewer can approve or request changes on this task.');
+          err.status = 403;
+          throw err;
+        }
+      }
+      if (task.assigneeId === actor.id && !isAdmin) {
+        const err = new Error('You cannot approve or reject your own submission.');
+        err.status = 400;
+        throw err;
+      }
+    }
+
+    await db.sequelize.transaction(async (t) => {
+      await db.TaskEvent.create({
+        id: uuidv4(),
+        taskId: task.id,
+        fromStatus: task.status,
+        toStatus: newStatus,
+        actorUserId: actor.id,
+        reasonCategory,
+        note,
+      }, { transaction: t });
+
+      const update = { status: newStatus };
+      if (newStatus === TASK_STATUS.DONE || newStatus === TASK_STATUS.APPROVED) {
+        update.completedAt = new Date();
+      }
+      await task.update(update, { transaction: t });
+    });
+
+    // Fire-and-forget in-app notifications
+    if (newStatus === TASK_STATUS.SUBMITTED || newStatus === TASK_STATUS.IN_REVIEW) {
+      const notifyReviewers = async () => {
+        const ids = new Set();
+        if (task.reviewerId) ids.add(task.reviewerId);
+        else if (task.createdBy) ids.add(task.createdBy);
+        if (!ids.size || task.type === 'blog_post' || task.type === 'content') {
+          const slots = await db.ProjectAssignment.findAll({
+            where: {
+              projectId: task.projectId,
+              roleSlot: { [db.Sequelize.Op.in]: ['project_strategist', 'project_manager'] },
+            },
+            attributes: ['userId'],
+          });
+          for (const a of slots) if (a.userId) ids.add(a.userId);
+        }
+        for (const userId of ids) {
+          if (userId === actor.id) continue;
+          NotificationService.notify(userId, orgId, {
+            type: 'task_submitted',
+            title: `Task ready for review: "${task.title}"`,
+            body: task.type === 'blog_post'
+              ? 'A blog post was submitted and is waiting for your review.'
+              : `${task.assignee?.name || 'Assignee'} submitted work and is waiting for your review.`,
+            ...taskNotifyRef(task.projectId, task.id),
+          });
+        }
+      };
+      notifyReviewers().catch(() => {});
+    } else if ([TASK_STATUS.APPROVED, TASK_STATUS.REJECTED].includes(newStatus) && task.assigneeId) {
+      NotificationService.notify(task.assigneeId, orgId, {
+        type: 'task_update',
+        title: newStatus === TASK_STATUS.APPROVED
+          ? `Task approved: "${task.title}"`
+          : `Changes requested: "${task.title}"`,
+        body: note
+          ? `Reviewer note: ${note}`
+          : (newStatus === TASK_STATUS.APPROVED
+            ? 'Your task was approved.'
+            : 'Your task was sent back — please revise and resubmit.'),
+        ...taskNotifyRef(task.projectId, task.id),
+      });
+    }
+
+    return task.reload();
+  }
+}
+
+module.exports = new TaskService();

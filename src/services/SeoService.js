@@ -1,0 +1,1874 @@
+const xlsx = require('xlsx');
+const { Op } = require('sequelize');
+const { Keyword, Backlink, ContentSubmission, BlogTask, RankSnapshot, Project, Client, WhiteLabelConfig, Task, User, Role, Stage, ProjectAssignment } = require('../models');
+const { createPdfBuffer, drawTable, drawFooter, BRAND_COLOR } = require('./PdfService');
+const { letterheadForOrg, loadLetterheadLogo, drawPdfKitLetterhead } = require('./letterhead');
+const TaskService = require('./TaskService');
+const NotificationService = require('./NotificationService');
+const { performAction } = require('../workflow/engine');
+
+function assertProjectAccess(projectId, orgId) {
+  return Project.findOne({ where: { id: projectId, orgId } }).then((p) => {
+    if (!p) throw Object.assign(new Error('Project not found'), { status: 404 });
+    return p;
+  });
+}
+
+function normName(value) {
+  return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function cell(row, ...keys) {
+  for (const key of keys) {
+    if (row[key] != null && String(row[key]).trim() !== '') return row[key];
+  }
+  // Case-insensitive fallback for sheets with odd header casing
+  const map = Object.fromEntries(
+    Object.entries(row || {}).map(([k, v]) => [String(k).trim().toLowerCase(), v]),
+  );
+  for (const key of keys) {
+    const v = map[String(key).trim().toLowerCase()];
+    if (v != null && String(v).trim() !== '') return v;
+  }
+  return null;
+}
+
+// Reads a numeric sheet cell exactly as the file has it.
+//
+// The old `parseInt(cell(...) || 0, 10) || null` lost real data three ways:
+//   • a genuine 0 (KD 0, Volume 0) became null and printed as "—";
+//   • the "<10" / "0-10" / "10-100" buckets that Ahrefs and Semrush export for
+//     low-volume keywords hit `parseInt("<10") === NaN` and vanished entirely;
+//   • abbreviated volumes ("1.2K", "3M") and thousands separators ("1,300")
+//     parsed as 1, 3 and 1 respectively.
+// Now a leading comparison operator is dropped, a range takes its first bound,
+// separators are stripped, K/M suffixes are expanded, and 0 survives.
+function sheetNumber(raw) {
+  if (raw == null) return null;
+  if (typeof raw === 'number') return Number.isFinite(raw) ? Math.round(raw) : null;
+
+  let s = String(raw).trim();
+  if (!s || s === '-' || s === '—' || s === 'n/a' || s.toLowerCase() === 'na') return null;
+
+  s = s.replace(/^[<>~≈≤≥]+\s*/, '');            // "<10" → "10"
+  s = s.split(/\s*[-–—]\s*/)[0] || s;             // "10-100" → "10"
+  s = s.replace(/,/g, '').replace(/\s+/g, '');    // "1,300" → "1300"
+
+  const match = s.match(/^(\d+(?:\.\d+)?)([kKmM]?)/);
+  if (!match) return null;
+  const value = parseFloat(match[1]);
+  if (!Number.isFinite(value)) return null;
+  const multiplier = match[2].toLowerCase() === 'k' ? 1000 : match[2].toLowerCase() === 'm' ? 1000000 : 1;
+  return Math.round(value * multiplier);
+}
+
+async function ensureContentTask(orgId, project, pageName, assigneeId, actorUserId) {
+  if (!assigneeId || !pageName) return;
+  const existing = await Task.findOne({
+    where: {
+      projectId: project.id,
+      type: 'content',
+      pageName,
+      assigneeId,
+      status: { [Op.notIn]: ['done', 'approved'] },
+    },
+  });
+  if (existing) return;
+  await TaskService.create(orgId, project.id, {
+    type: 'content',
+    title: `Write content — ${pageName}`,
+    assigneeId,
+    pageName,
+    stageKey: project.currentStageKey,
+  }, actorUserId);
+}
+
+/** Same pipeline as content — blog sheet rows get a writer Task (type blog_post). */
+async function ensureBlogTask(orgId, project, title, assigneeId, actorUserId) {
+  if (!assigneeId || !title) return;
+  const existing = await Task.findOne({
+    where: {
+      projectId: project.id,
+      type: 'blog_post',
+      pageName: title,
+      assigneeId,
+      status: { [Op.notIn]: ['done', 'approved'] },
+    },
+  });
+  if (existing) return existing;
+  return TaskService.create(orgId, project.id, {
+    type: 'blog_post',
+    title: `Write blog — ${title}`,
+    assigneeId,
+    pageName: title,
+    stageKey: project.currentStageKey,
+  }, actorUserId);
+}
+
+async function markBlogTasksSubmitted(orgId, projectId, title, assigneeId, actorUserId) {
+  if (!assigneeId || !title) return;
+  const openTasks = await Task.findAll({
+    where: {
+      projectId,
+      type: 'blog_post',
+      pageName: title,
+      assigneeId,
+      status: { [Op.in]: ['todo', 'in_progress', 'rejected'] },
+    },
+  });
+  for (const task of openTasks) {
+    try {
+      if (task.status === 'rejected') {
+        await TaskService.transition(task.id, orgId, 'in_progress', { id: actorUserId }, null, 'Blog resubmitted.');
+      }
+      await TaskService.transition(task.id, orgId, 'submitted', { id: actorUserId }, null, 'Blog submitted.');
+    } catch (err) {
+      console.error('[SeoService] Failed to mark blog task submitted:', err.message);
+    }
+  }
+}
+
+// Name → userId map for resolving a sheet's "Writer" column, restricted to the
+// same role pool the matching UI dropdown offers. Shared by the keyword and
+// backlink imports so a name that resolves in one resolves in the other.
+async function buildWriterLookup(orgId, roleKeys) {
+  const users = await User.findAll({
+    where: { orgId, isActive: true },
+    include: [{ model: Role, as: 'role', attributes: [], where: { key: roleKeys } }],
+    attributes: ['id', 'name'],
+  });
+  const byName = new Map();
+  for (const u of users) {
+    const key = normName(u.name);
+    if (key && !byName.has(key)) byName.set(key, u.id);
+  }
+  return byName;
+}
+
+async function nextSortOrder(Model, projectId) {
+  const max = await Model.max('sortOrder', { where: { projectId } });
+  return (Number.isFinite(max) ? max : -1) + 1;
+}
+
+const SHEET_ORDER = [['sortOrder', 'ASC'], ['createdAt', 'ASC']];
+
+// ─── Keywords ─────────────────────────────────────────────────────────────────
+
+// Deactivated ("deleted") rows are hidden unless the caller opts in with
+// includeInactive — see services/SoftDeleteService.js.
+async function listKeywords(projectId, orgId, { includeInactive = false } = {}) {
+  await assertProjectAccess(projectId, orgId);
+  return Keyword.findAll({
+    where: { projectId, ...(includeInactive ? {} : { status: 'active' }) },
+    include: [{ association: 'assignedWriter', attributes: ['id', 'name'] }],
+    order: SHEET_ORDER,
+  });
+}
+
+function normalizeKeywordStatus(raw) {
+  const v = String(raw ?? '').trim().toLowerCase();
+  if (['inactive', 'off', 'disabled', 'paused'].includes(v)) return 'inactive';
+  if (['active', 'on', 'enabled'].includes(v) || !v) return 'active';
+  return null;
+}
+
+async function createKeyword(data, orgId) {
+  const project = await assertProjectAccess(data.projectId, orgId);
+  const sortOrder = data.sortOrder != null ? data.sortOrder : await nextSortOrder(Keyword, data.projectId);
+  const status = normalizeKeywordStatus(data.status) || 'active';
+  const kw = await Keyword.create({ ...data, status, sortOrder });
+
+  // Assigning a writer at creation time should spin up their content task too,
+  // same as assigning one later via updateKeyword or via bulk import.
+  if (kw.assignedWriterId) {
+    const pageName = kw.pageName || kw.primaryKeyword;
+    await ensureContentTask(orgId, project, pageName, kw.assignedWriterId, data.createdBy);
+  }
+  return kw;
+}
+
+async function bulkImportKeywords(projectId, orgId, fileBuffer, createdBy) {
+  const project = await assertProjectAccess(projectId, orgId);
+  const wb = xlsx.read(fileBuffer, { type: 'buffer' });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = xlsx.utils.sheet_to_json(ws, { defval: null });
+
+  const writerByName = await buildWriterLookup(orgId, ['content_writer']);
+
+  let sortOrder = await nextSortOrder(Keyword, projectId);
+  const records = rows.map((row) => {
+    const primaryKeyword = String(cell(row, 'Keyword', 'Primary Keyword') || '').trim();
+    if (!primaryKeyword) return null;
+
+    const writerName = cell(row, 'Writer', 'Assigned Writer', 'Content Writer', 'Assignee');
+    const assignedWriterId = writerName ? (writerByName.get(normName(writerName)) || null) : null;
+
+    const record = {
+      projectId,
+      primaryKeyword,
+      secondaryKeywords: cell(row, 'Secondary Keywords', 'secondary_keywords') || null,
+      kd: sheetNumber(cell(row, 'KD', 'kd')),
+      volume: sheetNumber(cell(row, 'Volume', 'volume', 'Search Volume', 'Vol')),
+      targetUrl: cell(row, 'URL', 'Target URL', 'url') || null,
+      targetLocation: cell(row, 'Target Location', 'target_location', 'Location') || null,
+      pageName: cell(row, 'Page', 'Page Name', 'Target Page') || null,
+      status: normalizeKeywordStatus(cell(row, 'Status', 'status')) || 'active',
+      assignedWriterId,
+      createdBy,
+      sortOrder,
+    };
+    sortOrder += 1;
+    return record;
+  }).filter(Boolean);
+
+  const created = await Keyword.bulkCreate(records, { validate: true });
+
+  // Spin up one content task per unique page+writer (same as manual assign).
+  const taskKeys = new Set();
+  for (const rec of records) {
+    if (!rec.assignedWriterId) continue;
+    const pageName = rec.pageName || rec.primaryKeyword;
+    const key = `${rec.assignedWriterId}::${pageName}`;
+    if (taskKeys.has(key)) continue;
+    taskKeys.add(key);
+    await ensureContentTask(orgId, project, pageName, rec.assignedWriterId, createdBy);
+  }
+
+  return created;
+}
+
+async function updateKeyword(id, updates, orgId, actorUserId) {
+  const kw = await Keyword.findOne({
+    where: { id },
+    include: [{ model: Project, as: 'project', where: { orgId }, attributes: ['id', 'currentStageKey'] }],
+  });
+  if (!kw) throw Object.assign(new Error('Keyword not found'), { status: 404 });
+
+  const patch = { ...updates };
+  if (Object.prototype.hasOwnProperty.call(patch, 'status')) {
+    const normalized = normalizeKeywordStatus(patch.status);
+    if (!normalized) {
+      throw Object.assign(new Error('Status must be "active" or "inactive".'), { status: 400 });
+    }
+    patch.status = normalized;
+  }
+
+  const assigningWriter = patch.assignedWriterId && patch.assignedWriterId !== kw.assignedWriterId;
+  await kw.update(patch);
+
+  // Assigning a writer spins up their content-writing task for this page — unless
+  // they already have one open for it (re-assigning the same page's other keywords
+  // to the same writer shouldn't spam duplicate tasks).
+  if (assigningWriter) {
+    const pageName = kw.pageName || kw.primaryKeyword;
+    await ensureContentTask(orgId, kw.project, pageName, patch.assignedWriterId, actorUserId);
+  }
+  return kw;
+}
+
+async function keywordHasApprovedContent(keywordId, projectId) {
+  const rows = await ContentSubmission.findAll({
+    where: { projectId },
+    attributes: ['keywordIds', 'status', 'pageName', 'submittedBy', 'createdAt', 'revisionNumber'],
+    order: [['createdAt', 'DESC'], ['revisionNumber', 'DESC']],
+  });
+  // Latest submission per page+writer only — a reopen that flipped/left a
+  // rejected revise must not leave an older Approved still locking the keyword.
+  const seen = new Set();
+  for (const cs of rows) {
+    if (cs.status === 'superseded') continue;
+    const key = `${cs.pageName || ''}::${cs.submittedBy || ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (cs.status === 'approved' && (cs.keywordIds || []).includes(keywordId)) return true;
+  }
+  return false;
+}
+
+// A keyword is locked from deletion once it's handed to a writer — not just
+// once its content is approved. Assigning a writer means work may already be
+// underway (or a task already exists for it); pulling the keyword out from
+// under that mid-flight, before anything's even been submitted, would orphan
+// their work. Only unassigned keywords stay freely deletable.
+async function lockedKeywordIdSet(projectId) {
+  const [assigned, submissions] = await Promise.all([
+    Keyword.findAll({ where: { projectId, assignedWriterId: { [Op.ne]: null } }, attributes: ['id'] }),
+    ContentSubmission.findAll({
+      where: { projectId },
+      attributes: ['keywordIds', 'status', 'pageName', 'submittedBy', 'createdAt', 'revisionNumber'],
+      order: [['createdAt', 'DESC'], ['revisionNumber', 'DESC']],
+    }),
+  ]);
+  const ids = new Set(assigned.map((k) => k.id));
+  const seen = new Set();
+  for (const cs of submissions) {
+    if (cs.status === 'superseded') continue;
+    const key = `${cs.pageName || ''}::${cs.submittedBy || ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (cs.status !== 'approved') continue;
+    for (const kid of cs.keywordIds || []) ids.add(kid);
+  }
+  return ids;
+}
+
+// Deactivates rather than destroys — nothing in the CRM is hard-deleted (see
+// services/SoftDeleteService.js). Keyword already modelled this as its
+// status ENUM: inactive keywords stay on the sheet with their rank history
+// intact but drop out of the content pool and the default listing.
+async function deleteKeyword(id, orgId) {
+  const kw = await Keyword.findOne({
+    where: { id },
+    include: [{ model: Project, as: 'project', where: { orgId }, attributes: [] }],
+  });
+  if (!kw) throw Object.assign(new Error('Keyword not found'), { status: 404 });
+  if (kw.assignedWriterId) {
+    throw Object.assign(new Error('This keyword is assigned to a content writer and cannot be set to Inactive.'), { status: 400 });
+  }
+  if (await keywordHasApprovedContent(kw.id, kw.projectId)) {
+    throw Object.assign(new Error('This keyword has approved content and cannot be set to Inactive.'), { status: 400 });
+  }
+  await kw.update({ status: 'inactive' });
+  return kw;
+}
+
+/** Deactivate unassigned keywords only — assigned or approved-content keywords are kept. */
+async function clearKeywords(projectId, orgId) {
+  await assertProjectAccess(projectId, orgId);
+  const protectedIds = await lockedKeywordIdSet(projectId);
+  const keywords = await Keyword.findAll({ where: { projectId, status: 'active' }, attributes: ['id'] });
+  const deactivatableIds = keywords.map((k) => k.id).filter((id) => !protectedIds.has(id));
+  if (deactivatableIds.length) {
+    await Keyword.update({ status: 'inactive' }, { where: { id: deactivatableIds, projectId } });
+  }
+  return { deleted: deactivatableIds.length, deactivated: deactivatableIds.length, kept: protectedIds.size };
+}
+
+async function bulkDeleteKeywords(projectId, orgId, ids) {
+  await assertProjectAccess(projectId, orgId);
+  const idList = Array.isArray(ids) ? [...new Set(ids.filter(Boolean))] : [];
+  if (!idList.length) {
+    throw Object.assign(new Error('No keyword IDs provided.'), { status: 400 });
+  }
+  if (idList.length > 200) {
+    throw Object.assign(new Error('You can change at most 200 keywords at a time.'), { status: 400 });
+  }
+
+  const protectedIds = await lockedKeywordIdSet(projectId);
+  const rows = await Keyword.findAll({
+    where: { id: idList, projectId },
+    attributes: ['id'],
+  });
+  const found = new Set(rows.map((r) => r.id));
+  const deleted = [];
+  const skipped = [];
+
+  for (const id of idList) {
+    if (!found.has(id)) {
+      skipped.push({ id, reason: 'not_found' });
+      continue;
+    }
+    if (protectedIds.has(id)) {
+      skipped.push({ id, reason: 'assigned_or_approved' });
+      continue;
+    }
+    deleted.push(id);
+  }
+
+  if (deleted.length) {
+    await Keyword.update({ status: 'inactive' }, { where: { id: deleted, projectId } });
+  }
+  return { deleted: deleted.length, deactivated: deleted.length, skipped };
+}
+
+// ─── Rank Snapshots ───────────────────────────────────────────────────────────
+
+function todayDateOnly() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+// `orgId` and `projectId` are NOT NULL on rank_snapshots but were never being
+// set here, so every write through this path failed at the DB. Both are read
+// off the keyword's own project.
+async function addRankSnapshot(keywordId, position, checkedAt, orgId) {
+  const kw = await Keyword.findOne({
+    where: { id: keywordId },
+    include: [{ model: Project, as: 'project', where: { orgId }, attributes: ['id'] }],
+  });
+  if (!kw) throw Object.assign(new Error('Keyword not found'), { status: 404 });
+  return upsertRankSnapshot({
+    orgId,
+    projectId: kw.projectId,
+    keywordId,
+    date: toDateOnlyString(checkedAt) || todayDateOnly(),
+    position,
+  });
+}
+
+function toDateOnlyString(value) {
+  if (!value) return null;
+  if (typeof value === 'string') return value.slice(0, 10);
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString().slice(0, 10);
+  return null;
+}
+
+// One position per keyword per date per engine — re-recording the same report
+// date corrects the existing row rather than stacking duplicates, so a typo can
+// simply be re-entered.
+async function upsertRankSnapshot({ orgId, projectId, keywordId, date, position, url, searchEngine = 'google' }) {
+  const where = { projectId, keywordId, date, searchEngine };
+  const existing = await RankSnapshot.findOne({ where });
+  if (existing) {
+    await existing.update({ position, ...(url !== undefined ? { url } : {}) });
+    return existing;
+  }
+  return RankSnapshot.create({ orgId, projectId, keywordId, date, position, url, searchEngine });
+}
+
+// ─── Monthly Reporting ────────────────────────────────────────────────────────
+//
+// The Monthly Report stage needs a rank-tracking grid: every active keyword down
+// the side, every date the project was checked across the top, and the position
+// recorded in each cell. Returns exactly that, plus the movement between the two
+// most recent report dates so a strategist can see at a glance what improved.
+
+async function listRankings(projectId, orgId, { from, to } = {}) {
+  await assertProjectAccess(projectId, orgId);
+
+  const where = { projectId };
+  if (from && to) where.date = { [Op.between]: [String(from).slice(0, 10), String(to).slice(0, 10)] };
+  else if (from) where.date = { [Op.gte]: String(from).slice(0, 10) };
+  else if (to) where.date = { [Op.lte]: String(to).slice(0, 10) };
+
+  const [keywords, snapshots] = await Promise.all([
+    Keyword.findAll({
+      where: { projectId, status: 'active' },
+      attributes: ['id', 'primaryKeyword', 'pageName', 'targetUrl', 'volume', 'kd'],
+      order: SHEET_ORDER,
+    }),
+    RankSnapshot.findAll({ where, order: [['date', 'ASC']] }),
+  ]);
+
+  const dates = [...new Set(snapshots.map((s) => String(s.date).slice(0, 10)))].sort();
+  const byKeyword = new Map();
+  for (const s of snapshots) {
+    if (!byKeyword.has(s.keywordId)) byKeyword.set(s.keywordId, {});
+    byKeyword.get(s.keywordId)[String(s.date).slice(0, 10)] = s.position;
+  }
+
+  const latest = dates[dates.length - 1] || null;
+  const previous = dates[dates.length - 2] || null;
+
+  const rows = keywords.map((k) => {
+    const positions = byKeyword.get(k.id) || {};
+    const latestPos = latest != null ? (positions[latest] ?? null) : null;
+    const prevPos = previous != null ? (positions[previous] ?? null) : null;
+    return {
+      keywordId: k.id,
+      primaryKeyword: k.primaryKeyword,
+      pageName: k.pageName,
+      targetUrl: k.targetUrl,
+      volume: k.volume,
+      kd: k.kd,
+      positions,
+      latestPosition: latestPos,
+      previousPosition: prevPos,
+      // Positive = moved up the results (rank number got smaller).
+      change: latestPos != null && prevPos != null ? prevPos - latestPos : null,
+    };
+  });
+
+  return { dates, rows, latestDate: latest, previousDate: previous };
+}
+
+/**
+ * Records one report date's positions in a single call:
+ *   { date, entries: [{ keywordId, position, url? }] }
+ * A null/blank position means "not ranking on this date" and is stored as such
+ * (rather than skipped), so the grid can distinguish "checked, not found" from
+ * "never checked".
+ */
+async function recordRankings(projectId, orgId, { date, entries, searchEngine = 'google' }) {
+  await assertProjectAccess(projectId, orgId);
+
+  const day = toDateOnlyString(date) || todayDateOnly();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+    throw Object.assign(new Error('A valid report date (YYYY-MM-DD) is required.'), { status: 400 });
+  }
+  const list = Array.isArray(entries) ? entries : [];
+  if (!list.length) {
+    throw Object.assign(new Error('No rankings provided.'), { status: 400 });
+  }
+
+  // Only keywords that actually belong to this project may be written to.
+  const valid = new Set(
+    (await Keyword.findAll({ where: { projectId }, attributes: ['id'] })).map((k) => k.id)
+  );
+
+  let saved = 0;
+  for (const entry of list) {
+    if (!valid.has(entry.keywordId)) continue;
+    const raw = entry.position;
+    const position = raw === '' || raw == null ? null : parseInt(raw, 10);
+    if (position != null && (Number.isNaN(position) || position < 0)) {
+      throw Object.assign(
+        new Error(`Position must be a positive number (got "${raw}").`), { status: 400 }
+      );
+    }
+    await upsertRankSnapshot({
+      orgId, projectId, keywordId: entry.keywordId, date: day, position,
+      url: entry.url ?? undefined, searchEngine,
+    });
+    saved += 1;
+  }
+  return { date: day, saved };
+}
+
+/** Removes one whole report date — used to undo a mis-dated entry. */
+async function deleteRankingDate(projectId, orgId, date) {
+  await assertProjectAccess(projectId, orgId);
+  const day = toDateOnlyString(date);
+  if (!day) throw Object.assign(new Error('A report date is required.'), { status: 400 });
+  const deleted = await RankSnapshot.destroy({ where: { projectId, date: day } });
+  return { date: day, deleted };
+}
+
+/**
+ * Imports a report date's positions from a sheet. Matches rows to keywords by
+ * the "Keyword" column (case/spacing-insensitive); the report date comes either
+ * from a "Date" column per row or from the `date` argument for the whole file.
+ */
+async function bulkImportRankings(projectId, orgId, fileBuffer, fallbackDate) {
+  await assertProjectAccess(projectId, orgId);
+  const wb = xlsx.read(fileBuffer, { type: 'buffer', cellDates: true });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = xlsx.utils.sheet_to_json(ws, { defval: null });
+  if (!rows.length) {
+    throw Object.assign(new Error('The file has no data rows.'), { status: 400 });
+  }
+
+  const keywords = await Keyword.findAll({ where: { projectId }, attributes: ['id', 'primaryKeyword'] });
+  const byName = new Map();
+  for (const k of keywords) {
+    const key = normName(k.primaryKeyword);
+    if (key && !byName.has(key)) byName.set(key, k.id);
+  }
+
+  const errors = [];
+  const writes = [];
+  const unmatched = [];
+
+  rows.forEach((row, index) => {
+    const rowNum = index + 2;
+    const name = cell(row, 'Keyword', 'Primary Keyword', 'keyword');
+    if (!name) {
+      if (rowHasData(row)) errors.push(`Row ${rowNum}: "Keyword" is required.`);
+      return;
+    }
+    const keywordId = byName.get(normName(name));
+    if (!keywordId) { unmatched.push(String(name).trim()); return; }
+
+    const dateCell = cell(row, 'Date', 'Report Date', 'date');
+    let day = toDateOnlyString(fallbackDate);
+    if (dateCell != null) {
+      const parsed = parseSheetDate(dateCell);
+      if (parsed.error) { errors.push(`Row ${rowNum}: Date — ${parsed.error}.`); return; }
+      day = parsed.value || day;
+    }
+    if (!day) { errors.push(`Row ${rowNum}: no report date — add a "Date" column or pick one above.`); return; }
+
+    const posRaw = cell(row, 'Position', 'Rank', 'position', 'rank');
+    const position = posRaw == null ? null : sheetNumber(posRaw);
+    writes.push({ keywordId, date: day, position, url: cell(row, 'URL', 'Ranking URL', 'url') || undefined });
+  });
+
+  if (errors.length) throw importValidationError(errors);
+  if (!writes.length) {
+    throw Object.assign(new Error(
+      'No rows matched a keyword on this project. Make sure the sheet has a "Keyword" column whose values match the project\'s keywords.'
+    ), { status: 400 });
+  }
+
+  for (const w of writes) {
+    await upsertRankSnapshot({ orgId, projectId, ...w });
+  }
+  return { imported: writes.length, unmatchedCount: unmatched.length, unmatched: unmatched.slice(0, 20) };
+}
+
+// ─── Backlinks ────────────────────────────────────────────────────────────────
+
+async function listBacklinks(projectId, orgId, { includeInactive = false } = {}) {
+  await assertProjectAccess(projectId, orgId);
+  return Backlink.findAll({
+    where: { projectId, ...(includeInactive ? {} : { isActive: true }) },
+    include: [{ association: 'assignedWriter', attributes: ['id', 'name'] }],
+    order: SHEET_ORDER,
+  });
+}
+
+async function createBacklink(data, orgId) {
+  await assertProjectAccess(data.projectId, orgId);
+  const sortOrder = data.sortOrder != null ? data.sortOrder : await nextSortOrder(Backlink, data.projectId);
+  return Backlink.create({ ...data, sortOrder });
+}
+
+async function updateBacklink(id, updates, orgId) {
+  const bl = await Backlink.findOne({
+    where: { id },
+    include: [{ model: Project, as: 'project', where: { orgId }, attributes: [] }],
+  });
+  if (!bl) throw Object.assign(new Error('Backlink not found'), { status: 404 });
+  return bl.update(updates);
+}
+
+// Deactivates rather than destroys — see services/SoftDeleteService.js.
+async function deleteBacklink(id, orgId) {
+  const bl = await Backlink.findOne({
+    where: { id },
+    include: [{ model: Project, as: 'project', where: { orgId }, attributes: [] }],
+  });
+  if (!bl) throw Object.assign(new Error('Backlink not found'), { status: 404 });
+  if (bl.isIndexed) {
+    throw Object.assign(new Error('Indexed backlinks cannot be set to Inactive.'), { status: 400 });
+  }
+  await bl.update({ isActive: false });
+  return bl;
+}
+
+/** Deactivate non-indexed backlinks only — indexed rows are kept. */
+async function clearBacklinks(projectId, orgId) {
+  await assertProjectAccess(projectId, orgId);
+  const [deleted] = await Backlink.update(
+    { isActive: false },
+    { where: { projectId, isIndexed: false, isActive: true } },
+  );
+  const kept = await Backlink.count({ where: { projectId, isIndexed: true } });
+  return { deleted, deactivated: deleted, kept };
+}
+
+async function bulkDeleteBacklinks(projectId, orgId, ids) {
+  await assertProjectAccess(projectId, orgId);
+  const idList = Array.isArray(ids) ? [...new Set(ids.filter(Boolean))] : [];
+  if (!idList.length) {
+    throw Object.assign(new Error('No backlink IDs provided.'), { status: 400 });
+  }
+  if (idList.length > 200) {
+    throw Object.assign(new Error('You can change at most 200 backlinks at a time.'), { status: 400 });
+  }
+
+  const rows = await Backlink.findAll({
+    where: { id: idList, projectId },
+    attributes: ['id', 'isIndexed'],
+  });
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const deleted = [];
+  const skipped = [];
+
+  for (const id of idList) {
+    const row = byId.get(id);
+    if (!row) {
+      skipped.push({ id, reason: 'not_found' });
+      continue;
+    }
+    if (row.isIndexed) {
+      skipped.push({ id, reason: 'indexed' });
+      continue;
+    }
+    deleted.push(id);
+  }
+
+  if (deleted.length) {
+    await Backlink.update({ isActive: false }, { where: { id: deleted, projectId } });
+  }
+  return { deleted: deleted.length, deactivated: deleted.length, skipped };
+}
+
+const LINK_TYPE_VALUES = ['dofollow', 'nofollow', 'other'];
+function normalizeLinkType(raw) {
+  const v = String(raw || '').trim().toLowerCase();
+  return LINK_TYPE_VALUES.includes(v) ? v : 'other';
+}
+function normalizeIndexed(raw) {
+  const v = String(raw ?? '').trim().toLowerCase();
+  return ['yes', 'y', 'true', '1', 'indexed'].includes(v);
+}
+
+/** Convert Excel serials / Date objects / common strings into YYYY-MM-DD, or an error string. */
+function parseSheetDate(raw) {
+  if (raw == null || raw === '') return { value: null };
+  if (raw instanceof Date && !Number.isNaN(raw.getTime())) {
+    return { value: raw.toISOString().slice(0, 10) };
+  }
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    const parsed = xlsx.SSF?.parse_date_code?.(raw);
+    if (parsed?.y) {
+      return {
+        value: `${parsed.y}-${String(parsed.m).padStart(2, '0')}-${String(parsed.d).padStart(2, '0')}`,
+      };
+    }
+    return { error: `invalid Excel date value "${raw}"` };
+  }
+  const s = String(raw).trim();
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return { value: s.slice(0, 10) };
+  // DD/MM/YYYY or DD-MM-YYYY
+  const dmy = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/);
+  if (dmy) {
+    const day = Number(dmy[1]);
+    const month = Number(dmy[2]);
+    const year = Number(dmy[3]);
+    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      return { value: `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}` };
+    }
+  }
+  const d = new Date(s);
+  if (!Number.isNaN(d.getTime())) return { value: d.toISOString().slice(0, 10) };
+  return { error: `invalid date "${s}" — use YYYY-MM-DD or DD/MM/YYYY` };
+}
+
+function parseOptionalInt(raw, fieldLabel) {
+  if (raw == null || raw === '') return { value: null };
+  const n = parseInt(String(raw).replace(/[^\d-]/g, ''), 10);
+  if (Number.isNaN(n)) return { error: `${fieldLabel} must be a number (got "${raw}")` };
+  return { value: n };
+}
+
+function rowHasData(row) {
+  return Object.values(row || {}).some((v) => v != null && String(v).trim() !== '');
+}
+
+function importValidationError(messages) {
+  const preview = messages.slice(0, 6).join(' · ');
+  const extra = messages.length > 6 ? ` · …and ${messages.length - 6} more` : '';
+  return Object.assign(new Error(preview + extra), {
+    status: 422,
+    errors: { import: messages },
+  });
+}
+
+// Column set matches the client's real tracking sheet: Date, Domain, Published
+// URL, DA, S.S (spam score), Anchor text, Target URL, Status, Type, Index Status.
+// "Published URL" maps to sourceUrl — the field this codebase already treats as
+// the backlink's own URL.
+async function bulkImportBacklinks(projectId, orgId, fileBuffer, addedBy) {
+  await assertProjectAccess(projectId, orgId);
+  const wb = xlsx.read(fileBuffer, { type: 'buffer', cellDates: true });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = xlsx.utils.sheet_to_json(ws, { defval: null });
+
+  if (!rows.length) {
+    throw Object.assign(new Error('The file has no data rows. Add at least one backlink under the header row.'), { status: 400 });
+  }
+
+  // Link builders and content writers both place links in practice, so both
+  // role pools resolve from the sheet's "Writer" column.
+  const writerByName = await buildWriterLookup(orgId, ['link_builder', 'content_writer']);
+
+  const errors = [];
+  const records = [];
+
+  rows.forEach((row, index) => {
+    const rowNum = index + 2; // sheet row 1 is headers
+    const sourceUrl = String(
+      cell(row, 'Published URL', 'published_url', 'Published Url', 'URL', 'Source URL', 'source_url') || ''
+    ).trim();
+
+    if (!sourceUrl) {
+      if (rowHasData(row)) {
+        errors.push(`Row ${rowNum}: "Published URL" is required.`);
+      }
+      return;
+    }
+
+    const dateParsed = parseSheetDate(cell(row, 'Date', 'date', 'Published Date'));
+    if (dateParsed.error) errors.push(`Row ${rowNum}: Date — ${dateParsed.error}.`);
+
+    const daParsed = parseOptionalInt(cell(row, 'DA', 'da', 'Domain Authority'), 'DA');
+    if (daParsed.error) errors.push(`Row ${rowNum}: ${daParsed.error}.`);
+
+    const spamParsed = parseOptionalInt(cell(row, 'S.S', 'SS', 'Spam Score', 'spam_score'), 'Spam Score (S.S)');
+    if (spamParsed.error) errors.push(`Row ${rowNum}: ${spamParsed.error}.`);
+
+    const statusRaw = cell(row, 'Status', 'status');
+    const status = statusRaw == null ? 'live' : String(statusRaw).trim().slice(0, 50);
+    if (statusRaw != null && String(statusRaw).trim().length > 50) {
+      errors.push(`Row ${rowNum}: Status is too long (max 50 characters).`);
+    }
+
+    const domainRaw = cell(row, 'Domain', 'domain');
+    const domain = domainRaw == null ? null : String(domainRaw).trim().slice(0, 255);
+    if (domainRaw != null && String(domainRaw).trim().length > 255) {
+      errors.push(`Row ${rowNum}: Domain is too long (max 255 characters).`);
+    }
+
+    const anchorRaw = cell(row, 'Anchor text', 'Anchor Text', 'anchor_text', 'Anchor');
+    const anchorText = anchorRaw == null ? null : String(anchorRaw).trim().slice(0, 255);
+    if (anchorRaw != null && String(anchorRaw).trim().length > 255) {
+      errors.push(`Row ${rowNum}: Anchor text is too long (max 255 characters).`);
+    }
+
+    const linkTypeRaw = cell(row, 'Type', 'type', 'Link Type', 'link_type');
+    if (linkTypeRaw != null && String(linkTypeRaw).trim() !== '') {
+      const normalized = String(linkTypeRaw).trim().toLowerCase();
+      if (!LINK_TYPE_VALUES.includes(normalized)) {
+        errors.push(`Row ${rowNum}: Type must be dofollow, nofollow, or other (got "${linkTypeRaw}").`);
+      }
+    }
+
+    const writerName = cell(row, 'Writer', 'Assigned Writer', 'Assigned To', 'Link Builder', 'Assignee');
+    if (writerName && !writerByName.has(normName(writerName))) {
+      errors.push(`Row ${rowNum}: no active link builder or content writer named "${String(writerName).trim()}".`);
+    }
+
+    records.push({
+      projectId,
+      sourceUrl,
+      domain,
+      assignedWriterId: writerName ? (writerByName.get(normName(writerName)) || null) : null,
+      date: dateParsed.value ?? null,
+      da: daParsed.value ?? null,
+      spamScore: spamParsed.value ?? null,
+      anchorText,
+      targetUrl: cell(row, 'Target URL', 'target_url', 'Target Url') != null
+        ? String(cell(row, 'Target URL', 'target_url', 'Target Url')).trim()
+        : null,
+      status,
+      linkType: normalizeLinkType(linkTypeRaw),
+      isIndexed: normalizeIndexed(cell(row, 'Index Status', 'index_status', 'Indexed', 'indexed')),
+      addedBy,
+      _rowNum: rowNum,
+    });
+  });
+
+  if (errors.length) throw importValidationError(errors);
+
+  if (!records.length) {
+    throw Object.assign(new Error(
+      'No valid backlinks found. Make sure the sheet has a "Published URL" column and at least one data row.'
+    ), { status: 400 });
+  }
+
+  try {
+    let sortOrder = await nextSortOrder(Backlink, projectId);
+    const cleaned = records.map(({ _rowNum, ...rest }) => {
+      const row = { ...rest, sortOrder };
+      sortOrder += 1;
+      return row;
+    });
+    return await Backlink.bulkCreate(cleaned, { validate: true });
+  } catch (err) {
+    if (err.name === 'SequelizeValidationError' || err.name === 'SequelizeDatabaseError') {
+      const detail = err.errors?.map((e) => `${e.path}: ${e.message}`).join('; ')
+        || err.parent?.sqlMessage
+        || err.message;
+      throw Object.assign(new Error(`Import failed — ${detail}`), { status: 422 });
+    }
+    throw err;
+  }
+}
+
+// Second import mode: updates status/isIndexed on EXISTING backlinks by matching
+// "Published URL" — never creates new rows. Rows with no matching backlink in
+// this project are reported as skipped rather than silently ignored.
+async function bulkUpdateBacklinkStatus(projectId, orgId, fileBuffer) {
+  await assertProjectAccess(projectId, orgId);
+  const wb = xlsx.read(fileBuffer, { type: 'buffer', cellDates: true });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = xlsx.utils.sheet_to_json(ws, { defval: null });
+
+  if (!rows.length) {
+    throw Object.assign(new Error('The file has no data rows.'), { status: 400 });
+  }
+
+  let updated = 0;
+  const skipped = [];
+  const errors = [];
+  for (let i = 0; i < rows.length; i += 1) {
+    const row = rows[i];
+    const rowNum = i + 2;
+    const sourceUrl = String(
+      cell(row, 'Published URL', 'published_url', 'Published Url', 'URL', 'Source URL', 'source_url') || ''
+    ).trim();
+    if (!sourceUrl) {
+      if (rowHasData(row)) errors.push(`Row ${rowNum}: "Published URL" is required to match an existing backlink.`);
+      continue;
+    }
+    const bl = await Backlink.findOne({ where: { projectId, sourceUrl } });
+    if (!bl) { skipped.push(sourceUrl); continue; }
+    const updates = {};
+    if (cell(row, 'Status', 'status') != null) {
+      const status = String(cell(row, 'Status', 'status')).trim().slice(0, 50);
+      if (!status) errors.push(`Row ${rowNum}: Status cannot be empty.`);
+      else updates.status = status;
+    }
+    if (cell(row, 'Index Status', 'index_status', 'Indexed', 'indexed') !== null) {
+      updates.isIndexed = normalizeIndexed(cell(row, 'Index Status', 'index_status', 'Indexed', 'indexed'));
+    }
+    if (Object.keys(updates).length) {
+      await bl.update(updates);
+      updated += 1;
+    }
+  }
+  if (errors.length) throw importValidationError(errors);
+  return { updated, skippedCount: skipped.length, skipped };
+}
+
+// ─── Content Submissions ──────────────────────────────────────────────────────
+
+async function listContent(projectId, orgId) {
+  await assertProjectAccess(projectId, orgId);
+  return ContentSubmission.findAll({
+    where: { projectId },
+    include: [
+      { association: 'submitter', attributes: ['id', 'name'] },
+      { association: 'reviewer', attributes: ['id', 'name'] },
+    ],
+    order: [['createdAt', 'DESC']],
+  });
+}
+
+async function createContent(data, orgId, caller) {
+  await assertProjectAccess(data.projectId, orgId);
+
+  // Non-managers can only submit content for keywords assigned to them — the
+  // frontend picker already only shows their own assigned keywords, this is the
+  // server-side backstop against a crafted request bypassing that.
+  const isManager = ['super_admin', 'admin'].includes(caller?.role?.key) || !!caller?.role?.permissions?.['projects.manage'];
+  if (Array.isArray(data.keywordIds) && data.keywordIds.length) {
+    const kws = await Keyword.findAll({
+      where: { id: data.keywordIds, projectId: data.projectId },
+      attributes: ['id', 'assignedWriterId', 'status'],
+    });
+    if (kws.some((k) => k.status === 'inactive')) {
+      const err = new Error('Inactive keywords cannot be used for content submissions.');
+      err.status = 400;
+      throw err;
+    }
+    if (!isManager) {
+      const notMine = kws.some((k) => k.assignedWriterId !== data.submittedBy);
+      if (notMine) {
+        const err = new Error('You can only submit content for keywords assigned to you.');
+        err.status = 403;
+        throw err;
+      }
+    }
+  }
+
+  const latestRevision = await ContentSubmission.findOne({
+    where: {
+      projectId: data.projectId,
+      pageName: data.pageName,
+      submittedBy: data.submittedBy,
+    },
+    order: [['createdAt', 'DESC']],
+    attributes: ['id', 'revisionOfId', 'revisionNumber'],
+  });
+  const revisionOfId = latestRevision?.revisionOfId || latestRevision?.id || null;
+  const revisionNumber = latestRevision?.revisionNumber ? latestRevision.revisionNumber + 1 : 1;
+
+  const submission = await ContentSubmission.create({
+    ...data,
+    revisionOfId,
+    revisionNumber,
+  });
+
+  // Submitting content moves the writer's open "write this page" task to
+  // "submitted" so it shows under Submitted until a strategist approves/rejects.
+  if (data.submittedBy && data.pageName) {
+    const openTasks = await Task.findAll({
+      where: {
+        projectId: data.projectId,
+        type: 'content',
+        pageName: data.pageName,
+        assigneeId: data.submittedBy,
+        status: { [Op.in]: ['todo', 'in_progress', 'rejected'] },
+      },
+    });
+    for (const task of openTasks) {
+      try {
+        if (task.status === 'rejected') {
+          await TaskService.transition(task.id, orgId, 'in_progress', { id: data.submittedBy }, null, 'Content resubmitted.');
+        }
+        await TaskService.transition(task.id, orgId, 'submitted', { id: data.submittedBy }, null, 'Content submitted.');
+      } catch (err) {
+        console.error('[SeoService] Failed to mark content task submitted:', err.message);
+      }
+    }
+  }
+  return submission;
+}
+
+// A strategist approves or rejects a submitted page. Approving takes its
+// keywords out of the "remaining" pool (see the Keywords tab stat calc, which
+// only counts keywords covered by an *approved* submission); once every keyword
+// is covered, the project auto-advances past this stage. Rejecting requires a
+// reason and reopens a task for the original writer so they see it's back in
+// their queue — this can happen any number of times across resubmissions.
+async function reviewContent(id, updates, orgId, reviewer) {
+  const reviewerId = reviewer?.id;
+  const cs = await ContentSubmission.findOne({
+    where: { id },
+    include: [{ model: Project, as: 'project', where: { orgId } }],
+  });
+  if (!cs) throw Object.assign(new Error('Content submission not found'), { status: 404 });
+
+  const status = updates.status;
+  if (!['approved', 'rejected'].includes(status)) {
+    throw Object.assign(new Error('Status must be "approved" or "rejected".'), { status: 400 });
+  }
+  const reason = String(updates.rejectionReason || '').trim();
+  if (status === 'rejected' && !reason) {
+    throw Object.assign(new Error('A rejection reason is required.'), { status: 400 });
+  }
+  if (cs.submittedBy && cs.submittedBy === reviewerId) {
+    throw Object.assign(new Error('You cannot review your own submission.'), { status: 400 });
+  }
+  const canManageProjects = ['super_admin', 'admin'].includes(reviewer?.role?.key)
+    || !!reviewer?.role?.permissions?.['projects.manage'];
+  if (status === 'rejected' && cs.status === 'approved' && !canManageProjects) {
+    throw Object.assign(new Error('Only Project Manager or Super Admin can request revisions after approval.'), { status: 403 });
+  }
+
+  // Revisions after approval: keep the approved file as history (`superseded`)
+  // and open a new rejected revise row so keywords unlock for a rewrite.
+  const wasApproved = cs.status === 'approved';
+  let target = cs;
+  if (status === 'rejected' && wasApproved) {
+    const rootId = cs.revisionOfId || cs.id;
+    const revisionNumber = (cs.revisionNumber || 1) + 1;
+    await cs.update({
+      status: 'superseded',
+      rejectionReason: reason,
+      reviewedBy: reviewerId,
+      reviewedAt: new Date(),
+    });
+    target = await ContentSubmission.create({
+      projectId: cs.projectId,
+      pageName: cs.pageName,
+      keywordIds: cs.keywordIds,
+      fileUrl: cs.fileUrl,
+      fileName: cs.fileName,
+      submittedBy: cs.submittedBy,
+      wordCount: cs.wordCount,
+      status: 'rejected',
+      rejectionReason: reason,
+      reviewedBy: reviewerId,
+      reviewedAt: new Date(),
+      revisionOfId: rootId,
+      revisionNumber,
+    });
+  } else {
+    await cs.update({
+      status,
+      rejectionReason: status === 'rejected' ? reason : null,
+      reviewedBy: reviewerId,
+      reviewedAt: new Date(),
+    });
+  }
+
+  if (status === 'rejected') {
+    if (target.submittedBy && target.pageName) {
+      // Mark the submitted/in-review task as rejected so it leaves the review queue.
+      const reviewTasks = await Task.findAll({
+        where: {
+          projectId: target.projectId,
+          type: 'content',
+          pageName: target.pageName,
+          assigneeId: target.submittedBy,
+          status: { [Op.in]: ['submitted', 'in_review'] },
+        },
+      });
+      for (const task of reviewTasks) {
+        try {
+          await TaskService.transition(task.id, orgId, 'rejected', { id: reviewerId }, null, reason);
+        } catch (err) {
+          console.error('[SeoService] Failed to mark content task rejected:', err.message);
+        }
+      }
+
+      const existingOpen = await Task.findOne({
+        where: {
+          projectId: target.projectId,
+          type: 'content',
+          pageName: target.pageName,
+          assigneeId: target.submittedBy,
+          status: { [Op.in]: ['todo', 'in_progress'] },
+        },
+      });
+      if (!existingOpen) {
+        // Prefer reopening a just-rejected task as the revise work item.
+        const rejectedTask = await Task.findOne({
+          where: {
+            projectId: target.projectId,
+            type: 'content',
+            pageName: target.pageName,
+            assigneeId: target.submittedBy,
+            status: 'rejected',
+          },
+          order: [['updatedAt', 'DESC']],
+        });
+        if (rejectedTask) {
+          try {
+            await TaskService.transition(rejectedTask.id, orgId, 'in_progress', { id: reviewerId }, null, reason);
+            await rejectedTask.update({ title: `Revise content — ${target.pageName}` });
+          } catch (err) {
+            console.error('[SeoService] Failed to reopen rejected content task:', err.message);
+            await TaskService.create(orgId, target.projectId, {
+              type: 'content',
+              title: `Revise content — ${target.pageName}`,
+              assigneeId: target.submittedBy,
+              pageName: target.pageName,
+              stageKey: cs.project.currentStageKey,
+            }, reviewerId);
+          }
+        } else {
+          await TaskService.create(orgId, target.projectId, {
+            type: 'content',
+            title: `Revise content — ${target.pageName}`,
+            assigneeId: target.submittedBy,
+            pageName: target.pageName,
+            stageKey: cs.project.currentStageKey,
+          }, reviewerId);
+        }
+      }
+      NotificationService.notify(target.submittedBy, orgId, {
+        type: 'content_rejected',
+        title: wasApproved
+          ? `Revision requested: "${target.pageName}"`
+          : `Content rejected: "${target.pageName}"`,
+        body: reason,
+        refTable: 'projects',
+        refId: target.projectId,
+      });
+    }
+    return target;
+  }
+
+  // Approved — mirror onto matching content Tasks for this page. Don't require
+  // assigneeId === submittedBy (admin may submit on a writer's behalf) and
+  // include open statuses so a leftover todo/in_progress row can't block Mark Complete.
+  if (cs.pageName) {
+    const matchTasks = await Task.findAll({
+      where: {
+        projectId: cs.projectId,
+        type: 'content',
+        pageName: cs.pageName,
+        status: { [Op.in]: ['todo', 'in_progress', 'submitted', 'in_review', 'rejected', 'done'] },
+      },
+    });
+    for (const task of matchTasks) {
+      try {
+        await Task.update(
+          { status: 'approved', completedAt: new Date() },
+          { where: { id: task.id } }
+        );
+      } catch (err) {
+        console.error('[SeoService] Failed to mark content task approved:', err.message);
+      }
+    }
+  }
+
+  // If every *active* keyword now has an approved submission covering it,
+  // the pool is empty; try to auto-advance the project. Inactive keywords are
+  // ignored so a focus change doesn't block stage completion.
+  const [keywords, approvedSubmissions] = await Promise.all([
+    Keyword.findAll({ where: { projectId: cs.projectId, status: 'active' }, attributes: ['id'] }),
+    ContentSubmission.findAll({ where: { projectId: cs.projectId, status: 'approved' }, attributes: ['keywordIds'] }),
+  ]);
+  const coveredIds = new Set();
+  for (const s of approvedSubmissions) (s.keywordIds || []).forEach((kid) => coveredIds.add(kid));
+  const remaining = keywords.filter((k) => !coveredIds.has(k.id));
+
+  if (keywords.length > 0 && remaining.length === 0) {
+    try {
+      const reviewer = await User.findByPk(reviewerId, { include: [{ association: 'role' }] });
+      await performAction({ user: reviewer, project: cs.project, action: 'complete', note: 'All content approved — pool cleared.' });
+    } catch (err) {
+      console.error('[SeoService] Auto-advance on content pool clear failed:', err.message);
+    }
+  }
+  return cs;
+}
+
+async function deleteContent(id, orgId, actor) {
+  const cs = await ContentSubmission.findOne({
+    where: { id },
+    include: [{ model: Project, as: 'project', where: { orgId }, attributes: ['id'] }],
+  });
+  if (!cs) throw Object.assign(new Error('Content submission not found.'), { status: 404 });
+
+  const isManager = ['super_admin', 'admin'].includes(actor?.role?.key)
+    || !!actor?.role?.permissions?.['projects.manage'];
+  if (!isManager && cs.submittedBy !== actor.id) {
+    throw Object.assign(new Error('Only the submitter can delete this content item.'), { status: 403 });
+  }
+  if (cs.status === 'approved' && !isManager) {
+    throw Object.assign(new Error('Approved content cannot be deleted by the submitter. Ask a reviewer to reopen it first.'), { status: 400 });
+  }
+  if (cs.status === 'superseded' && !isManager) {
+    throw Object.assign(new Error('Prior versions are kept for history and cannot be deleted by the submitter.'), { status: 400 });
+  }
+
+  const idsToDestroy = new Set([cs.id]);
+
+  // Heal older "reopen kept Approved + created Rejected" rows: converting the
+  // live approved sibling to superseded unlocks keywords while preserving the
+  // prior file in history (instead of deleting it).
+  if (cs.status === 'rejected' && cs.pageName && cs.submittedBy) {
+    await ContentSubmission.update(
+      {
+        status: 'superseded',
+        rejectionReason: cs.rejectionReason || 'Superseded by revision request.',
+        reviewedAt: new Date(),
+      },
+      {
+        where: {
+          projectId: cs.projectId,
+          pageName: cs.pageName,
+          submittedBy: cs.submittedBy,
+          status: 'approved',
+          id: { [Op.ne]: cs.id },
+        },
+      },
+    );
+  }
+
+  await ContentSubmission.destroy({ where: { id: [...idsToDestroy] } });
+  return { ok: true };
+}
+
+/** Heal older content tasks left as "done" after the submission was approved. */
+async function syncApprovedContentTasks(orgId, userId) {
+  const submissions = await ContentSubmission.findAll({
+    where: {
+      status: 'approved',
+      ...(userId ? { submittedBy: userId } : {}),
+    },
+    include: [{
+      model: Project,
+      as: 'project',
+      where: { orgId },
+      attributes: ['id'],
+      required: true,
+    }],
+    attributes: ['projectId', 'pageName', 'submittedBy'],
+  });
+
+  for (const cs of submissions) {
+    if (!cs.submittedBy || !cs.pageName) continue;
+    await Task.update(
+      { status: 'approved', completedAt: new Date() },
+      {
+        where: {
+          projectId: cs.projectId,
+          type: 'content',
+          pageName: cs.pageName,
+          assigneeId: cs.submittedBy,
+          status: { [Op.in]: ['done', 'submitted', 'in_review'] },
+        },
+      },
+    );
+  }
+}
+
+// ─── Blog Tasks ───────────────────────────────────────────────────────────────
+
+async function listBlogSheet(projectId, orgId, { includeInactive = false } = {}) {
+  await assertProjectAccess(projectId, orgId);
+  return BlogTask.findAll({
+    where: { projectId, ...(includeInactive ? {} : { isActive: true }) },
+    include: [
+      { association: 'submitter', attributes: ['id', 'name'] },
+      { association: 'assignedWriter', attributes: ['id', 'name'] },
+      { association: 'reviewer', attributes: ['id', 'name'] },
+    ],
+    order: SHEET_ORDER,
+  });
+}
+
+async function listBlogTasks(projectId, orgId) {
+  await assertProjectAccess(projectId, orgId);
+  return BlogTask.findAll({ where: { projectId }, order: [['createdAt', 'DESC']] });
+}
+
+/**
+ * Manual single-row add for the Blog Sheet plan (like adding a Keyword).
+ * Creates a draft row + writer Task in todo — deliverable submit is separate.
+ */
+async function createBlogSheetRow(projectId, data, orgId, actorUserId) {
+  const project = await assertProjectAccess(projectId, orgId);
+  const title = String(data.title || '').trim();
+  if (!title) {
+    throw Object.assign(new Error('Blog Title is required.'), { status: 400 });
+  }
+  const sortOrder = await nextSortOrder(BlogTask, projectId);
+  const volume = sheetNumber(data.volume);
+  const kd = sheetNumber(data.kd);
+  const assignedWriterId = data.assignedWriterId || null;
+
+  const bt = await BlogTask.create({
+    projectId,
+    title,
+    contentType: data.contentType || null,
+    mainKeyword: data.mainKeyword || null,
+    volume,
+    kd,
+    supportingKeywords: data.supportingKeywords || null,
+    urlSlug: data.urlSlug || null,
+    targetServicePage: data.targetServicePage || null,
+    proof: data.proof || null,
+    fileUrl: null,
+    status: 'draft',
+    submittedBy: null,
+    assignedWriterId,
+    createdBy: actorUserId,
+    sortOrder,
+  });
+
+  // Mirror keyword assign: open a write task; do not mark submitted until deliverable.
+  if (assignedWriterId) {
+    await ensureBlogTask(orgId, project, title, assignedWriterId, actorUserId);
+  }
+
+  return bt;
+}
+
+/**
+ * Content-parity submit: writer uploads the blog deliverable (existing draft/
+ * rejected row, or a new title). Moves sheet to pending + Task to submitted.
+ */
+async function submitBlogDeliverable(projectId, data, orgId, caller) {
+  const project = await assertProjectAccess(projectId, orgId);
+  const title = String(data.title || '').trim();
+  const blogId = data.blogId || null;
+  if (!title && !blogId) {
+    throw Object.assign(new Error('Blog title or blogId is required.'), { status: 400 });
+  }
+
+  let bt = null;
+  if (blogId) {
+    bt = await BlogTask.findOne({ where: { id: blogId, projectId } });
+    if (!bt) throw Object.assign(new Error('Blog row not found.'), { status: 404 });
+    if (!['draft', 'rejected', 'pending'].includes(bt.status)) {
+      throw Object.assign(new Error('This blog is already approved and cannot be resubmitted.'), { status: 400 });
+    }
+  }
+
+  const resolvedTitle = title || bt.title;
+  const isManager = ['super_admin', 'admin'].includes(caller?.role?.key)
+    || !!caller?.role?.permissions?.['projects.manage'];
+  const writerId = data.assignedWriterId || bt?.assignedWriterId || caller.id;
+
+  // Writers can only submit sheet rows assigned to them — unassigned drafts stay
+  // on the plan until a strategist/PM picks a writer (keyword content parity).
+  if (!isManager) {
+    if (!bt || bt.assignedWriterId !== caller.id) {
+      throw Object.assign(new Error('You can only submit blogs assigned to you.'), { status: 403 });
+    }
+  }
+
+  let fileUrl = String(data.fileUrl || '').trim() || null;
+  if (fileUrl && !/^https?:\/\//i.test(fileUrl) && !fileUrl.startsWith('/')) {
+    fileUrl = `https://${fileUrl}`;
+  }
+  const resolvedFileUrl = fileUrl || bt?.fileUrl || null;
+  if (!resolvedFileUrl) {
+    throw Object.assign(new Error('Attach a file or paste a deliverable link.'), { status: 400 });
+  }
+
+  if (bt) {
+    await bt.update({
+      status: 'pending',
+      rejectionReason: null,
+      reviewedBy: null,
+      reviewedAt: null,
+      submittedBy: caller.id,
+      assignedWriterId: writerId,
+      fileUrl: resolvedFileUrl,
+      title: resolvedTitle,
+      ...(data.mainKeyword != null ? { mainKeyword: data.mainKeyword } : {}),
+      ...(data.contentType != null ? { contentType: data.contentType } : {}),
+    });
+  } else {
+    const sortOrder = await nextSortOrder(BlogTask, projectId);
+    bt = await BlogTask.create({
+      projectId,
+      title: resolvedTitle,
+      contentType: data.contentType || null,
+      mainKeyword: data.mainKeyword || null,
+      volume: sheetNumber(data.volume),
+      kd: sheetNumber(data.kd),
+      supportingKeywords: data.supportingKeywords || null,
+      urlSlug: data.urlSlug || null,
+      targetServicePage: data.targetServicePage || null,
+      fileUrl: resolvedFileUrl,
+      status: 'pending',
+      submittedBy: caller.id,
+      assignedWriterId: writerId,
+      createdBy: caller.id,
+      sortOrder,
+    });
+  }
+
+  await ensureBlogTask(orgId, project, resolvedTitle, writerId, caller.id);
+  await markBlogTasksSubmitted(orgId, projectId, resolvedTitle, writerId, caller.id);
+
+  for (const slot of ['project_strategist', 'project_manager']) {
+    const assignment = await ProjectAssignment.findOne({ where: { projectId, roleSlot: slot } });
+    if (assignment?.userId && assignment.userId !== caller.id) {
+      NotificationService.notify(assignment.userId, orgId, {
+        type: 'blog_submitted',
+        title: `Blog submitted for review: "${bt.title}"`,
+        body: `${project.name} — waiting on your approval.`,
+        refTable: 'projects',
+        refId: projectId,
+      });
+      break;
+    }
+  }
+
+  return bt;
+}
+
+async function createBlogTask(data, orgId) {
+  await assertProjectAccess(data.projectId, orgId);
+  return BlogTask.create(data);
+}
+
+async function updateBlogTask(id, updates, orgId, actorUserId) {
+  const bt = await BlogTask.findOne({
+    where: { id },
+    include: [{ model: Project, as: 'project', where: { orgId }, attributes: ['id', 'currentStageKey', 'name'] }],
+  });
+  if (!bt) throw Object.assign(new Error('Blog task not found'), { status: 404 });
+
+  if (bt.status === 'approved' && Object.prototype.hasOwnProperty.call(updates, 'assignedWriterId')) {
+    throw Object.assign(new Error('Cannot reassign writer on an approved blog.'), { status: 400 });
+  }
+
+  const patch = { ...updates };
+  const assigningWriter = patch.assignedWriterId && patch.assignedWriterId !== bt.assignedWriterId;
+  await bt.update(patch);
+
+  if (assigningWriter) {
+    await ensureBlogTask(orgId, bt.project, bt.title, patch.assignedWriterId, actorUserId);
+  }
+  return bt;
+}
+
+/**
+ * CSV/XLSX import for the Blog content-plan sheet (pillar/cluster rows). Mirrors
+ * bulkImportKeywords's permissive style, not bulkImportBacklinks's strict one — the
+ * only required cell is Blog Title; every other column is optional, and a
+ * missing/unparseable value is just stored as null rather than rejecting the row
+ * or the import (per product requirement: never throw for null/invalid optional
+ * cells, but never show a literal "null" for a cell that did have data either —
+ * that half is a display concern, handled on the frontend).
+ */
+async function bulkImportBlogTasks(projectId, orgId, fileBuffer, submittedBy) {
+  const project = await assertProjectAccess(projectId, orgId);
+  const wb = xlsx.read(fileBuffer, { type: 'buffer' });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = xlsx.utils.sheet_to_json(ws, { defval: null });
+  const writerByName = await buildWriterLookup(orgId, ['blog_writer', 'content_writer']);
+  const unmatchedWriters = new Set();
+
+  let sortOrder = await nextSortOrder(BlogTask, projectId);
+  const records = rows.map((row) => {
+    const title = String(cell(row, 'Blog Title', 'Title') || '').trim();
+    if (!title) return null;
+
+    const writerName = cell(row, 'Writer', 'Assigned Writer', 'Blog Writer', 'Assignee');
+    let assignedWriterId = null;
+    if (writerName) {
+      const trimmed = String(writerName).trim();
+      assignedWriterId = writerByName.get(normName(trimmed)) || null;
+      if (trimmed && !assignedWriterId) unmatchedWriters.add(trimmed);
+    }
+
+    const record = {
+      projectId,
+      title,
+      contentType: cell(row, 'Type', 'Content Type') || null,
+      mainKeyword: cell(row, 'Main Keyword', 'main_keyword') || null,
+      volume: sheetNumber(cell(row, 'Volume', 'volume', 'Search Volume', 'Vol')),
+      kd: sheetNumber(cell(row, 'KD', 'kd')),
+      supportingKeywords: cell(row, 'Supporting Keywords', 'supporting_keywords') || null,
+      urlSlug: cell(row, 'URL Slug', 'url_slug', 'Slug') || null,
+      targetServicePage: cell(row, 'Target Service Page', 'target_service_page') || null,
+      // "Approve" is a manual-only Yes/No field set on the sheet after review —
+      // never read from an imported file, even if the sheet happens to have a
+      // column with that name.
+      proof: null,
+      status: 'draft',
+      submittedBy: null,
+      assignedWriterId,
+      createdBy: submittedBy,
+      sortOrder,
+    };
+    sortOrder += 1;
+    return record;
+  }).filter(Boolean);
+
+  if (!records.length) {
+    throw Object.assign(new Error('No rows with a Blog Title were found in this file.'), { status: 400 });
+  }
+
+  const created = await BlogTask.bulkCreate(records, { validate: true });
+
+  // Content-parity with keyword import: open write Tasks; deliverable submit is separate.
+  const seen = new Set();
+  for (const rec of records) {
+    if (!rec.assignedWriterId) continue;
+    const key = `${rec.assignedWriterId}::${rec.title}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    await ensureBlogTask(orgId, project, rec.title, rec.assignedWriterId, submittedBy);
+  }
+
+  return { rows: created, unmatchedWriters: [...unmatchedWriters] };
+}
+
+/** A Project Strategist / Project Manager / Super Admin approves or rejects one blog row. */
+async function reviewBlogTask(id, updates, orgId, reviewer) {
+  const bt = await BlogTask.findOne({
+    where: { id },
+    include: [{ model: Project, as: 'project', where: { orgId }, attributes: ['id', 'name'] }],
+  });
+  if (!bt) throw Object.assign(new Error('Blog task not found'), { status: 404 });
+
+  if (bt.status !== 'pending') {
+    throw Object.assign(new Error('Only blogs awaiting review can be approved or rejected.'), { status: 400 });
+  }
+
+  const status = updates.status;
+  if (!['approved', 'rejected'].includes(status)) {
+    throw Object.assign(new Error('Status must be "approved" or "rejected".'), { status: 400 });
+  }
+  const reason = String(updates.rejectionReason || '').trim();
+  if (status === 'rejected' && !reason) {
+    throw Object.assign(new Error('A rejection reason is required.'), { status: 400 });
+  }
+  if (bt.submittedBy && bt.submittedBy === reviewer.id) {
+    throw Object.assign(new Error('You cannot review your own submission.'), { status: 400 });
+  }
+
+  const isManager = ['super_admin', 'admin'].includes(reviewer?.role?.key) || !!reviewer?.role?.permissions?.['projects.manage'];
+  if (!isManager) {
+    const assignment = await ProjectAssignment.findOne({
+      where: {
+        projectId: bt.projectId,
+        userId: reviewer.id,
+        roleSlot: { [Op.in]: ['project_strategist', 'project_manager'] },
+      },
+    });
+    if (!assignment) {
+      throw Object.assign(new Error('Only an admin, project manager, or project strategist can review blog submissions.'), { status: 403 });
+    }
+  }
+
+  await bt.update({
+    status,
+    rejectionReason: status === 'rejected' ? reason : null,
+    reviewedBy: reviewer.id,
+    reviewedAt: new Date(),
+  });
+
+  const writerId = bt.assignedWriterId || bt.submittedBy;
+  const project = await Project.findByPk(bt.projectId);
+
+  if (status === 'rejected' && writerId) {
+    // Mirror reviewContent: reject open review tasks and reopen a revise task.
+    const reviewTasks = await Task.findAll({
+      where: {
+        projectId: bt.projectId,
+        type: 'blog_post',
+        pageName: bt.title,
+        assigneeId: writerId,
+        status: { [Op.in]: ['submitted', 'in_review'] },
+      },
+    });
+    for (const task of reviewTasks) {
+      try {
+        await TaskService.transition(task.id, orgId, 'rejected', { id: reviewer.id }, null, reason);
+      } catch (err) {
+        console.error('[SeoService] Failed to mark blog task rejected:', err.message);
+      }
+    }
+
+    const existingOpen = await Task.findOne({
+      where: {
+        projectId: bt.projectId,
+        type: 'blog_post',
+        pageName: bt.title,
+        assigneeId: writerId,
+        status: { [Op.in]: ['todo', 'in_progress'] },
+      },
+    });
+    if (!existingOpen) {
+      const rejectedTask = await Task.findOne({
+        where: {
+          projectId: bt.projectId,
+          type: 'blog_post',
+          pageName: bt.title,
+          assigneeId: writerId,
+          status: 'rejected',
+        },
+        order: [['updatedAt', 'DESC']],
+      });
+      if (rejectedTask) {
+        try {
+          await TaskService.transition(rejectedTask.id, orgId, 'in_progress', { id: reviewer.id }, null, reason);
+          await rejectedTask.update({ title: `Revise blog — ${bt.title}` });
+        } catch (err) {
+          console.error('[SeoService] Failed to reopen rejected blog task:', err.message);
+          await TaskService.create(orgId, bt.projectId, {
+            type: 'blog_post',
+            title: `Revise blog — ${bt.title}`,
+            assigneeId: writerId,
+            pageName: bt.title,
+            stageKey: project?.currentStageKey,
+          }, reviewer.id);
+        }
+      } else {
+        await TaskService.create(orgId, bt.projectId, {
+          type: 'blog_post',
+          title: `Revise blog — ${bt.title}`,
+          assigneeId: writerId,
+          pageName: bt.title,
+          stageKey: project?.currentStageKey,
+        }, reviewer.id);
+      }
+    }
+  }
+
+  if (status === 'approved') {
+    const matchTasks = await Task.findAll({
+      where: {
+        projectId: bt.projectId,
+        type: 'blog_post',
+        pageName: bt.title,
+        status: { [Op.in]: ['todo', 'in_progress', 'submitted', 'in_review', 'rejected', 'done'] },
+      },
+    });
+    for (const task of matchTasks) {
+      try {
+        await Task.update(
+          { status: 'approved', completedAt: new Date() },
+          { where: { id: task.id } }
+        );
+      } catch (err) {
+        console.error('[SeoService] Failed to mark blog task approved:', err.message);
+      }
+    }
+  }
+
+  if (writerId || bt.submittedBy) {
+    const notifyUserId = bt.submittedBy || writerId;
+    NotificationService.notify(notifyUserId, orgId, {
+      type: status === 'approved' ? 'blog_approved' : 'blog_rejected',
+      title: status === 'approved' ? `Blog approved: "${bt.title}"` : `Blog rejected: "${bt.title}"`,
+      body: status === 'rejected' ? reason : `${bt.project.name} — approved.`,
+      refTable: 'projects',
+      refId: bt.projectId,
+    });
+  }
+
+  return bt;
+}
+
+/** Heal blog Tasks left as done/submitted after the sheet row was approved. */
+async function syncApprovedBlogTasks(orgId, userId) {
+  const rows = await BlogTask.findAll({
+    where: {
+      status: 'approved',
+      ...(userId ? { [Op.or]: [{ submittedBy: userId }, { assignedWriterId: userId }] } : {}),
+    },
+    include: [{
+      model: Project,
+      as: 'project',
+      where: { orgId },
+      attributes: ['id'],
+      required: true,
+    }],
+    attributes: ['projectId', 'title', 'submittedBy', 'assignedWriterId'],
+  });
+
+  for (const bt of rows) {
+    if (!bt.title) continue;
+    const matchTasks = await Task.findAll({
+      where: {
+        projectId: bt.projectId,
+        type: 'blog_post',
+        pageName: bt.title,
+        status: { [Op.in]: ['submitted', 'in_review', 'done'] },
+        ...(userId ? { assigneeId: userId } : {}),
+      },
+    });
+    for (const task of matchTasks) {
+      try {
+        await Task.update(
+          { status: 'approved', completedAt: new Date() },
+          { where: { id: task.id } }
+        );
+      } catch (err) {
+        console.error('[SeoService] Failed to sync approved blog task:', err.message);
+      }
+    }
+  }
+}
+
+// Deactivates rather than destroys — see services/SoftDeleteService.js.
+async function deleteBlogTask(id, orgId, active = false) {
+  const bt = await BlogTask.findOne({
+    where: { id },
+    include: [{ model: Project, as: 'project', where: { orgId }, attributes: [] }],
+  });
+  if (!bt) throw Object.assign(new Error('Blog task not found'), { status: 404 });
+  if (!active && bt.status === 'approved') {
+    throw Object.assign(new Error('This blog has approved content and cannot be set to Inactive.'), { status: 400 });
+  }
+  await bt.update({ isActive: active });
+  return bt;
+}
+
+// ─── Keyword / Backlink Report PDFs ───────────────────────────────────────────
+
+async function _loadSeoReportContext(projectId, orgId) {
+  const project = await Project.findOne({
+    where: { id: projectId, orgId },
+    include: [{ model: Client, as: 'client', attributes: ['name'] }],
+  });
+  if (!project) throw Object.assign(new Error('Project not found'), { status: 404 });
+  const brandConfig = await WhiteLabelConfig.findOne({ where: { orgId } });
+  const brandName = brandConfig?.brandName || 'Mohsin Designs Project Management';
+  const brandColor = brandConfig?.primaryColor || BRAND_COLOR;
+  // SEO reports go to the client, so they carry the billing entity's letterhead
+  // (the same one that appears on their invoices and quotations) rather than the
+  // HR entity — see services/letterhead.js.
+  const letterhead = await letterheadForOrg(orgId, 'billing');
+  const logo = await loadLetterheadLogo(letterhead.logoUrl);
+  return { project, brandName, brandColor, letterhead, logo };
+}
+
+async function generateKeywordReportBuffer(projectId, orgId) {
+  const { project, brandName, brandColor, letterhead, logo } = await _loadSeoReportContext(projectId, orgId);
+  const keywords = await Keyword.findAll({ where: { projectId }, order: SHEET_ORDER });
+
+  const buffer = await createPdfBuffer((doc) => {
+    drawPdfKitLetterhead(doc, letterhead, {
+      title: 'KEYWORDS REPORT',
+      subtitle: `${project.client?.name || ''} — ${project.name} · Generated ${new Date().toLocaleDateString()}`,
+      color: brandColor,
+      logo,
+    });
+
+    doc.font('Helvetica-Bold').fontSize(13).fillColor('#111111').text(`Keywords (${keywords.length})`);
+    doc.moveDown(0.5);
+    if (keywords.length === 0) {
+      doc.font('Helvetica-Oblique').fontSize(10).fillColor('#999999').text('No keywords recorded yet.');
+    } else {
+      drawTable(doc, {
+        columns: [
+          { label: 'Sr', key: 'sr', width: 4, align: 'left' },
+          { label: 'Main Keyword', key: 'main', width: 14 },
+          { label: 'Supporting Keywords', key: 'support', width: 20 },
+          { label: 'Volume', key: 'volume', width: 7, align: 'right' },
+          { label: 'KD', key: 'kd', width: 5, align: 'right' },
+          { label: 'Status', key: 'status', width: 8 },
+          { label: 'Target Location', key: 'location', width: 12 },
+          { label: 'Target Page', key: 'page', width: 10 },
+        ],
+        rows: keywords.map((k, i) => ({
+          sr: i + 1,
+          main: k.primaryKeyword,
+          support: k.secondaryKeywords || '—',
+          volume: k.volume != null ? k.volume.toLocaleString() : '—',
+          kd: k.kd ?? '—',
+          status: k.status === 'inactive' ? 'Inactive' : 'Active',
+          location: k.targetLocation || '—',
+          page: k.pageName || '—',
+        })),
+      });
+    }
+
+    drawFooter(doc, `Generated by ${brandName}`);
+  }, {
+    layout: 'landscape',
+    margin: 40,
+    info: {
+      Title: `Keywords Report — ${[project.client?.name, project.name].filter(Boolean).join(' — ')}`,
+      Author: brandName,
+    },
+  });
+
+  return { buffer, project };
+}
+
+async function generateBacklinkReportBuffer(projectId, orgId) {
+  const { project, brandName, brandColor, letterhead, logo } = await _loadSeoReportContext(projectId, orgId);
+  const backlinks = await Backlink.findAll({
+    where: { projectId },
+    include: [{ association: 'assignedWriter', attributes: ['id', 'name'] }],
+    order: SHEET_ORDER,
+  });
+
+  const buffer = await createPdfBuffer((doc) => {
+    drawPdfKitLetterhead(doc, letterhead, {
+      title: 'BACKLINKS REPORT',
+      subtitle: `${project.client?.name || ''} — ${project.name} · Generated ${new Date().toLocaleDateString()}`,
+      color: brandColor,
+      logo,
+    });
+
+    doc.font('Helvetica-Bold').fontSize(13).fillColor('#111111').text(`Backlinks (${backlinks.length})`);
+    doc.moveDown(0.5);
+    if (backlinks.length === 0) {
+      doc.font('Helvetica-Oblique').fontSize(10).fillColor('#999999').text('No backlinks recorded yet.');
+    } else {
+      drawTable(doc, {
+        columns: [
+          { label: 'Source URL', key: 'source', width: 14 },
+          { label: 'Date', key: 'date', width: 7 },
+          { label: 'Anchor', key: 'anchor', width: 8 },
+          { label: 'DA', key: 'da', width: 4, align: 'right' },
+          { label: 'Type', key: 'type', width: 7 },
+          { label: 'Writer', key: 'writer', width: 8 },
+          { label: 'Indexed', key: 'indexed', width: 5 },
+        ],
+        rows: backlinks.map((b) => ({
+          source: b.sourceUrl,
+          date: b.date || '—',
+          anchor: b.anchorText || '—',
+          da: b.da ?? '—',
+          type: b.linkType,
+          writer: b.assignedWriter?.name || '—',
+          indexed: b.isIndexed ? 'Yes' : 'No',
+        })),
+      });
+    }
+
+    drawFooter(doc, `Generated by ${brandName}`);
+  }, {
+    layout: 'landscape',
+    margin: 40,
+    info: {
+      Title: `Backlinks Report — ${[project.client?.name, project.name].filter(Boolean).join(' — ')}`,
+      Author: brandName,
+    },
+  });
+
+  return { buffer, project };
+}
+
+module.exports = {
+  listKeywords, createKeyword, bulkImportKeywords, updateKeyword, deleteKeyword, clearKeywords, bulkDeleteKeywords,
+  addRankSnapshot, listRankings, recordRankings, deleteRankingDate, bulkImportRankings,
+  listBacklinks, createBacklink, updateBacklink, deleteBacklink, clearBacklinks, bulkDeleteBacklinks, bulkImportBacklinks, bulkUpdateBacklinkStatus,
+  listContent, createContent, reviewContent, deleteContent, syncApprovedContentTasks,
+  listBlogTasks, createBlogTask, updateBlogTask,
+  listBlogSheet, createBlogSheetRow, submitBlogDeliverable, bulkImportBlogTasks,
+  reviewBlogTask, deleteBlogTask, syncApprovedBlogTasks,
+  generateKeywordReportBuffer, generateBacklinkReportBuffer,
+};

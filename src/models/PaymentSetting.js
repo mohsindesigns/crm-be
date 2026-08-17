@@ -1,0 +1,112 @@
+const { ensureColumns } = require('../utils/schemaSync');
+
+/**
+ * Card-payment settings owned by the admin panel.
+ *
+ * Deliberately holds NO credentials. The Stripe secret key and webhook signing
+ * secret stay in the environment: they are bearer credentials — anyone holding
+ * the secret key can move money — and a database column puts them in every
+ * backup, replica and stray `SELECT *`. What lives here is the business side of
+ * the decision, which an admin should be able to change without a deploy:
+ *
+ *   • whether cards are accepted at all
+ *   • how long a finalized Stripe invoice stays payable
+ *
+ * Per-currency processing fees live in PaymentFeeRule.
+ */
+module.exports = (sequelize, DataTypes) => {
+  const PaymentSetting = sequelize.define('PaymentSetting', {
+    orgId: {
+      type: DataTypes.CHAR(36),
+      primaryKey: true,
+      references: { model: 'orgs', key: 'id' },
+    },
+    stripeEnabled: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    // Days a finalized Stripe invoice stays payable before Stripe marks it past due.
+    invoiceDueDays: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      defaultValue: 7,
+    },
+  }, {
+    tableName: 'payment_settings',
+    timestamps: true,
+  });
+
+  PaymentSetting.associate = (db) => {
+    PaymentSetting.belongsTo(db.Org, { foreignKey: 'orgId', as: 'org' });
+  };
+
+  PaymentSetting.ensureSchema = () => ensureColumns(PaymentSetting);
+
+  /**
+   * The org's effective card configuration: the admin's settings combined with
+   * the credentials from the environment.
+   *
+   * Cards are live only when BOTH sides agree — an admin has switched them on
+   * AND a secret key is present. Either half missing means the portal hides the
+   * card option rather than offering a button that cannot work.
+   */
+  PaymentSetting.resolve = async (orgId) => {
+    const row = orgId ? await PaymentSetting.findByPk(orgId).catch(() => null) : null;
+
+    const secretKey = String(process.env.STRIPE_SECRET_KEY || '').trim();
+    const webhookSecret = String(process.env.STRIPE_WEBHOOK_SECRET || '').trim();
+
+    // Before an admin saves anything, fall back to STRIPE_ENABLED so existing
+    // deploys keep working. Once a row exists the panel is authoritative —
+    // otherwise the env var would silently override the toggle they just used.
+    const enabledByAdmin = row
+      ? !!row.stripeEnabled
+      : String(process.env.STRIPE_ENABLED || '').toLowerCase() === 'true';
+
+    return {
+      configured: !!row,
+      enabledByAdmin,
+      hasCredentials: !!secretKey,
+      enabled: enabledByAdmin && !!secretKey,
+      secretKey,
+      webhookSecret,
+      hasWebhookSecret: !!webhookSecret,
+      invoiceDueDays: row?.invoiceDueDays ?? (parseInt(process.env.STRIPE_INVOICE_DUE_DAYS, 10) || 7),
+      // Test keys start sk_test_; anything else is treated as live, so the panel
+      // errs toward warning that real money is moving.
+      mode: secretKey.startsWith('sk_test_') ? 'sandbox' : 'live',
+    };
+  };
+
+  /** What the admin panel is allowed to see — never the credentials themselves. */
+  PaymentSetting.publicView = async (orgId) => {
+    const r = await PaymentSetting.resolve(orgId);
+    return {
+      enabled: r.enabled,
+      enabledByAdmin: r.enabledByAdmin,
+      hasCredentials: r.hasCredentials,
+      hasWebhookSecret: r.hasWebhookSecret,
+      invoiceDueDays: r.invoiceDueDays,
+      mode: r.mode,
+    };
+  };
+
+  PaymentSetting.save = async (orgId, patch = {}) => {
+    const [row] = await PaymentSetting.findOrCreate({
+      where: { orgId },
+      defaults: { orgId, stripeEnabled: false, invoiceDueDays: 7 },
+    });
+
+    const update = {};
+    if (patch.stripeEnabled !== undefined) update.stripeEnabled = !!patch.stripeEnabled;
+    if (patch.invoiceDueDays !== undefined) {
+      update.invoiceDueDays = Math.min(365, Math.max(0, parseInt(patch.invoiceDueDays, 10) || 0));
+    }
+
+    await row.update(update);
+    return PaymentSetting.publicView(orgId);
+  };
+
+  return PaymentSetting;
+};
