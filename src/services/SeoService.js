@@ -317,21 +317,17 @@ async function lockedKeywordIdSet(projectId) {
   return ids;
 }
 
-// Deactivates rather than destroys — nothing in the CRM is hard-deleted (see
-// services/SoftDeleteService.js). Keyword already modelled this as its
-// status ENUM: inactive keywords stay on the sheet with their rank history
-// intact but drop out of the content pool and the default listing.
 /**
- * Deactivates a single keyword — same "delete" as everywhere else in this app
- * (see models/softDeletable.js): nothing is destroyed, a status flip drops it
- * out of the active sheet.
+ * Permanently deletes a single keyword — real removal, not a status flip.
+ * Its rank-history rows (RankSnapshot) are destroyed first since the DB has a
+ * real foreign key from rank_snapshots.keywordId to keywords.id, which would
+ * otherwise reject the delete.
  *
- * Previously admin-only regardless of who added the keyword, which meant the
- * person who typed it in couldn't undo their own mistake. Now the submitter
- * can delete it themselves too, but only while it's still theirs to take
- * back — once a writer is on the hook for it or its content has been
- * approved, only an admin/manager can touch it (same as `deleteContent`'s
- * submitter-vs-manager split).
+ * Not admin-only: the person who added the keyword can delete it themselves
+ * too, but only while it's still theirs to take back — once a writer is on
+ * the hook for it or its content has been approved, only an admin/manager can
+ * touch it (same as `deleteContent`'s submitter-vs-manager split). Those two
+ * guards exist to protect in-progress work, not to soften the delete itself.
  */
 async function deleteKeyword(id, orgId, actor) {
   const kw = await Keyword.findOne({
@@ -343,19 +339,20 @@ async function deleteKeyword(id, orgId, actor) {
   const isManager = ['super_admin', 'admin'].includes(actor?.role?.key)
     || !!actor?.role?.permissions?.['projects.manage'];
   if (!isManager && kw.createdBy !== actor?.id) {
-    throw Object.assign(new Error('Only the person who added this keyword (or an admin) can set it to Inactive.'), { status: 403 });
+    throw Object.assign(new Error('Only the person who added this keyword (or an admin) can delete it.'), { status: 403 });
   }
   if (kw.assignedWriterId) {
-    throw Object.assign(new Error('This keyword is assigned to a content writer and cannot be set to Inactive.'), { status: 400 });
+    throw Object.assign(new Error('This keyword is assigned to a content writer and cannot be deleted.'), { status: 400 });
   }
   if (await keywordHasApprovedContent(kw.id, kw.projectId)) {
-    throw Object.assign(new Error('This keyword has approved content and cannot be set to Inactive.'), { status: 400 });
+    throw Object.assign(new Error('This keyword has approved content and cannot be deleted.'), { status: 400 });
   }
-  await kw.update({ status: 'inactive' });
+  await RankSnapshot.destroy({ where: { keywordId: kw.id } });
+  await kw.destroy();
   return kw;
 }
 
-/** Deactivate unassigned keywords only — assigned or approved-content keywords are kept. */
+/** Non-destructive: sets every eligible active keyword on the sheet to Inactive — assigned or approved-content keywords are kept as-is. */
 async function clearKeywords(projectId, orgId) {
   await assertProjectAccess(projectId, orgId);
   const protectedIds = await lockedKeywordIdSet(projectId);
@@ -399,7 +396,8 @@ async function bulkDeleteKeywords(projectId, orgId, ids) {
   }
 
   if (deleted.length) {
-    await Keyword.update({ status: 'inactive' }, { where: { id: deleted, projectId } });
+    await RankSnapshot.destroy({ where: { keywordId: deleted } });
+    await Keyword.destroy({ where: { id: deleted, projectId } });
   }
   return { deleted: deleted.length, deactivated: deleted.length, skipped };
 }
@@ -427,6 +425,41 @@ async function bulkActivateKeywords(projectId, orgId, ids) {
   }
   const skipped = idList.filter((id) => !found.includes(id)).map((id) => ({ id, reason: 'not_found' }));
   return { activated: found.length, skipped };
+}
+
+/**
+ * Non-destructive: sets selected keywords to Inactive (a status flip, not a
+ * delete) — the reversible counterpart to bulkActivateKeywords, and a
+ * separate action from bulkDeleteKeywords now that "delete" really deletes.
+ * Same lock check as delete: assigned/approved keywords are skipped so a
+ * bulk action can't silently pull one out of a writer's active pool.
+ */
+async function bulkDeactivateKeywords(projectId, orgId, ids) {
+  await assertProjectAccess(projectId, orgId);
+  const idList = Array.isArray(ids) ? [...new Set(ids.filter(Boolean))] : [];
+  if (!idList.length) {
+    throw Object.assign(new Error('No keyword IDs provided.'), { status: 400 });
+  }
+  if (idList.length > 200) {
+    throw Object.assign(new Error('You can change at most 200 keywords at a time.'), { status: 400 });
+  }
+
+  const protectedIds = await lockedKeywordIdSet(projectId);
+  const rows = await Keyword.findAll({ where: { id: idList, projectId }, attributes: ['id'] });
+  const found = new Set(rows.map((r) => r.id));
+  const deactivated = [];
+  const skipped = [];
+
+  for (const id of idList) {
+    if (!found.has(id)) { skipped.push({ id, reason: 'not_found' }); continue; }
+    if (protectedIds.has(id)) { skipped.push({ id, reason: 'assigned_or_approved' }); continue; }
+    deactivated.push(id);
+  }
+
+  if (deactivated.length) {
+    await Keyword.update({ status: 'inactive' }, { where: { id: deactivated, projectId } });
+  }
+  return { deactivated: deactivated.length, skipped };
 }
 
 // ─── Rank Snapshots ───────────────────────────────────────────────────────────
@@ -671,7 +704,9 @@ async function updateBacklink(id, updates, orgId) {
   return bl.update(updates);
 }
 
-// Deactivates rather than destroys — see services/SoftDeleteService.js.
+// Permanently deletes — real removal, not a status flip. Indexed backlinks
+// are protected because de-indexing them for real takes time at the search
+// engine; deleting the row here doesn't undo that.
 async function deleteBacklink(id, orgId) {
   const bl = await Backlink.findOne({
     where: { id },
@@ -679,13 +714,13 @@ async function deleteBacklink(id, orgId) {
   });
   if (!bl) throw Object.assign(new Error('Backlink not found'), { status: 404 });
   if (bl.isIndexed) {
-    throw Object.assign(new Error('Indexed backlinks cannot be set to Inactive.'), { status: 400 });
+    throw Object.assign(new Error('Indexed backlinks cannot be deleted.'), { status: 400 });
   }
-  await bl.update({ isActive: false });
+  await bl.destroy();
   return bl;
 }
 
-/** Deactivate non-indexed backlinks only — indexed rows are kept. */
+/** Non-destructive: sets every non-indexed backlink to Inactive — indexed rows are kept as-is. */
 async function clearBacklinks(projectId, orgId) {
   await assertProjectAccess(projectId, orgId);
   const [deleted] = await Backlink.update(
@@ -694,6 +729,39 @@ async function clearBacklinks(projectId, orgId) {
   );
   const kept = await Backlink.count({ where: { projectId, isIndexed: true } });
   return { deleted, deactivated: deleted, kept };
+}
+
+/**
+ * Non-destructive: sets selected backlinks to Inactive (a status flip, not a
+ * delete) — a separate action from bulkDeleteBacklinks now that "delete"
+ * really deletes. Same indexed-backlink guard as delete.
+ */
+async function bulkDeactivateBacklinks(projectId, orgId, ids) {
+  await assertProjectAccess(projectId, orgId);
+  const idList = Array.isArray(ids) ? [...new Set(ids.filter(Boolean))] : [];
+  if (!idList.length) {
+    throw Object.assign(new Error('No backlink IDs provided.'), { status: 400 });
+  }
+  if (idList.length > 200) {
+    throw Object.assign(new Error('You can change at most 200 backlinks at a time.'), { status: 400 });
+  }
+
+  const rows = await Backlink.findAll({ where: { id: idList, projectId }, attributes: ['id', 'isIndexed'] });
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const deactivated = [];
+  const skipped = [];
+
+  for (const id of idList) {
+    const row = byId.get(id);
+    if (!row) { skipped.push({ id, reason: 'not_found' }); continue; }
+    if (row.isIndexed) { skipped.push({ id, reason: 'indexed' }); continue; }
+    deactivated.push(id);
+  }
+
+  if (deactivated.length) {
+    await Backlink.update({ isActive: false }, { where: { id: deactivated, projectId } });
+  }
+  return { deactivated: deactivated.length, skipped };
 }
 
 async function bulkDeleteBacklinks(projectId, orgId, ids) {
@@ -728,7 +796,7 @@ async function bulkDeleteBacklinks(projectId, orgId, ids) {
   }
 
   if (deleted.length) {
-    await Backlink.update({ isActive: false }, { where: { id: deleted, projectId } });
+    await Backlink.destroy({ where: { id: deleted, projectId } });
   }
   return { deleted: deleted.length, deactivated: deleted.length, skipped };
 }
@@ -2152,9 +2220,9 @@ async function generateBacklinkReportBuffer(projectId, orgId, letterheadFields) 
 }
 
 module.exports = {
-  listKeywords, createKeyword, bulkImportKeywords, updateKeyword, deleteKeyword, clearKeywords, bulkDeleteKeywords, bulkActivateKeywords,
+  listKeywords, createKeyword, bulkImportKeywords, updateKeyword, deleteKeyword, clearKeywords, bulkDeleteKeywords, bulkActivateKeywords, bulkDeactivateKeywords,
   addRankSnapshot, listRankings, recordRankings, deleteRankingDate, bulkImportRankings,
-  listBacklinks, createBacklink, updateBacklink, deleteBacklink, clearBacklinks, bulkDeleteBacklinks, bulkImportBacklinks, bulkUpdateBacklinkStatus,
+  listBacklinks, createBacklink, updateBacklink, deleteBacklink, clearBacklinks, bulkDeleteBacklinks, bulkDeactivateBacklinks, bulkImportBacklinks, bulkUpdateBacklinkStatus,
   listContent, createContent, reviewContent, deleteContent, bulkDeleteContent, syncApprovedContentTasks,
   listBlogTasks, createBlogTask, updateBlogTask,
   listBlogSheet, createBlogSheetRow, submitBlogDeliverable, bulkImportBlogTasks,

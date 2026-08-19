@@ -397,6 +397,19 @@ class ClientService {
     return Math.max(0, Math.round(soldPrice * 100) / 100);
   }
 
+  // Given a sale's startDate, billing cycle, and how many cycles the discount
+  // lasts, returns the calendar date the discount period ends — the date
+  // DiscountExpiryScheduler reverts the price back to basePrice. Walks
+  // RetainerService.addCycle the same number of times the retainer itself will,
+  // so the revert always lands on an actual renewal date rather than drifting.
+  _computeDiscountEndsAt(startDate, cycle, discountCycles) {
+    const cycles = parseInt(discountCycles, 10);
+    if (!(cycles > 0)) return null;
+    let date = startDate;
+    for (let i = 0; i < cycles; i++) date = RetainerService.addCycle(date, cycle);
+    return date;
+  }
+
   // Sells a package to a client: records the sale (with optional discount) and
   // spawns one project per bundled service, each with its own workflow. If the
   // package is recurring, a single retainer covering the whole package is also
@@ -419,6 +432,9 @@ class ClientService {
     const soldPrice = hasCustomPrice
       ? Math.max(0, Math.round(parseFloat(data.customPrice) * 100) / 100)
       : this._computeSoldPrice(basePrice, discountType, discountValue);
+    // Only meaningful alongside an actual discount — a custom sell price or no
+    // discount at all has nothing to expire back to.
+    const discountCycles = discountType ? (parseInt(data.discountCycles, 10) || null) : null;
     const currency = pkg.currency || client.defaultCurrency;
     // An installment plan set on this specific sale overrides whatever plan is
     // baked into the package template — different clients buying the same
@@ -438,11 +454,19 @@ class ClientService {
       ? pkg.services
       : [{ serviceTypeKey: pkg.serviceTypeKey, workflowTemplateId: null }];
 
+    const billingCycle = pkg.billingCycle || 'monthly';
+    // Only a recurring sale actually bills more than once, so a discount timeline
+    // is meaningless on a one-time package even if a stray value was submitted.
+    const discountEndsAt = pkg.isRecurring
+      ? this._computeDiscountEndsAt(startDate, billingCycle, discountCycles)
+      : null;
+
     const { clientPackage, projects } = await db.sequelize.transaction(async (t) => {
       const clientPackage = await db.ClientPackage.create({
         orgId, clientId, packageId: pkg.id,
-        basePrice, discountType, discountValue, soldPrice, currency,
-        billingCycle: pkg.billingCycle || 'monthly',
+        basePrice, discountType, discountValue, discountCycles: discountEndsAt ? discountCycles : null,
+        discountEndsAt, soldPrice, currency,
+        billingCycle,
         status: 'active',
         startDate,
         createdBy: userId,
@@ -697,6 +721,7 @@ class ClientService {
           customPrice: entry.customPrice,
           discountType: entry.discountType,
           discountValue: entry.discountValue,
+          discountCycles: entry.discountCycles,
           installmentPlan: entry.installmentPlan,
           // Shared across the sale — this is what makes the line items land on
           // one invoice rather than several.
@@ -775,7 +800,10 @@ class ClientService {
 
     let retainerUpdated = false;
     await db.sequelize.transaction(async (t) => {
-      await clientPackage.update({ soldPrice: price, discountType: null, discountValue: null }, { transaction: t });
+      await clientPackage.update({
+        soldPrice: price, discountType: null, discountValue: null,
+        discountCycles: null, discountEndsAt: null,
+      }, { transaction: t });
       const [count] = await db.Retainer.update(
         { amount: price },
         { where: { clientPackageId: clientPackage.id, status: { [Op.ne]: 'cancelled' } }, transaction: t }

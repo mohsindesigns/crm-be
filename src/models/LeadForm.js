@@ -65,8 +65,8 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.TEXT,
     },
     // Appearance: { headline?, description?, primaryColor?, backgroundColor?,
-    // buttonText?, showBranding?, borderRadius? } — every key optional, unset
-    // ones fall back to org branding / sensible defaults (see
+    // buttonText?, showLogo?, showName?, borderRadius? } — every key optional,
+    // unset ones fall back to org branding / sensible defaults (see
     // LeadFormService#normalizeTheme / #effectiveTheme). Kept as one JSON blob
     // rather than a column per property since this is purely display config,
     // never queried or filtered on.

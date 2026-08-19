@@ -84,14 +84,12 @@ router.patch('/keywords/:id', rbac('projects.act'), async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// Kept on the DELETE verb so existing clients don't break, but the effect is a
-// deactivation — nothing is destroyed. Reactivate via PATCH /keywords/:id
-// { status: 'active' }. Not adminOnly: the keyword's own submitter can delete
+// Permanently deletes — not adminOnly: the keyword's own submitter can delete
 // it too while it's still unassigned/unapproved — see SeoService.deleteKeyword.
 router.delete('/keywords/:id', rbac('projects.act'), async (req, res, next) => {
   try {
     const kw = await SeoService.deleteKeyword(req.params.id, req.orgId, req.user);
-    res.json({ message: 'Keyword set to Inactive', keyword: kw });
+    res.json({ message: 'Keyword deleted', keyword: kw });
   } catch (e) { next(e); }
 });
 
@@ -112,6 +110,14 @@ router.post('/projects/:projectId/keywords/bulk-delete', adminOnly, rbac('projec
 router.post('/projects/:projectId/keywords/bulk-activate', rbac('projects.act'), async (req, res, next) => {
   try {
     res.json(await SeoService.bulkActivateKeywords(req.params.projectId, req.orgId, req.body?.ids));
+  } catch (e) { next(e); }
+});
+
+// Non-destructive counterpart to bulk-delete (which really deletes now) —
+// same adminOnly gate as bulk-delete since it's still a bulk sheet action.
+router.post('/projects/:projectId/keywords/bulk-deactivate', adminOnly, rbac('projects.act'), async (req, res, next) => {
+  try {
+    res.json(await SeoService.bulkDeactivateKeywords(req.params.projectId, req.orgId, req.body?.ids));
   } catch (e) { next(e); }
 });
 
@@ -180,11 +186,11 @@ router.patch('/backlinks/:id', rbac('projects.act'), async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// Deactivates, never destroys. Reactivate via PATCH /backlinks/:id { isActive: true }.
+// Permanently deletes.
 router.delete('/backlinks/:id', adminOnly, rbac('projects.act'), async (req, res, next) => {
   try {
     const bl = await SeoService.deleteBacklink(req.params.id, req.orgId);
-    res.json({ message: 'Backlink set to Inactive', backlink: bl });
+    res.json({ message: 'Backlink deleted', backlink: bl });
   } catch (e) { next(e); }
 });
 
@@ -197,6 +203,13 @@ router.delete('/projects/:projectId/backlinks', adminOnly, rbac('projects.act'),
 router.post('/projects/:projectId/backlinks/bulk-delete', adminOnly, rbac('projects.act'), async (req, res, next) => {
   try {
     res.json(await SeoService.bulkDeleteBacklinks(req.params.projectId, req.orgId, req.body?.ids));
+  } catch (e) { next(e); }
+});
+
+// Non-destructive counterpart to bulk-delete (which really deletes now).
+router.post('/projects/:projectId/backlinks/bulk-deactivate', adminOnly, rbac('projects.act'), async (req, res, next) => {
+  try {
+    res.json(await SeoService.bulkDeactivateBacklinks(req.params.projectId, req.orgId, req.body?.ids));
   } catch (e) { next(e); }
 });
 

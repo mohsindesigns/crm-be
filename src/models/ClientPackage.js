@@ -37,6 +37,21 @@ module.exports = (sequelize, DataTypes) => {
     discountValue: {
       type: DataTypes.DECIMAL(12, 2),
     },
+    // How many recurring billing cycles the discount above applies for — e.g. 3
+    // means "the first 3 invoices are discounted, then it goes back to full
+    // price." Null/0 means the discount never expires. Set at sale time (see
+    // ClientService.sellPackage) from the package sale form or a converted
+    // document's own discountCycles.
+    discountCycles: {
+      type: DataTypes.INTEGER,
+    },
+    // Calendar date the discount period ends, derived once at sale time from
+    // startDate + discountCycles cycles (ClientService._computeDiscountEndsAt) —
+    // stored rather than recomputed so DiscountExpiryScheduler can find expired
+    // discounts with a plain date query. Null when discountCycles is null.
+    discountEndsAt: {
+      type: DataTypes.DATEONLY,
+    },
     // Price actually charged to the client after the discount is applied.
     soldPrice: {
       type: DataTypes.DECIMAL(12, 2),

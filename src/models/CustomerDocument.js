@@ -73,6 +73,16 @@ module.exports = (sequelize, DataTypes) => {
     discountValue: {
       type: DataTypes.DECIMAL(12, 2),
     },
+    // How many recurring billing cycles this discount lasts once the deal is sold
+    // — e.g. 3 means "discounted for the first 3 invoices, then full price."
+    // Distinct from `validUntil`, which is how long this PROPOSAL itself stands
+    // before the client must respond, not how long the price inside it lasts
+    // once agreed. Null means the discount never expires. Carried onto the
+    // resulting ClientPackage(s) at conversion — see convert()'s
+    // discountEndsAt computation.
+    discountCycles: {
+      type: DataTypes.INTEGER,
+    },
     // [{ description, qty, unitPrice }, ...] — quotations only.
     lineItems: {
       type: DataTypes.JSON,

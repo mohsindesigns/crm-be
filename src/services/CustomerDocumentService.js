@@ -413,6 +413,7 @@ class CustomerDocumentService {
     const baseAmount = (isCompare || isMenu) ? 0 : this._computeBaseAmount({ ...data, services: normalizedServices }, pkg);
     const discountType = ['percent', 'fixed'].includes(data.discountType) ? data.discountType : null;
     const discountValue = discountType ? (parseFloat(data.discountValue) || 0) : null;
+    const discountCycles = discountType ? (parseInt(data.discountCycles, 10) || null) : null;
 
     const document = await db.CustomerDocument.create({
       id: uuidv4(),
@@ -434,6 +435,7 @@ class CustomerDocumentService {
       basePrice: baseAmount,
       discountType,
       discountValue,
+      discountCycles,
       amount: this._applyDiscount(baseAmount, discountType, discountValue),
       lineItems: (isCompare || isMenu) ? null : (Array.isArray(data.lineItems) && data.lineItems.length ? data.lineItems : null),
       validUntil,
@@ -504,6 +506,9 @@ class CustomerDocumentService {
     const discountValue = data.discountType !== undefined
       ? (data.discountType ? (parseFloat(data.discountValue) || 0) : null)
       : (data.discountValue !== undefined ? (parseFloat(data.discountValue) || 0) : document.discountValue);
+    const discountCycles = data.discountType !== undefined
+      ? (data.discountType ? (parseInt(data.discountCycles, 10) || null) : null)
+      : (data.discountCycles !== undefined ? (parseInt(data.discountCycles, 10) || null) : document.discountCycles);
 
     await document.update({
       type: data.type ?? document.type,
@@ -524,6 +529,7 @@ class CustomerDocumentService {
       basePrice: baseAmount,
       discountType,
       discountValue,
+      discountCycles,
       amount: this._applyDiscount(baseAmount, discountType, discountValue),
       lineItems: (isCompare || isMenu)
         ? null
@@ -721,6 +727,7 @@ class CustomerDocumentService {
       amount: this._computeAmount(data, null),
       discountType: data.discountType || null,
       discountValue: data.discountValue || null,
+      discountCycles: data.discountCycles || null,
       scopeTerms: data.scopeTerms || '',
       validUntil: data.validUntil || '',
     };
@@ -917,6 +924,16 @@ class CustomerDocumentService {
       const soldPackages = [];
       for (const item of items) {
         if (!item.pkg) { soldPackages.push(null); continue; }
+        const billingCycle = ['monthly', 'quarterly', 'annual'].includes(item.pkg.billingCycle)
+          ? item.pkg.billingCycle
+          : 'monthly';
+        // The discount timeline promised on the proposal still carries through
+        // even though the discount markdown itself is already folded into
+        // chargedPrice below — only meaningful for a service that actually
+        // recurs, same as ClientService.sellPackage.
+        const discountEndsAt = item.isRecurring
+          ? ClientService._computeDiscountEndsAt(today, billingCycle, document.discountCycles)
+          : null;
         const clientPackage = await db.ClientPackage.create({
           orgId,
           clientId: client.id,
@@ -927,11 +944,11 @@ class CustomerDocumentService {
           // markdown that may not even map to this one package.
           discountType: null,
           discountValue: null,
+          discountCycles: discountEndsAt ? document.discountCycles : null,
+          discountEndsAt,
           soldPrice: item.chargedPrice,
           currency: document.currency || 'USD',
-          billingCycle: ['monthly', 'quarterly', 'annual'].includes(item.pkg.billingCycle)
-            ? item.pkg.billingCycle
-            : 'monthly',
+          billingCycle,
           status: 'active',
           startDate: today,
           createdBy: userId,
@@ -1295,6 +1312,13 @@ class CustomerDocumentService {
       discountLabel = document.discountType === 'percent'
         ? `${Number(document.discountValue)}%`
         : `${document.currency || 'USD'} ${Number(document.discountValue).toFixed(2)}`;
+      // A discount on a recurring package only lasts so many billing cycles —
+      // say so on the document itself, not just internally, so the client isn't
+      // surprised when the price goes back up.
+      const cycles = parseInt(document.discountCycles, 10);
+      if (cycles > 0) {
+        discountLabel += ` (first ${cycles} billing cycle${cycles === 1 ? '' : 's'} only)`;
+      }
     }
 
     const packageMenuForPdf = isMenuPending

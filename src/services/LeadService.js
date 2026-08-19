@@ -5,6 +5,13 @@ const { LEAD_STATUS } = require('../config/constants');
 const { activeWhere } = require('./SoftDeleteService');
 const NotificationService = require('./NotificationService');
 const LeadFormService = require('./LeadFormService');
+const CaptchaService = require('./CaptchaService');
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// Digits with optional leading +, spaces/dashes/dots/parens as separators —
+// permissive on formatting (no country-specific shape assumed) but rejects
+// obvious junk like "abc" or a single digit.
+const PHONE_RE = /^\+?[\d\s().-]{7,20}$/;
 
 const VALID_STATUSES = Object.values(LEAD_STATUS);
 
@@ -51,6 +58,10 @@ function buildFieldData(fields, answers) {
   let phone = null;
 
   for (const field of fields) {
+    // Hidden fields never render on the public form, so a visitor can never
+    // answer them — skip validation entirely rather than blocking every
+    // submission on a required field nobody could see.
+    if (field.hidden) continue;
     const raw = answers?.[field.key];
     const value = typeof raw === 'string' ? raw.trim() : raw;
     if (field.required && (value === undefined || value === null || value === '')) {
@@ -58,6 +69,12 @@ function buildFieldData(fields, answers) {
     }
     if (field.type === 'select' && value && !field.options?.includes(value)) {
       throw badRequest(`"${value}" is not a valid option for "${field.label}".`);
+    }
+    if (field.type === 'email' && value && !EMAIL_RE.test(value)) {
+      throw badRequest(`"${field.label}" must be a valid email address.`);
+    }
+    if (field.type === 'phone' && value && !PHONE_RE.test(value)) {
+      throw badRequest(`"${field.label}" must be a valid phone number.`);
     }
     if (value !== undefined && value !== null && value !== '') {
       fieldData[field.key] = value;
@@ -87,6 +104,7 @@ async function submitPublic(token, body, req) {
   }
 
   checkRateLimit(req?.ip);
+  CaptchaService.verify(body?.captchaToken, body?.captchaAnswer);
 
   const form = await db.LeadForm.findOne({ where: { publicToken: token, status: 'active', isActive: true } });
   if (!form) throw notFound('This form is no longer available.');

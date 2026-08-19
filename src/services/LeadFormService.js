@@ -41,7 +41,7 @@ function normalizeFields(rawFields) {
     if (type === 'select' && (!options || options.length === 0)) {
       throw badRequest(`Field "${label}" is a dropdown but has no options.`);
     }
-    return { key, label, type, required: !!f?.required, ...(options ? { options } : {}) };
+    return { key, label, type, required: !!f?.required, hidden: !!f?.hidden, ...(options ? { options } : {}) };
   });
 }
 
@@ -72,7 +72,8 @@ function normalizeTheme(raw) {
     if (!HEX_COLOR_RE.test(v)) throw badRequest('Background color must be a hex value like #FFFFFF.');
     t.backgroundColor = v;
   }
-  if (src.showBranding !== undefined) t.showBranding = !!src.showBranding;
+  if (src.showLogo !== undefined) t.showLogo = !!src.showLogo;
+  if (src.showName !== undefined) t.showName = !!src.showName;
   if (src.borderRadius) {
     const v = String(src.borderRadius);
     if (!BORDER_RADIUS_VALUES.includes(v)) throw badRequest('Invalid border radius option.');
@@ -87,13 +88,18 @@ function normalizeTheme(raw) {
  *  `form.theme` directly, so neither has to duplicate the fallback chain. */
 function effectiveTheme(form) {
   const t = form.theme || {};
+  // Forms saved before logo/name became independent toggles only have the old
+  // combined `showBranding` flag — fall back to it for either half so those
+  // forms keep rendering the same way until next edited and resaved.
+  const legacyShowBranding = t.showBranding !== undefined ? t.showBranding : true;
   return {
     headline: t.headline || form.name,
     description: t.description || '',
     buttonText: t.buttonText || 'Submit',
     primaryColor: t.primaryColor || form.org?.brand?.primaryColor || '#0B1D5E',
     backgroundColor: t.backgroundColor || '#FFFFFF',
-    showBranding: t.showBranding !== undefined ? t.showBranding : true,
+    showLogo: t.showLogo !== undefined ? t.showLogo : legacyShowBranding,
+    showName: t.showName !== undefined ? t.showName : legacyShowBranding,
     borderRadius: BORDER_RADIUS_VALUES.includes(t.borderRadius) ? t.borderRadius : 'rounded',
   };
 }
@@ -215,7 +221,9 @@ async function getPublicByToken(token) {
   return {
     id: form.id,
     name: form.name,
-    fields: form.fields,
+    // Hidden fields stay in the stored definition (so toggling visibility
+    // back on preserves the config) but never reach the public page.
+    fields: (form.fields || []).filter((f) => !f.hidden),
     branding: {
       brandName: form.org?.brand?.brandName || form.org?.name || 'Contact us',
       logoUrl: form.org?.brand?.logoUrl || null,
