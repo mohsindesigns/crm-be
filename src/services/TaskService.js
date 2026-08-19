@@ -48,6 +48,7 @@ class TaskService {
         { model: db.User, as: 'assignee', attributes: ['id', 'name', 'avatarUrl'] },
         { model: db.User, as: 'reviewer', attributes: ['id', 'name', 'avatarUrl'] },
         { model: db.User, as: 'creator', attributes: ['id', 'name'] },
+        { model: db.User, as: 'pendingAssignee', attributes: ['id', 'name', 'avatarUrl'] },
       ],
       order: type ? [['createdAt', 'DESC']] : [['createdAt', 'ASC']],
     });
@@ -60,6 +61,7 @@ class TaskService {
         { model: db.User, as: 'assignee', attributes: ['id', 'name', 'avatarUrl'] },
         { model: db.User, as: 'reviewer', attributes: ['id', 'name', 'avatarUrl'] },
         { model: db.User, as: 'creator', attributes: ['id', 'name'] },
+        { model: db.User, as: 'pendingAssignee', attributes: ['id', 'name', 'avatarUrl'] },
         {
           model: db.Project,
           as: 'project',
@@ -102,6 +104,11 @@ class TaskService {
       reviewerId = createdBy;
     }
 
+    // Technical audit: the chosen assignee is parked in pendingAssigneeId and
+    // the task goes out unassigned until an admin approves it (approveAudit),
+    // instead of notifying the assignee immediately.
+    const requiresTechnicalAudit = !!data.requiresTechnicalAudit;
+
     const task = await db.Task.create({
       id: uuidv4(),
       orgId,
@@ -109,7 +116,10 @@ class TaskService {
       stageKey: data.stageKey || project.currentStageKey,
       type: data.type,
       title: data.title,
-      assigneeId: data.assigneeId,
+      assigneeId: requiresTechnicalAudit ? null : data.assigneeId,
+      pendingAssigneeId: requiresTechnicalAudit ? (data.assigneeId || null) : null,
+      requiresTechnicalAudit,
+      auditStatus: requiresTechnicalAudit ? 'pending' : null,
       reviewerId,
       dueAt: data.dueAt || null,
       remarks,
@@ -120,9 +130,11 @@ class TaskService {
       status: TASK_STATUS.TODO,
     });
 
-    // Notify the assignee — email + in-app, fire-and-forget (mirrors the
-    // project-assignment notification pattern in ProjectController#setAssignment).
-    if (task.assigneeId) {
+    if (requiresTechnicalAudit) {
+      this._notifyAdminsForAudit(task, project, orgId).catch(() => {});
+    } else if (task.assigneeId) {
+      // Notify the assignee — email + in-app, fire-and-forget (mirrors the
+      // project-assignment notification pattern in ProjectController#setAssignment).
       db.User.findByPk(task.assigneeId).then((assignee) => {
         if (!assignee) return;
         if (assignee.email) {
@@ -142,6 +154,106 @@ class TaskService {
     }
 
     return this.getById(task.id, orgId, projectId);
+  }
+
+  // Fire-and-forget: mirrors PublicDocumentService#_notifyAdmins.
+  async _notifyAdminsForAudit(task, project, orgId) {
+    const admins = await db.User.findAll({
+      where: { orgId },
+      include: [{ model: db.Role, as: 'role' }],
+    });
+    const recipients = admins.filter((u) => ['super_admin', 'admin'].includes(u.role?.key));
+    await Promise.all(recipients.map((u) => NotificationService.notify(u.id, orgId, {
+      type: 'task_audit_pending',
+      title: `Technical audit needed: "${task.title}"`,
+      body: `A task on ${project.name} needs technical-audit approval before it can be assigned.`,
+      ...taskNotifyRef(project.id, task.id),
+    })));
+  }
+
+  async approveAudit(taskId, orgId, actor) {
+    const task = await db.Task.findOne({
+      where: { id: taskId, orgId },
+      include: [{ model: db.Project, as: 'project', attributes: ['id', 'name'] }],
+    });
+    if (!task) {
+      const err = new Error('Task not found.');
+      err.status = 404;
+      throw err;
+    }
+    if (!task.requiresTechnicalAudit || task.auditStatus !== 'pending') {
+      const err = new Error('This task is not awaiting technical audit approval.');
+      err.status = 400;
+      throw err;
+    }
+
+    const assigneeId = task.pendingAssigneeId;
+    await db.sequelize.transaction(async (t) => {
+      await db.TaskEvent.create({
+        id: uuidv4(),
+        taskId: task.id,
+        fromStatus: task.status,
+        toStatus: task.status,
+        actorUserId: actor.id,
+        reasonCategory: 'technical_audit_approved',
+      }, { transaction: t });
+      await task.update({ auditStatus: 'approved', assigneeId, pendingAssigneeId: null }, { transaction: t });
+    });
+
+    if (assigneeId) {
+      db.User.findByPk(assigneeId).then((assignee) => {
+        if (!assignee) return;
+        if (assignee.email) {
+          EmailService.sendTaskAssigned(assignee.email, assignee.name, task.title, task.project?.name, task.dueAt);
+        }
+        NotificationService.notify(assignee.id, orgId, {
+          type: 'task_assigned',
+          title: `New task assigned: "${task.title}"`,
+          body: `You've been assigned a task on ${task.project?.name}. Status: To do.`,
+          ...taskNotifyRef(task.projectId, task.id),
+        });
+      }).catch(() => {});
+    }
+
+    return this.getById(task.id, orgId, task.projectId);
+  }
+
+  async rejectAudit(taskId, orgId, actor, note) {
+    const task = await db.Task.findOne({ where: { id: taskId, orgId } });
+    if (!task) {
+      const err = new Error('Task not found.');
+      err.status = 404;
+      throw err;
+    }
+    if (!task.requiresTechnicalAudit || task.auditStatus !== 'pending') {
+      const err = new Error('This task is not awaiting technical audit approval.');
+      err.status = 400;
+      throw err;
+    }
+
+    await db.sequelize.transaction(async (t) => {
+      await db.TaskEvent.create({
+        id: uuidv4(),
+        taskId: task.id,
+        fromStatus: task.status,
+        toStatus: task.status,
+        actorUserId: actor.id,
+        reasonCategory: 'technical_audit_rejected',
+        note: note || null,
+      }, { transaction: t });
+      await task.update({ auditStatus: 'rejected' }, { transaction: t });
+    });
+
+    if (task.createdBy) {
+      NotificationService.notify(task.createdBy, orgId, {
+        type: 'task_update',
+        title: `Technical audit rejected: "${task.title}"`,
+        body: note ? `Reviewer note: ${note}` : 'The technical audit for this task was rejected.',
+        ...taskNotifyRef(task.projectId, task.id),
+      });
+    }
+
+    return this.getById(task.id, orgId, task.projectId);
   }
 
   async transition(taskId, orgId, newStatus, actor, reasonCategory, note) {

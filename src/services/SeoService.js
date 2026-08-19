@@ -1,8 +1,13 @@
 const xlsx = require('xlsx');
 const { Op } = require('sequelize');
 const { Keyword, Backlink, ContentSubmission, BlogTask, RankSnapshot, Project, Client, WhiteLabelConfig, Task, User, Role, Stage, ProjectAssignment } = require('../models');
-const { createPdfBuffer, drawTable, drawFooter, BRAND_COLOR } = require('./PdfService');
-const { letterheadForOrg, loadLetterheadLogo, drawPdfKitLetterhead } = require('./letterhead');
+const {
+  createPdfBuffer, drawTable, drawFooter, drawReportFooter, drawStatCards, drawPill, BRAND_COLOR,
+} = require('./PdfService');
+const {
+  letterheadForOrg, loadLetterheadLogo, drawPdfKitLetterhead,
+  normalizeLetterheadFields, filterLetterheadFields, letterheadShowsLogo,
+} = require('./letterhead');
 const TaskService = require('./TaskService');
 const NotificationService = require('./NotificationService');
 const { performAction } = require('../workflow/engine');
@@ -316,12 +321,30 @@ async function lockedKeywordIdSet(projectId) {
 // services/SoftDeleteService.js). Keyword already modelled this as its
 // status ENUM: inactive keywords stay on the sheet with their rank history
 // intact but drop out of the content pool and the default listing.
-async function deleteKeyword(id, orgId) {
+/**
+ * Deactivates a single keyword — same "delete" as everywhere else in this app
+ * (see models/softDeletable.js): nothing is destroyed, a status flip drops it
+ * out of the active sheet.
+ *
+ * Previously admin-only regardless of who added the keyword, which meant the
+ * person who typed it in couldn't undo their own mistake. Now the submitter
+ * can delete it themselves too, but only while it's still theirs to take
+ * back — once a writer is on the hook for it or its content has been
+ * approved, only an admin/manager can touch it (same as `deleteContent`'s
+ * submitter-vs-manager split).
+ */
+async function deleteKeyword(id, orgId, actor) {
   const kw = await Keyword.findOne({
     where: { id },
     include: [{ model: Project, as: 'project', where: { orgId }, attributes: [] }],
   });
   if (!kw) throw Object.assign(new Error('Keyword not found'), { status: 404 });
+
+  const isManager = ['super_admin', 'admin'].includes(actor?.role?.key)
+    || !!actor?.role?.permissions?.['projects.manage'];
+  if (!isManager && kw.createdBy !== actor?.id) {
+    throw Object.assign(new Error('Only the person who added this keyword (or an admin) can set it to Inactive.'), { status: 403 });
+  }
   if (kw.assignedWriterId) {
     throw Object.assign(new Error('This keyword is assigned to a content writer and cannot be set to Inactive.'), { status: 400 });
   }
@@ -1719,23 +1742,93 @@ async function syncApprovedBlogTasks(orgId, userId) {
   }
 }
 
-// Deactivates rather than destroys — see services/SoftDeleteService.js.
-async function deleteBlogTask(id, orgId, active = false) {
+/**
+ * Deactivates (or reactivates) a blog row — see models/softDeletable.js.
+ *
+ * Deactivating is admin-only by default, but same as `deleteKeyword`: the
+ * person who added the row can also take it back themselves while it's still
+ * theirs to take back — once it's been approved, only an admin/manager can.
+ * Reactivating stays admin-only (the route it's called from keeps `adminOnly`),
+ * so `actor` is only checked on the deactivate path.
+ */
+async function deleteBlogTask(id, orgId, active = false, actor = null) {
   const bt = await BlogTask.findOne({
     where: { id },
     include: [{ model: Project, as: 'project', where: { orgId }, attributes: [] }],
   });
   if (!bt) throw Object.assign(new Error('Blog task not found'), { status: 404 });
-  if (!active && bt.status === 'approved') {
-    throw Object.assign(new Error('This blog has approved content and cannot be set to Inactive.'), { status: 400 });
+
+  if (!active) {
+    const isManager = ['super_admin', 'admin'].includes(actor?.role?.key)
+      || !!actor?.role?.permissions?.['projects.manage'];
+    if (!isManager && bt.createdBy !== actor?.id) {
+      throw Object.assign(new Error('Only the person who added this blog (or an admin) can set it to Inactive.'), { status: 403 });
+    }
+    if (bt.status === 'approved') {
+      throw Object.assign(new Error('This blog has approved content and cannot be set to Inactive.'), { status: 400 });
+    }
   }
   await bt.update({ isActive: active });
   return bt;
 }
 
+/** Same row set as the Blog Sheet tab (every row, active or inactive) — spreadsheet-friendly. */
+async function generateBlogCsv(projectId, orgId) {
+  const project = await assertProjectAccess(projectId, orgId);
+  const rows = await BlogTask.findAll({
+    where: { projectId },
+    include: [{ association: 'assignedWriter', attributes: ['id', 'name'] }],
+    order: SHEET_ORDER,
+  });
+
+  const headers = [
+    'Type', 'Blog Title', 'Main Keyword', 'Volume', 'KD', 'Supporting Keywords',
+    'URL Slug', 'Target Service Page', 'Status', 'Writer', 'Published URL',
+  ];
+  const csvRows = rows.map((b) => [
+    b.contentType || '',
+    b.title,
+    b.mainKeyword || '',
+    b.volume ?? '',
+    b.kd ?? '',
+    b.supportingKeywords || '',
+    b.urlSlug || '',
+    b.targetServicePage || '',
+    b.status.charAt(0).toUpperCase() + b.status.slice(1),
+    b.assignedWriter?.name || '',
+    b.publishedUrl || '',
+  ]);
+  const csv = [headers, ...csvRows]
+    .map((row) => row.map((v) => `"${String(v ?? '').replace(/"/g, '""')}"`).join(','))
+    .join('\n');
+  return { csv, project };
+}
+
 // ─── Keyword / Backlink Report PDFs ───────────────────────────────────────────
 
-async function _loadSeoReportContext(projectId, orgId) {
+// Standard SEO difficulty banding — used to color-code the Difficulty column
+// on the keyword report instead of a bare number.
+function keywordDifficultyTier(kd) {
+  if (kd == null) return { label: '—', bg: '#F3F4F6', color: '#6B7280' };
+  if (kd <= 30) return { label: `${kd} · Easy`, bg: '#ECFDF5', color: '#047857' };
+  if (kd <= 60) return { label: `${kd} · Medium`, bg: '#FFFBEB', color: '#B45309' };
+  return { label: `${kd} · Hard`, bg: '#FEF2F2', color: '#B91C1C' };
+}
+
+function keywordStatusTier(status) {
+  return status === 'Inactive'
+    ? { bg: '#F3F4F6', color: '#6B7280' }
+    : { bg: '#ECFDF5', color: '#047857' };
+}
+
+/**
+ * @param {string[]|null} [letterheadFields] Which company detail fields (logo,
+ *   address, tax number, email, phone, website — see services/letterhead.js)
+ *   print on this export's letterhead. Set from the "Company details" checkbox
+ *   list next to the report's View/Download buttons; null means "not
+ *   specified" — show everything, the pre-existing default.
+ */
+async function _loadSeoReportContext(projectId, orgId, letterheadFields) {
   const project = await Project.findOne({
     where: { id: projectId, orgId },
     include: [{ model: Client, as: 'client', attributes: ['name'] }],
@@ -1747,14 +1840,59 @@ async function _loadSeoReportContext(projectId, orgId) {
   // SEO reports go to the client, so they carry the billing entity's letterhead
   // (the same one that appears on their invoices and quotations) rather than the
   // HR entity — see services/letterhead.js.
-  const letterhead = await letterheadForOrg(orgId, 'billing');
-  const logo = await loadLetterheadLogo(letterhead.logoUrl);
+  const fields = normalizeLetterheadFields(letterheadFields);
+  const letterhead = filterLetterheadFields(await letterheadForOrg(orgId, 'billing'), fields);
+  // drawPdfKitLetterhead treats an explicit `null` logo as "draw nothing" but
+  // `undefined` as "use the bundled default" — loadLetterheadLogo itself falls
+  // back to the bundled default for a blank URL, so unticking the box has to
+  // skip calling it rather than pass it an empty string.
+  const logo = letterheadShowsLogo(fields) ? await loadLetterheadLogo(letterhead.logoUrl) : null;
   return { project, brandName, brandColor, letterhead, logo };
 }
 
-async function generateKeywordReportBuffer(projectId, orgId) {
-  const { project, brandName, brandColor, letterhead, logo } = await _loadSeoReportContext(projectId, orgId);
+/** Same row set as the PDF report (every keyword, active or inactive) — spreadsheet-friendly. */
+async function generateKeywordCsv(projectId, orgId) {
+  const project = await assertProjectAccess(projectId, orgId);
+  const keywords = await Keyword.findAll({
+    where: { projectId },
+    include: [{ association: 'assignedWriter', attributes: ['id', 'name'] }],
+    order: SHEET_ORDER,
+  });
+
+  const headers = [
+    'Main Keyword', 'Supporting Keywords', 'Volume', 'KD', 'Status',
+    'Target Location', 'Target Page', 'Target URL', 'Assigned Writer',
+  ];
+  const rows = keywords.map((k) => [
+    k.primaryKeyword,
+    k.secondaryKeywords || '',
+    k.volume ?? '',
+    k.kd ?? '',
+    k.status === 'inactive' ? 'Inactive' : 'Active',
+    k.targetLocation || '',
+    k.pageName || '',
+    k.targetUrl || '',
+    k.assignedWriter?.name || '',
+  ]);
+  const csv = [headers, ...rows]
+    .map((row) => row.map((v) => `"${String(v ?? '').replace(/"/g, '""')}"`).join(','))
+    .join('\n');
+  return { csv, project };
+}
+
+async function generateKeywordReportBuffer(projectId, orgId, letterheadFields) {
+  const { project, brandName, brandColor, letterhead, logo } = await _loadSeoReportContext(projectId, orgId, letterheadFields);
   const keywords = await Keyword.findAll({ where: { projectId }, order: SHEET_ORDER });
+
+  const activeCount = keywords.filter((k) => k.status !== 'inactive').length;
+  const withVolume = keywords.filter((k) => k.volume != null);
+  const avgVolume = withVolume.length
+    ? Math.round(withVolume.reduce((sum, k) => sum + k.volume, 0) / withVolume.length)
+    : null;
+  const withKd = keywords.filter((k) => k.kd != null);
+  const avgKd = withKd.length
+    ? Math.round(withKd.reduce((sum, k) => sum + k.kd, 0) / withKd.length)
+    : null;
 
   const buffer = await createPdfBuffer((doc) => {
     drawPdfKitLetterhead(doc, letterhead, {
@@ -1764,19 +1902,44 @@ async function generateKeywordReportBuffer(projectId, orgId) {
       logo,
     });
 
-    doc.font('Helvetica-Bold').fontSize(13).fillColor('#111111').text(`Keywords (${keywords.length})`);
+    if (keywords.length > 0) {
+      // At-a-glance summary before the raw table — what a client-facing agency
+      // report leads with, instead of dropping straight into a data dump.
+      drawStatCards(doc, [
+        { label: 'Total Keywords', value: keywords.length },
+        { label: 'Active', value: activeCount },
+        { label: 'Avg Search Volume', value: avgVolume != null ? avgVolume.toLocaleString() : '—' },
+        { label: 'Avg Difficulty', value: avgKd ?? '—' },
+      ], { color: brandColor });
+    }
+
+    doc.font('Helvetica-Bold').fontSize(13).fillColor('#111111').text('Keyword Details');
     doc.moveDown(0.5);
     if (keywords.length === 0) {
       doc.font('Helvetica-Oblique').fontSize(10).fillColor('#999999').text('No keywords recorded yet.');
     } else {
       drawTable(doc, {
+        headerBg: brandColor,
+        headerTextColor: '#FFFFFF',
         columns: [
           { label: 'Sr', key: 'sr', width: 4, align: 'left' },
-          { label: 'Main Keyword', key: 'main', width: 14 },
-          { label: 'Supporting Keywords', key: 'support', width: 20 },
-          { label: 'Volume', key: 'volume', width: 7, align: 'right' },
-          { label: 'KD', key: 'kd', width: 5, align: 'right' },
-          { label: 'Status', key: 'status', width: 8 },
+          { label: 'Main Keyword', key: 'main', width: 15 },
+          { label: 'Supporting Keywords', key: 'support', width: 19 },
+          { label: 'Volume', key: 'volume', width: 8, align: 'right' },
+          {
+            label: 'Difficulty', key: 'kd', width: 9, align: 'center',
+            render: (d, value, box) => {
+              const tier = keywordDifficultyTier(value);
+              drawPill(d, tier.label, box, { bg: tier.bg, color: tier.color });
+            },
+          },
+          {
+            label: 'Status', key: 'status', width: 8, align: 'center',
+            render: (d, value, box) => {
+              const tier = keywordStatusTier(value);
+              drawPill(d, value, box, { bg: tier.bg, color: tier.color });
+            },
+          },
           { label: 'Target Location', key: 'location', width: 12 },
           { label: 'Target Page', key: 'page', width: 10 },
         ],
@@ -1785,7 +1948,7 @@ async function generateKeywordReportBuffer(projectId, orgId) {
           main: k.primaryKeyword,
           support: k.secondaryKeywords || '—',
           volume: k.volume != null ? k.volume.toLocaleString() : '—',
-          kd: k.kd ?? '—',
+          kd: k.kd ?? null,
           status: k.status === 'inactive' ? 'Inactive' : 'Active',
           location: k.targetLocation || '—',
           page: k.pageName || '—',
@@ -1793,7 +1956,7 @@ async function generateKeywordReportBuffer(projectId, orgId) {
       });
     }
 
-    drawFooter(doc, `Generated by ${brandName}`);
+    drawReportFooter(doc, { leftText: `Generated by ${brandName}` });
   }, {
     layout: 'landscape',
     margin: 40,
@@ -1806,8 +1969,8 @@ async function generateKeywordReportBuffer(projectId, orgId) {
   return { buffer, project };
 }
 
-async function generateBacklinkReportBuffer(projectId, orgId) {
-  const { project, brandName, brandColor, letterhead, logo } = await _loadSeoReportContext(projectId, orgId);
+async function generateBacklinkReportBuffer(projectId, orgId, letterheadFields) {
+  const { project, brandName, brandColor, letterhead, logo } = await _loadSeoReportContext(projectId, orgId, letterheadFields);
   const backlinks = await Backlink.findAll({
     where: { projectId },
     include: [{ association: 'assignedWriter', attributes: ['id', 'name'] }],
@@ -1870,5 +2033,5 @@ module.exports = {
   listBlogTasks, createBlogTask, updateBlogTask,
   listBlogSheet, createBlogSheetRow, submitBlogDeliverable, bulkImportBlogTasks,
   reviewBlogTask, deleteBlogTask, syncApprovedBlogTasks,
-  generateKeywordReportBuffer, generateBacklinkReportBuffer,
+  generateKeywordReportBuffer, generateBacklinkReportBuffer, generateKeywordCsv, generateBlogCsv,
 };

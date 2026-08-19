@@ -93,9 +93,19 @@ function drawHeader(doc, brand, subtitle, opts = {}) {
 // before drawing so rows never overlap, and starts a fresh page (redrawing the
 // header row) when a row would run past the bottom margin.
 //
-// columns: [{ label, key, width, align? }]
+// columns: [{ label, key, width, align?, render? }] — `render(doc, value, box)`
+//   (box: { x, y, width, height, row }) draws the cell itself instead of the
+//   default left/right-aligned text, for things like colored status pills
+//   (see drawPill below). Row-height is still measured off the plain value —
+//   fine for the short single-line badges this is meant for.
 // rows: array of plain objects keyed by column.key (string/number values)
-function drawTable(doc, { columns, rows, fontSize = 9, cellPadding = 5, zebra = true }) {
+// `headerBg`/`headerTextColor` let a caller brand the header row (e.g. a
+// client-facing report) without changing the default look for every other
+// table already using this.
+function drawTable(doc, {
+  columns, rows, fontSize = 9, cellPadding = 5, zebra = true,
+  headerBg = HEADER_BG, headerTextColor = '#555555', borderColor = BORDER_COLOR, zebraColor = '#FBFCFC',
+}) {
   const left = doc.page.margins.left;
   const usableWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
   const totalDefinedWidth = columns.reduce((sum, c) => sum + (c.width || 0), 0);
@@ -109,12 +119,12 @@ function drawTable(doc, { columns, rows, fontSize = 9, cellPadding = 5, zebra = 
 
   function drawHeaderRow() {
     const y = doc.y;
-    doc.font('Helvetica-Bold').fontSize(fontSize).fillColor('#555555');
+    doc.font('Helvetica-Bold').fontSize(fontSize).fillColor(headerTextColor);
     const headerHeight = Math.max(...columns.map((c, i) =>
       doc.heightOfString(c.label, { width: colWidths[i] - cellPadding * 2 })
     )) + cellPadding * 2;
-    doc.rect(left, y, usableWidth, headerHeight).fill(HEADER_BG);
-    doc.fillColor('#555555');
+    doc.rect(left, y, usableWidth, headerHeight).fill(headerBg);
+    doc.fillColor(headerTextColor);
     columns.forEach((c, i) => {
       doc.text(c.label.toUpperCase(), colX(i) + cellPadding, y + cellPadding, {
         width: colWidths[i] - cellPadding * 2,
@@ -122,7 +132,7 @@ function drawTable(doc, { columns, rows, fontSize = 9, cellPadding = 5, zebra = 
       });
     });
     doc.y = y + headerHeight;
-    doc.moveTo(left, doc.y).lineTo(left + usableWidth, doc.y).strokeColor(BORDER_COLOR).lineWidth(0.5).stroke();
+    doc.moveTo(left, doc.y).lineTo(left + usableWidth, doc.y).strokeColor(borderColor).lineWidth(0.5).stroke();
   }
 
   drawHeaderRow();
@@ -143,22 +153,93 @@ function drawTable(doc, { columns, rows, fontSize = 9, cellPadding = 5, zebra = 
 
     const y = doc.y;
     if (zebra && rowIndex % 2 === 1) {
-      doc.rect(left, y, usableWidth, rowHeight).fill('#FBFCFC');
+      doc.rect(left, y, usableWidth, rowHeight).fill(zebraColor);
     }
-    doc.fillColor(TEXT_COLOR);
     columns.forEach((c, i) => {
       const value = row[c.key] ?? '—';
+      if (c.render) {
+        c.render(doc, row[c.key], { x: colX(i), y, width: colWidths[i], height: rowHeight, row });
+        return;
+      }
+      doc.font('Helvetica').fontSize(fontSize).fillColor(TEXT_COLOR);
       doc.text(String(value), colX(i) + cellPadding, y + cellPadding, {
         width: colWidths[i] - cellPadding * 2,
         align: c.align || 'left',
       });
     });
     doc.y = y + rowHeight;
-    doc.moveTo(left, doc.y).lineTo(left + usableWidth, doc.y).strokeColor(BORDER_COLOR).lineWidth(0.5).stroke();
+    doc.moveTo(left, doc.y).lineTo(left + usableWidth, doc.y).strokeColor(borderColor).lineWidth(0.5).stroke();
   });
 
   doc.x = left;
   doc.moveDown(1);
+}
+
+// Small rounded-rect badge (status chips, difficulty tiers), centered within a
+// table cell's box ({ x, y, width }) — used via a column's `render` in
+// drawTable, or standalone.
+function drawPill(doc, text, { x, y, width }, { bg = '#F3F4F6', color = TEXT_COLOR, fontSize = 8 } = {}) {
+  doc.font('Helvetica-Bold').fontSize(fontSize);
+  const label = String(text);
+  const textWidth = doc.widthOfString(label);
+  const paddingX = 7;
+  const pillWidth = Math.min(width, textWidth + paddingX * 2);
+  const pillHeight = fontSize + 6;
+  const pillX = x + Math.max(0, (width - pillWidth) / 2);
+  doc.roundedRect(pillX, y, pillWidth, pillHeight, pillHeight / 2).fill(bg);
+  doc.fillColor(color).text(label, pillX, y + 3, { width: pillWidth, align: 'center', lineBreak: false });
+}
+
+// A row of "big number + label" summary cards under a report's letterhead —
+// the at-a-glance stats block real agency reports lead with, instead of
+// dropping the reader straight into a raw data table.
+// cards: [{ label, value }]
+function drawStatCards(doc, cards, { color = BRAND_COLOR, cardBg = '#F9FAFB', borderColor = BORDER_COLOR } = {}) {
+  if (!cards.length) return;
+  const left = doc.page.margins.left;
+  const usableWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+  const gap = 10;
+  const cardWidth = (usableWidth - gap * (cards.length - 1)) / cards.length;
+  const cardHeight = 46;
+  const y = doc.y;
+  cards.forEach((card, i) => {
+    const x = left + i * (cardWidth + gap);
+    doc.roundedRect(x, y, cardWidth, cardHeight, 6).fillAndStroke(cardBg, borderColor);
+    doc.font('Helvetica-Bold').fontSize(16).fillColor(color)
+      .text(String(card.value), x + 10, y + 9, { width: cardWidth - 20, lineBreak: false });
+    doc.font('Helvetica').fontSize(7.5).fillColor(MUTED_COLOR)
+      .text(card.label.toUpperCase(), x + 10, y + 29, { width: cardWidth - 20, lineBreak: false });
+  });
+  doc.x = left;
+  doc.y = y + cardHeight;
+  doc.moveDown(1);
+}
+
+// Footer stamped on EVERY buffered page (drawFooter above only stamps the
+// last one) — `leftText` left-aligned, "Page X of Y" right-aligned, both on
+// the same line. Call once, after all content is drawn.
+function drawReportFooter(doc, { leftText = '', color = MUTED_COLOR } = {}) {
+  const range = typeof doc.bufferedPageRange === 'function' ? doc.bufferedPageRange() : null;
+  if (!range || !range.count) return;
+  const width = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+  for (let i = 0; i < range.count; i += 1) {
+    doc.switchToPage(range.start + i);
+    const bottom = doc.page.height - Math.max(24, doc.page.margins.bottom - 4);
+    // pdfkit auto-adds a page when text this close to the physical edge would
+    // "overflow" the margin box, even with an explicit y — same trap drawFooter
+    // avoids by only ever drawing once. Zeroing the bottom margin for this one
+    // write disables that check without touching layout anywhere else.
+    const savedBottomMargin = doc.page.margins.bottom;
+    doc.page.margins.bottom = 0;
+    doc.font('Helvetica').fontSize(8).fillColor(color);
+    if (leftText) {
+      doc.text(leftText, doc.page.margins.left, bottom, { width: width / 2, lineBreak: false });
+    }
+    doc.text(`Page ${i + 1} of ${range.count}`, doc.page.margins.left, bottom, {
+      width, align: 'right', lineBreak: false,
+    });
+    doc.page.margins.bottom = savedBottomMargin;
+  }
 }
 
 // A simple two-column "label: value" info table for letters/documents (info-grid
@@ -201,10 +282,14 @@ module.exports = {
   createPdfBuffer,
   drawHeader,
   drawTable,
+  drawPill,
+  drawStatCards,
   drawInfoRows,
   drawFooter,
+  drawReportFooter,
   fetchImageBuffer,
   BRAND_COLOR,
   TEXT_COLOR,
   MUTED_COLOR,
+  BORDER_COLOR,
 };

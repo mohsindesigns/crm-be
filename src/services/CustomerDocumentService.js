@@ -9,7 +9,7 @@ const EmailService = require('./EmailService');
 const { buildProjectName } = require('../utils/projectName');
 const { buildMergeTokens, renderTemplate, defaultServiceFragment, formatFeatures } = require('../utils/documentRenderer');
 const { buildDocumentPdfOnLetterhead } = require('./DocumentLetterheadPdf');
-const { letterheadForOrg, letterheadForClient } = require('./letterhead');
+const { letterheadForOrg, letterheadForClient, billingCompanyFor } = require('./letterhead');
 const { isTruthy } = require('./SoftDeleteService');
 
 const EDITABLE_STATUSES = ['draft', 'rejected', 'expired'];
@@ -100,13 +100,18 @@ class CustomerDocumentService {
    * type (QT / AGR / PRO), year, sequence — so the entity, kind and vintage read
    * straight off the number.
    *
-   * Quotations and agreements are billing documents, so the prefix comes from
-   * the company ticked "Use for invoices & quotations" (the primary one, when
-   * both are ticked). Orgs with no companies configured keep the legacy
-   * `DOC-0001` scheme so nothing renumbers on upgrade.
+   * Quotations and agreements are billing documents, so the prefix follows the
+   * same hard rule as invoice numbering (see InvoiceService#_nextNumber /
+   * letterhead.billingCompanyFor): a client on "Pay via CRM" is quoted by the
+   * LLC, everyone else by the LLP. A document with no linked client (legacy, or
+   * a cold prospect) falls back to whichever company is ticked primary for
+   * billing. Orgs with no companies configured keep the legacy `DOC-0001`
+   * scheme so nothing renumbers on upgrade.
    */
-  async _nextNumber(orgId, type = null, { transaction = null } = {}) {
-    const company = await db.Company.primaryFor(orgId, 'billing').catch(() => null);
+  async _nextNumber(orgId, type = null, { transaction = null, isStripe = null } = {}) {
+    const company = isStripe === null
+      ? await db.Company.primaryFor(orgId, 'billing').catch(() => null)
+      : await billingCompanyFor(orgId, isStripe, { transaction }).catch(() => null);
 
     if (!company) {
       const last = await db.CustomerDocument.findOne({
@@ -385,7 +390,9 @@ class CustomerDocumentService {
       : services;
     const packageId = (isCompare || isMenu) ? null : (data.packageId || normalizedServices?.[0]?.packageId);
     const pkg = packageId ? await db.Package.findOne({ where: { id: packageId, orgId } }) : null;
-    const number = await this._nextNumber(orgId, data.type);
+    const number = await this._nextNumber(orgId, data.type, {
+      isStripe: client ? client.billingMode === 'stripe' : null,
+    });
     const baseAmount = (isCompare || isMenu) ? 0 : this._computeBaseAmount({ ...data, services: normalizedServices }, pkg);
     const discountType = ['percent', 'fixed'].includes(data.discountType) ? data.discountType : null;
     const discountValue = discountType ? (parseFloat(data.discountValue) || 0) : null;

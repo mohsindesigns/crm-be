@@ -28,6 +28,11 @@ const publicInvoicesRouter = require('./routes/publicInvoices');
 const messagesRouter = require('./routes/messages');
 const portalMessagesRouter = require('./routes/portalMessages');
 const stripeWebhookRouter = require('./routes/stripeWebhook');
+const leadFormsRouter = require('./routes/leadForms');
+const publicLeadFormsRouter = require('./routes/publicLeadForms');
+const leadsRouter = require('./routes/leads');
+const portalLeadFormsRouter = require('./routes/portalLeadForms');
+const portalLeadsRouter = require('./routes/portalLeads');
 const errorHandler = require('./middleware/errorHandler');
 
 const { WhiteLabelConfig, Org } = require('./models');
@@ -103,6 +108,11 @@ app.use('/api/public/documents', publicDocumentsRouter);
 app.use('/api/public/invoices', publicInvoicesRouter);
 app.use('/api/messages', messagesRouter);
 app.use('/api/portal/messages', portalMessagesRouter);
+app.use('/api/lead-forms', leadFormsRouter);
+app.use('/api/public/lead-forms', publicLeadFormsRouter);
+app.use('/api/leads', leadsRouter);
+app.use('/api/portal/lead-forms', portalLeadFormsRouter);
+app.use('/api/portal/leads', portalLeadsRouter);
 
 // 404
 app.use((req, res) => res.status(404).json({ message: 'Not found.' }));
@@ -129,6 +139,23 @@ db.sequelize.query(
     '$."billing.update"', CAST('true' AS JSON)),
     '$."clients.read"',  CAST('true' AS JSON))
   WHERE JSON_EXTRACT(permissions, '$."billing.read"') = true`
+).catch(() => {});
+
+// Lead management shipped after some orgs were already seeded — grant the new
+// leads.* permissions to the same role keys seed.js now gives them by default,
+// so an existing install doesn't need a full reseed to use the feature.
+db.sequelize.query(
+  `UPDATE roles SET permissions = JSON_SET(JSON_SET(JSON_SET(permissions,
+    '$."leads.read"',   CAST('true' AS JSON)),
+    '$."leads.act"',    CAST('true' AS JSON)),
+    '$."leads.manage"', CAST('true' AS JSON))
+  WHERE \`key\` IN ('project_manager', 'ads_manager') AND JSON_EXTRACT(permissions, '$."leads.manage"') IS NULL`
+).catch(() => {});
+db.sequelize.query(
+  `UPDATE roles SET permissions = JSON_SET(JSON_SET(permissions,
+    '$."leads.read"', CAST('true' AS JSON)),
+    '$."leads.act"',  CAST('true' AS JSON))
+  WHERE \`key\` = 'account_manager' AND JSON_EXTRACT(permissions, '$."leads.read"') IS NULL`
 ).catch(() => {});
 
 // Add payment proof URL column to invoices. Errors silently if column already exists.
@@ -291,6 +318,9 @@ app.schemaReady = (async () => {
     await db.SlaPolicy.ensureSchema();
     await db.HrDepartment.ensureSchema();
     await db.HrDesignation.ensureSchema();
+    await db.LeadForm.ensureSchema();  // new table; depends on projects
+    await db.Lead.ensureSchema();      // new table; depends on lead_forms/projects/clients
+    await db.LeadEvent.ensureSchema(); // new table; depends on leads
   } catch (err) {
     console.error('[Schema] ensureSchema failed:', err.message);
   }

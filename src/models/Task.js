@@ -53,6 +53,21 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.ENUM('todo', 'in_progress', 'submitted', 'in_review', 'approved', 'rejected', 'done'),
       defaultValue: 'todo',
     },
+    // When set at creation, the task is held unassigned until an admin approves
+    // the technical audit — see TaskService.create/approveAudit/rejectAudit.
+    requiresTechnicalAudit: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
+    // The assignee the creator originally picked, parked here while
+    // requiresTechnicalAudit is pending — copied into assigneeId on approval.
+    pendingAssigneeId: {
+      type: DataTypes.CHAR(36),
+      references: { model: 'users', key: 'id' },
+    },
+    auditStatus: {
+      type: DataTypes.ENUM('pending', 'approved', 'rejected'),
+    },
     reasonCategory: {
       type: DataTypes.STRING(100),
     },
@@ -110,6 +125,7 @@ module.exports = (sequelize, DataTypes) => {
     Task.belongsTo(db.ProjectCycle, { foreignKey: 'cycleId', as: 'cycle' });
     Task.belongsTo(db.User, { foreignKey: 'assigneeId', as: 'assignee' });
     Task.belongsTo(db.User, { foreignKey: 'reviewerId', as: 'reviewer' });
+    Task.belongsTo(db.User, { foreignKey: 'pendingAssigneeId', as: 'pendingAssignee' });
     Task.belongsTo(db.User, { foreignKey: 'createdBy', as: 'creator' });
     Task.belongsTo(db.RecurringTaskRule, { foreignKey: 'ruleId', as: 'rule' });
     Task.hasMany(db.TaskEvent, { foreignKey: 'taskId', as: 'events' });

@@ -49,7 +49,7 @@ const SYSTEM_ROLES = [
 
 // Department roles — matched to ownerRoleSlot keys used in workflow stages
 const DEPARTMENT_ROLES = [
-  { id: uuidv4(), orgId: ORG_ID, key: 'project_manager',  name: 'Project Manager',      color: '#2B6CB0', isSystemRole: false, permissions: { 'projects.read': true, 'projects.act': true, 'projects.manage': true, 'clients.read': true, 'users.read': true } },
+  { id: uuidv4(), orgId: ORG_ID, key: 'project_manager',  name: 'Project Manager',      color: '#2B6CB0', isSystemRole: false, permissions: { 'projects.read': true, 'projects.act': true, 'projects.manage': true, 'clients.read': true, 'users.read': true, 'leads.read': true, 'leads.act': true, 'leads.manage': true } },
   { id: uuidv4(), orgId: ORG_ID, key: 'ui_designer',      name: 'UI/UX Designer',        color: '#7B2D8B', isSystemRole: false, permissions: { 'projects.read': true, 'projects.act': true } },
   { id: uuidv4(), orgId: ORG_ID, key: 'web_developer',    name: 'Web Developer',         color: '#276749', isSystemRole: false, permissions: { 'projects.read': true, 'projects.act': true } },
   { id: uuidv4(), orgId: ORG_ID, key: 'app_developer',    name: 'App Developer',         color: '#1A5276', isSystemRole: false, permissions: { 'projects.read': true, 'projects.act': true } },
@@ -58,8 +58,8 @@ const DEPARTMENT_ROLES = [
   { id: uuidv4(), orgId: ORG_ID, key: 'project_strategist', name: 'Project Strategist',  color: '#1D6A96', isSystemRole: false, permissions: { 'projects.read': true, 'projects.act': true } },
   { id: uuidv4(), orgId: ORG_ID, key: 'link_builder',     name: 'Link Builder',          color: '#145A32', isSystemRole: false, permissions: { 'projects.read': true, 'projects.act': true } },
   { id: uuidv4(), orgId: ORG_ID, key: 'social_manager',   name: 'Social Media Manager',  color: '#6C3483', isSystemRole: false, permissions: { 'projects.read': true, 'projects.act': true } },
-  { id: uuidv4(), orgId: ORG_ID, key: 'ads_manager',      name: 'Ads Manager',           color: '#922B21', isSystemRole: false, permissions: { 'projects.read': true, 'projects.act': true } },
-  { id: uuidv4(), orgId: ORG_ID, key: 'account_manager',  name: 'Account Manager',       color: '#1B4F72', isSystemRole: false, permissions: { 'projects.read': true, 'projects.act': true, 'clients.read': true } },
+  { id: uuidv4(), orgId: ORG_ID, key: 'ads_manager',      name: 'Ads Manager',           color: '#922B21', isSystemRole: false, permissions: { 'projects.read': true, 'projects.act': true, 'leads.read': true, 'leads.act': true, 'leads.manage': true } },
+  { id: uuidv4(), orgId: ORG_ID, key: 'account_manager',  name: 'Account Manager',       color: '#1B4F72', isSystemRole: false, permissions: { 'projects.read': true, 'projects.act': true, 'clients.read': true, 'leads.read': true, 'leads.act': true } },
 ];
 
 const SEO_STAGES = [

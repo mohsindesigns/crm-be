@@ -79,6 +79,7 @@ function taskIncludes() {
     { model: User, as: 'assignee', attributes: ['id', 'name', 'avatarUrl'] },
     { model: User, as: 'reviewer', attributes: ['id', 'name', 'avatarUrl'] },
     { model: User, as: 'creator', attributes: ['id', 'name'] },
+    { model: User, as: 'pendingAssignee', attributes: ['id', 'name', 'avatarUrl'] },
     {
       model: Project,
       as: 'project',
@@ -299,6 +300,7 @@ router.get('/mine', async (req, res, next) => {
       { model: User, as: 'assignee', attributes: ['id', 'name', 'avatarUrl'] },
       { model: User, as: 'reviewer', attributes: ['id', 'name', 'avatarUrl'] },
       { model: User, as: 'creator', attributes: ['id', 'name'] },
+      { model: User, as: 'pendingAssignee', attributes: ['id', 'name', 'avatarUrl'] },
       ],
       order: taskOrder(req.query.sort || 'due_asc'),
     });

@@ -15,5 +15,9 @@ router.post('/', rbac('projects.act'), (req, res, next) => TaskController.create
 router.get('/:taskId', (req, res, next) => TaskController.getById(req, res, next));
 // Any project member can transition their assigned tasks
 router.patch('/:taskId/status', (req, res, next) => TaskController.transition(req, res, next));
+// Admin-only: decide a task flagged "Technical Audit" — approving assigns it
+// to whoever the creator originally picked; rejecting leaves it unassigned.
+router.post('/:taskId/audit-approve', (req, res, next) => TaskController.approveAudit(req, res, next));
+router.post('/:taskId/audit-reject', (req, res, next) => TaskController.rejectAudit(req, res, next));
 
 module.exports = router;

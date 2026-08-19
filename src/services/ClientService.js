@@ -5,6 +5,7 @@ const { v4: uuidv4 } = require('uuid');
 const { buildProjectName } = require('../utils/projectName');
 const RetainerService = require('./RetainerService');
 const InvoiceService = require('./InvoiceService');
+const { billingCompanyFor } = require('./letterhead');
 const { isTruthy } = require('./SoftDeleteService');
 
 class ClientService {
@@ -156,6 +157,25 @@ class ClientService {
       throw err;
     }
     return client;
+  }
+
+  /**
+   * The legal entity (LLC or LLP) that will issue this client's invoices and
+   * quotations, per their "Pay via CRM" billing mode — surfaced read-only on
+   * the client page so staff can see which company applies without opening a
+   * document. Same hard rule InvoiceService/CustomerDocumentService use — see
+   * letterhead.billingCompanyFor. Null when the org has no companies configured
+   * (documents fall back to the legacy branding letterhead in that case).
+   */
+  async resolveBillingCompany(client, orgId) {
+    const company = await billingCompanyFor(orgId, client.billingMode === 'stripe').catch(() => null);
+    if (!company) return null;
+    return {
+      id: company.id,
+      legalName: company.legalName,
+      code: company.code,
+      officeLabel: company.officeLabel,
+    };
   }
 
   async create(orgId, data, actorUserId = null) {

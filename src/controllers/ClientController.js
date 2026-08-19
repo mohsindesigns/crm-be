@@ -24,9 +24,11 @@ class ClientController {
 
   async getOne(req, res, next) {
     try {
-      res.json(await ClientService.findById(req.params.id, req.orgId, {
+      const client = await ClientService.findById(req.params.id, req.orgId, {
         includeInactiveContacts: isTruthy(req.query.includeInactive),
-      }));
+      });
+      const billingCompany = await ClientService.resolveBillingCompany(client, req.orgId);
+      res.json({ ...client.toJSON(), billingCompany });
     } catch (err) { next(err); }
   }
 

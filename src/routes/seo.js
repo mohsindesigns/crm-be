@@ -29,9 +29,21 @@ router.post('/projects/:projectId/keywords', rbac('projects.act'), async (req, r
   } catch (e) { next(e); }
 });
 
+// Which company detail fields (logo, address, tax number, email, phone,
+// website, note) print on the report's letterhead — the "Company details"
+// checkbox list next to the report buttons. Comma-separated; absent means
+// "show everything" (unchanged from before this option existed).
+function letterheadFieldsFromQuery(req) {
+  return typeof req.query.fields === 'string' && req.query.fields.length
+    ? req.query.fields.split(',').map((s) => s.trim()).filter(Boolean)
+    : null;
+}
+
 router.get('/projects/:projectId/keywords/pdf', rbac('projects.read'), async (req, res, next) => {
   try {
-    const { buffer, project } = await SeoService.generateKeywordReportBuffer(req.params.projectId, req.orgId);
+    const { buffer, project } = await SeoService.generateKeywordReportBuffer(
+      req.params.projectId, req.orgId, letterheadFieldsFromQuery(req),
+    );
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="keyword-report-${project.id}.pdf"`);
     res.send(buffer);
@@ -40,10 +52,21 @@ router.get('/projects/:projectId/keywords/pdf', rbac('projects.read'), async (re
 
 router.get('/projects/:projectId/backlinks/pdf', rbac('projects.read'), async (req, res, next) => {
   try {
-    const { buffer, project } = await SeoService.generateBacklinkReportBuffer(req.params.projectId, req.orgId);
+    const { buffer, project } = await SeoService.generateBacklinkReportBuffer(
+      req.params.projectId, req.orgId, letterheadFieldsFromQuery(req),
+    );
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="backlink-report-${project.id}.pdf"`);
     res.send(buffer);
+  } catch (e) { next(e); }
+});
+
+router.get('/projects/:projectId/keywords/csv', rbac('projects.read'), async (req, res, next) => {
+  try {
+    const { csv, project } = await SeoService.generateKeywordCsv(req.params.projectId, req.orgId);
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="keywords-${project.id}.csv"`);
+    res.send(csv);
   } catch (e) { next(e); }
 });
 
@@ -63,10 +86,11 @@ router.patch('/keywords/:id', rbac('projects.act'), async (req, res, next) => {
 
 // Kept on the DELETE verb so existing clients don't break, but the effect is a
 // deactivation — nothing is destroyed. Reactivate via PATCH /keywords/:id
-// { status: 'active' }.
-router.delete('/keywords/:id', adminOnly, rbac('projects.act'), async (req, res, next) => {
+// { status: 'active' }. Not adminOnly: the keyword's own submitter can delete
+// it too while it's still unassigned/unapproved — see SeoService.deleteKeyword.
+router.delete('/keywords/:id', rbac('projects.act'), async (req, res, next) => {
   try {
-    const kw = await SeoService.deleteKeyword(req.params.id, req.orgId);
+    const kw = await SeoService.deleteKeyword(req.params.id, req.orgId, req.user);
     res.json({ message: 'Keyword set to Inactive', keyword: kw });
   } catch (e) { next(e); }
 });
@@ -271,6 +295,15 @@ router.get('/projects/:projectId/blog-sheet', rbac('projects.read'), async (req,
   } catch (e) { next(e); }
 });
 
+router.get('/projects/:projectId/blog-sheet/csv', rbac('projects.read'), async (req, res, next) => {
+  try {
+    const { csv, project } = await SeoService.generateBlogCsv(req.params.projectId, req.orgId);
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="blog-sheet-${project.id}.csv"`);
+    res.send(csv);
+  } catch (e) { next(e); }
+});
+
 router.post('/projects/:projectId/blog-sheet', rbac('projects.act'), async (req, res, next) => {
   try {
     const bt = await SeoService.createBlogSheetRow(req.params.projectId, req.body, req.orgId, req.user.id);
@@ -317,10 +350,11 @@ router.patch('/blog-sheet/:id/review', rbac('projects.act'), async (req, res, ne
   } catch (e) { next(e); }
 });
 
-// Deactivates, never destroys.
-router.delete('/blog-sheet/:id', adminOnly, rbac('projects.act'), async (req, res, next) => {
+// Deactivates, never destroys. Not adminOnly: the blog's own submitter can
+// delete it too while it's still unapproved — see SeoService.deleteBlogTask.
+router.delete('/blog-sheet/:id', rbac('projects.act'), async (req, res, next) => {
   try {
-    const bt = await SeoService.deleteBlogTask(req.params.id, req.orgId, false);
+    const bt = await SeoService.deleteBlogTask(req.params.id, req.orgId, false, req.user);
     res.json({ message: 'Blog set to Inactive', blog: bt });
   } catch (e) { next(e); }
 });
