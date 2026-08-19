@@ -19,6 +19,7 @@ const mediaRouter = require('./routes/media');
 const seoRouter = require('./routes/seo');
 const hrRouter = require('./routes/hr');
 const analyticsRouter = require('./routes/analytics');
+const reportsRouter = require('./routes/reports');
 const retainersRouter = require('./routes/retainers');
 const myTasksRouter = require('./routes/myTasks');
 const portalRouter = require('./routes/portal');
@@ -100,6 +101,7 @@ app.use('/api/media', mediaRouter);
 app.use('/api/seo', seoRouter);
 app.use('/api/hr', hrRouter);
 app.use('/api/analytics', analyticsRouter);
+app.use('/api/reports', reportsRouter);
 app.use('/api/retainers', retainersRouter);
 app.use('/api/tasks', myTasksRouter);
 app.use('/api/portal', portalRouter);
@@ -289,8 +291,8 @@ app.schemaReady = (async () => {
     await db.HrDocument.ensureSchema(); // widens `type` ENUM (cv, cnic_front, cnic_back, ...)
     await db.Keyword.ensureSchema();    // adds targetLocation
     await db.RecurringTaskRule.ensureSchema(); // new table; depends on projects
-    await db.Task.ensureSchema();       // adds ruleId — depends on recurring_task_rules
-    await db.Artifact.ensureSchema();   // adds taskId — depends on tasks
+    await db.Task.ensureSchema();       // adds ruleId/acceptedAt + widens status ENUM w/ `accepted` — depends on recurring_task_rules
+    await db.Artifact.ensureSchema();   // adds taskId/taskEventId — depends on tasks
     await db.Backlink.ensureSchema();   // widens `linkType` ENUM + adds date/domain/status/spamScore
     await db.ContentSubmission.ensureSchema(); // adds wordCount
     await db.BlogTask.ensureSchema();          // adds sheet columns + approval workflow fields

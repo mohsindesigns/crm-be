@@ -21,6 +21,14 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.CHAR(36),
       references: { model: 'tasks', key: 'id' },
     },
+    // Set when this file/voice message was attached to a specific task-status
+    // transition (e.g. the "Send back for changes" note) rather than uploaded as
+    // a general deliverable — lets the Activity timeline show it under that exact
+    // event instead of mixing it into the Deliverable list.
+    taskEventId: {
+      type: DataTypes.CHAR(36),
+      references: { model: 'task_events', key: 'id' },
+    },
     stageKey: {
       type: DataTypes.STRING(100),
       allowNull: false,
@@ -57,6 +65,7 @@ module.exports = (sequelize, DataTypes) => {
     Artifact.belongsTo(db.Project, { foreignKey: 'projectId', as: 'project' });
     Artifact.belongsTo(db.User, { foreignKey: 'uploadedBy', as: 'uploader' });
     Artifact.belongsTo(db.Task, { foreignKey: 'taskId', as: 'task' });
+    Artifact.belongsTo(db.TaskEvent, { foreignKey: 'taskEventId', as: 'taskEvent' });
   };
 
   Artifact.ensureSchema = () => ensureColumns(Artifact);

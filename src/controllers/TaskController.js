@@ -49,7 +49,8 @@ class TaskController {
         req.body.status,
         req.user,
         req.body.reasonCategory,
-        req.body.note
+        req.body.note,
+        req.body.attachmentIds
       );
       res.json(task);
     } catch (err) { next(err); }

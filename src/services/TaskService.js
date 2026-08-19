@@ -15,8 +15,14 @@ function taskNotifyRef(projectId, taskId) {
 // 'issue') don't need the submit->review pipeline, they're a single owner marking
 // their own work complete. The submit/review chain stays available for tasks that
 // do use it (a reviewerId is set).
+//
+// ACCEPTED sits between TODO and everything else for tasks handed to someone
+// other than their creator — see the acceptance gate in #transition. Self-assigned
+// tasks skip it entirely (no one to hand acceptance to), so TODO also keeps its
+// direct paths for them.
 const VALID_TRANSITIONS = {
-  [TASK_STATUS.TODO]: [TASK_STATUS.IN_PROGRESS, TASK_STATUS.SUBMITTED, TASK_STATUS.DONE],
+  [TASK_STATUS.TODO]: [TASK_STATUS.ACCEPTED, TASK_STATUS.IN_PROGRESS, TASK_STATUS.SUBMITTED, TASK_STATUS.DONE],
+  [TASK_STATUS.ACCEPTED]: [TASK_STATUS.IN_PROGRESS, TASK_STATUS.SUBMITTED, TASK_STATUS.DONE],
   [TASK_STATUS.IN_PROGRESS]: [TASK_STATUS.SUBMITTED, TASK_STATUS.DONE],
   // Content submit lands on "submitted"; strategist approve/reject can go straight
   // from there (or via in_review). Done→approved heals older content tasks that
@@ -71,7 +77,10 @@ class TaskService {
         {
           model: db.TaskEvent,
           as: 'events',
-          include: [{ model: db.User, as: 'actor', attributes: ['id', 'name'] }],
+          include: [
+            { model: db.User, as: 'actor', attributes: ['id', 'name'] },
+            { model: db.Artifact, as: 'attachments', where: { isActive: true }, required: false },
+          ],
           separate: true,
           order: [['createdAt', 'ASC'], ['id', 'ASC']],
         },
@@ -256,7 +265,7 @@ class TaskService {
     return this.getById(task.id, orgId, task.projectId);
   }
 
-  async transition(taskId, orgId, newStatus, actor, reasonCategory, note) {
+  async transition(taskId, orgId, newStatus, actor, reasonCategory, note, attachmentIds) {
     const task = await db.Task.findOne({
       where: { id: taskId, orgId },
       include: [
@@ -285,6 +294,23 @@ class TaskService {
     }
     const effectiveReviewerId = task.reviewerId || task.createdBy || null;
     const usesReviewPipeline = !!(effectiveReviewerId && task.assigneeId && effectiveReviewerId !== task.assigneeId);
+
+    // A task handed to someone other than its creator carries an acceptance step,
+    // tracked as its own status + timestamp for the activity timeline. Self-assigned/
+    // unassigned tasks have no one to accept from, so they never need it. Only the
+    // assignee (or an admin standing in for them) may record the explicit accept —
+    // the UI gates its Submit/Complete actions on it — but the check stays advisory
+    // at this layer rather than a hard block, since several server-side integrations
+    // (blog/content submission, resubmission after a rejection) drive a task's status
+    // directly from the assignee's own action without ever hitting this endpoint
+    // first; that first action stamps acceptedAt itself, just as the explicit
+    // Accept click would.
+    const needsAcceptance = !!(task.assigneeId && task.assigneeId !== task.createdBy);
+    if (newStatus === TASK_STATUS.ACCEPTED && !isAdmin && task.assigneeId !== actor.id) {
+      const err = new Error('Only the assignee can accept this task.');
+      err.status = 403;
+      throw err;
+    }
 
     // Submit: assignee (or admin). Approve/reject: reviewer / assigner / admin.
     if (newStatus === TASK_STATUS.SUBMITTED && usesReviewPipeline) {
@@ -326,7 +352,7 @@ class TaskService {
     }
 
     await db.sequelize.transaction(async (t) => {
-      await db.TaskEvent.create({
+      const event = await db.TaskEvent.create({
         id: uuidv4(),
         taskId: task.id,
         fromStatus: task.status,
@@ -336,9 +362,23 @@ class TaskService {
         note,
       }, { transaction: t });
 
+      // Voice message / file attachments dropped on this specific transition (e.g.
+      // a "Send back for changes" note) — the assignee/reviewer uploads them first
+      // via /media/upload, then hands the resulting Artifact ids in here. Scoped to
+      // this task so a stray/foreign id can't get linked in.
+      if (Array.isArray(attachmentIds) && attachmentIds.length) {
+        await db.Artifact.update(
+          { taskEventId: event.id },
+          { where: { id: attachmentIds, taskId: task.id }, transaction: t },
+        );
+      }
+
       const update = { status: newStatus };
       if (newStatus === TASK_STATUS.DONE || newStatus === TASK_STATUS.APPROVED) {
         update.completedAt = new Date();
+      }
+      if (newStatus === TASK_STATUS.ACCEPTED || (needsAcceptance && !task.acceptedAt && task.assigneeId === actor.id)) {
+        update.acceptedAt = new Date();
       }
       await task.update(update, { transaction: t });
     });
@@ -372,6 +412,13 @@ class TaskService {
         }
       };
       notifyReviewers().catch(() => {});
+    } else if (newStatus === TASK_STATUS.ACCEPTED && task.createdBy && task.createdBy !== actor.id) {
+      NotificationService.notify(task.createdBy, orgId, {
+        type: 'task_update',
+        title: `Task accepted: "${task.title}"`,
+        body: `${task.assignee?.name || 'The assignee'} accepted the task and can now begin work.`,
+        ...taskNotifyRef(task.projectId, task.id),
+      });
     } else if ([TASK_STATUS.APPROVED, TASK_STATUS.REJECTED].includes(newStatus) && task.assigneeId) {
       NotificationService.notify(task.assigneeId, orgId, {
         type: 'task_update',

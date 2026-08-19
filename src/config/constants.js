@@ -22,6 +22,7 @@ module.exports = {
 
   TASK_STATUS: {
     TODO: 'todo',
+    ACCEPTED: 'accepted',
     IN_PROGRESS: 'in_progress',
     SUBMITTED: 'submitted',
     IN_REVIEW: 'in_review',
