@@ -24,6 +24,7 @@
  */
 const Stripe = require('stripe');
 const { v4: uuidv4 } = require('uuid');
+const { Op } = require('sequelize');
 const db = require('../models');
 const { INVOICE_STATUS } = require('../config/constants');
 const PortalNotificationService = require('./PortalNotificationService');
@@ -94,11 +95,15 @@ function fromMinorUnits(amount, currency) {
  * The card processing fee passed on to the client, from the org's per-currency
  * rule in Admin → Payments.
  *
- * Always charged to the client — it becomes a line on the Stripe invoice so the
- * agency receives its invoice total intact. A currency with no configured rule
- * charges nothing, rather than inventing a surcharge for a rate nobody set.
+ * Charged to the client by default — it becomes a line on the Stripe invoice so
+ * the agency receives its invoice total intact. A currency with no configured
+ * rule charges nothing, rather than inventing a surcharge for a rate nobody
+ * set. `chargeFee: false` (Client.chargeCardFee unticked — see the Pay via CRM
+ * section on the client page) absorbs it into the agency's side instead, for
+ * both ordinary invoices and quotation/agreement/proposal payments.
  */
-async function processingFeeFor(orgId, amount, currency) {
+async function processingFeeFor(orgId, amount, currency, { chargeFee = true } = {}) {
+  if (!chargeFee) return 0;
   const db = require('../models');
   return db.PaymentFeeRule.feeFor(orgId, currency, amount).catch(() => 0);
 }
@@ -342,7 +347,7 @@ class StripeService {
       || null;
 
     const customerId = await this._ensureCustomer(invoice.client, billingContact);
-    const fee = await processingFeeFor(orgId, chargeAmount, currency);
+    const fee = await processingFeeFor(orgId, chargeAmount, currency, { chargeFee: invoice.client?.chargeCardFee !== false });
     // How long the client has to pay, set by the admin rather than the deploy.
     const settings = await db.PaymentSetting.resolve(orgId).catch(() => null);
     const dueDays = Math.max(0, settings?.invoiceDueDays ?? 7);
@@ -461,6 +466,152 @@ class StripeService {
   }
 
   /**
+   * Pay-before-convert for a CustomerDocument (quotation/agreement/proposal).
+   *
+   * A real Client, Project and Invoice only get created once Stripe confirms
+   * the money actually landed (see _convertAndMarkPaidFromDocument, invoked
+   * from the webhook) — nothing exists yet at this point. That's deliberate:
+   * the old flow converted (and raised an invoice) as soon as the client
+   * submitted billing details, so a client who then declined to pay left an
+   * unpaid invoice — and a live project — sitting in the system. Paying first
+   * means a declined/abandoned checkout leaves no trace at all; the document
+   * just sits at "approved" and Pay Now is still there to click again.
+   *
+   * No part-payment here (unlike invoice payments): the document total is a
+   * single up-front commitment, not a balance to chip away at.
+   */
+  async startDocumentPayment(documentId, orgId) {
+    return this._withInvoiceLock(`doc:${documentId}`, () => this._startDocumentPaymentLocked(documentId, orgId));
+  }
+
+  async _startDocumentPaymentLocked(documentId, orgId) {
+    const s = stripe();
+    const document = await db.CustomerDocument.findOne({ where: { id: documentId, orgId } });
+    if (!document) {
+      const err = new Error('Document not found.');
+      err.status = 404;
+      throw err;
+    }
+    if (document.status !== 'approved') {
+      const err = new Error('This document has not been approved yet.');
+      err.status = 409;
+      throw err;
+    }
+    if (!document.detailsSubmittedAt) {
+      const err = new Error('Please submit your billing details before paying.');
+      err.status = 409;
+      throw err;
+    }
+    if (document.convertedClientId || document.convertedProjectId) {
+      const err = new Error('This document has already been converted — an invoice already exists for it.');
+      err.status = 409;
+      throw err;
+    }
+
+    const amount = Math.round((Number(document.amount) || 0) * 100) / 100;
+    if (!(amount > 0)) {
+      const err = new Error('There is nothing to charge on this document.');
+      err.status = 400;
+      throw err;
+    }
+    const currency = String(document.currency || 'USD').toLowerCase();
+
+    // Resume an already-open Stripe page for this same document (refresh, or a
+    // second click before the first page loaded) instead of spawning a second
+    // payable page for the same money.
+    if (document.stripeInvoiceId) {
+      try {
+        const existing = await s.invoices.retrieve(document.stripeInvoiceId);
+        if (existing.status === 'open' && existing.hosted_invoice_url) {
+          return { url: existing.hosted_invoice_url, resumed: true, amount, currency: document.currency };
+        }
+        if (existing.status === 'draft') await s.invoices.del(existing.id).catch(() => {});
+        // 'paid' means the webhook already converted this (convertedClientId
+        // would be set above); 'void'/'uncollectible' falls through to create fresh.
+      } catch {
+        // Vanished or belongs to another Stripe account — fall through and build a new one.
+      }
+    }
+
+    // Reuse the linked client's Stripe Customer when this document already
+    // points at a real client; otherwise a fresh Customer keyed to the
+    // prospect's own details — there's no Client row yet, convert() creates
+    // one once payment clears, and _convertAndMarkPaidFromDocument attaches
+    // this same Customer id to it.
+    let customerId = null;
+    let chargeFee = true;
+    if (document.clientId) {
+      const client = await db.Client.findByPk(document.clientId);
+      if (client) {
+        customerId = await this._ensureCustomer(client, { email: document.email });
+        chargeFee = client.chargeCardFee !== false;
+      }
+    }
+    if (!customerId) {
+      const customer = await s.customers.create({
+        name: document.businessName || document.prospectName || undefined,
+        email: document.email || undefined,
+        metadata: { cadenceDocumentId: document.id, cadenceOrgId: orgId },
+      });
+      customerId = customer.id;
+    }
+
+    const fee = await processingFeeFor(orgId, amount, currency, { chargeFee });
+    const settings = await db.PaymentSetting.resolve(orgId).catch(() => null);
+    const dueDays = Math.max(0, settings?.invoiceDueDays ?? 7);
+    const typeLabel = String(document.type || 'document');
+    const typeTitle = typeLabel.charAt(0).toUpperCase() + typeLabel.slice(1);
+
+    const draft = await s.invoices.create({
+      customer: customerId,
+      currency,
+      collection_method: 'send_invoice',
+      days_until_due: dueDays,
+      pending_invoice_items_behavior: 'exclude',
+      auto_advance: false,
+      description: `Payment for ${typeLabel} ${document.number}`,
+      // Distinguishes this from an ordinary invoice payment in the webhook —
+      // see StripeService.handleEvent. No cadenceInvoiceId: none exists yet.
+      metadata: {
+        cadenceDocumentId: document.id,
+        cadenceOrgId: orgId,
+        cadenceDocumentNumber: document.number,
+        cadenceProcessingFee: String(fee),
+        cadenceMethodLabel: 'Credit / Debit Card (Stripe)',
+      },
+      custom_fields: [{ name: typeTitle, value: String(document.number).slice(0, 30) }],
+    });
+
+    await s.invoiceItems.create({
+      customer: customerId,
+      invoice: draft.id,
+      currency,
+      amount: toMinorUnits(amount, currency),
+      description: `${typeTitle} ${document.number}`,
+    });
+    if (fee > 0) {
+      await s.invoiceItems.create({
+        customer: customerId,
+        invoice: draft.id,
+        currency,
+        amount: toMinorUnits(fee, currency),
+        description: 'Card processing fee',
+      });
+    }
+
+    const finalized = await s.invoices.finalizeInvoice(draft.id, { auto_advance: false });
+    if (!finalized.hosted_invoice_url) {
+      const err = new Error('Stripe did not return a payment link. Please try again or use another payment method.');
+      err.status = 502;
+      throw err;
+    }
+
+    await document.update({ stripeInvoiceId: finalized.id, stripeHostedUrl: finalized.hosted_invoice_url });
+
+    return { url: finalized.hosted_invoice_url, resumed: false, amount, currency: document.currency, processingFee: fee };
+  }
+
+  /**
    * Pull the current state of an invoice straight from Stripe and reconcile it.
    *
    * The webhook is the normal path, but it can't cover everything: an invoice
@@ -527,8 +678,14 @@ class StripeService {
   async handleEvent(event) {
     switch (event.type) {
       case 'invoice.paid':
-      case 'invoice.payment_succeeded':
-        return this._markPaidFromStripeInvoice(event.data.object);
+      case 'invoice.payment_succeeded': {
+        const obj = event.data.object;
+        // A pay-before-convert document payment (see startDocumentPayment)
+        // carries cadenceDocumentId instead of cadenceInvoiceId — no Invoice
+        // row exists yet, so it needs the conversion step first.
+        if (obj?.metadata?.cadenceDocumentId) return this._convertAndMarkPaidFromDocument(obj);
+        return this._markPaidFromStripeInvoice(obj);
+      }
       case 'invoice.payment_failed':
         return this._onPaymentFailed(event.data.object);
       case 'invoice.voided':
@@ -649,6 +806,88 @@ class StripeService {
     return { ok: true, invoiceId: invoice.id, fullySettled, remaining };
   }
 
+  /**
+   * The other half of startDocumentPayment: Stripe confirms a document's
+   * up-front payment cleared, so NOW — for the first time — convert it into a
+   * real Client/Project/Invoice (the exact same CustomerDocumentService.convert
+   * an admin's "Convert to Project" button calls), then mark the invoice it
+   * produced as paid via the normal _markPaidFromStripeInvoice path.
+   *
+   * Idempotent: a webhook retry (or invoice.paid + invoice.payment_succeeded
+   * both firing) finds the document already converted and skips straight to
+   * marking paid, which is itself deduped on the Stripe payment reference.
+   */
+  async _convertAndMarkPaidFromDocument(stripeInvoice) {
+    const documentId = stripeInvoice?.metadata?.cadenceDocumentId;
+    if (!documentId) return { ignored: 'no_document_id' };
+
+    const document = await db.CustomerDocument.findByPk(documentId);
+    if (!document) return { ignored: 'unknown_document' };
+
+    const stripeCustomerId = typeof stripeInvoice.customer === 'string'
+      ? stripeInvoice.customer
+      : stripeInvoice.customer?.id || null;
+
+    if (!document.convertedClientId && !document.convertedProjectId) {
+      const CustomerDocumentService = require('./CustomerDocumentService');
+      let result = null;
+      try {
+        result = await CustomerDocumentService.convert(document.id, document.orgId, null, {});
+      } catch (err) {
+        // An admin converted it manually in the meantime (race between the
+        // client paying and staff acting on the submitted details) — fine,
+        // fall through to find and mark paid whatever invoice that produced.
+        if (!/already been converted/i.test(err.message || '')) {
+          console.error(`[StripeService] Payment cleared for document ${document.number} but conversion failed:`, err.stack || err.message);
+          await this._notifyOrgAdmins(document.orgId, {
+            type: 'payment_received',
+            title: `Payment received but conversion failed: ${document.number}`,
+            body: `A card payment for ${document.type} ${document.number} was collected by Stripe, but converting it to a client/project/invoice failed: ${err.message}. This needs a manual fix — the money is real, nothing was created for it yet.`,
+          });
+          return { ignored: 'convert_failed', error: err.message };
+        }
+      }
+
+      if (result?.client) {
+        // They just paid by card — keep billing this client through Stripe
+        // from here on, same as an admin turning on "Pay via CRM" manually.
+        await result.client.update({
+          billingMode: 'stripe',
+          stripeCustomerId: stripeCustomerId || result.client.stripeCustomerId,
+        }).catch(() => {});
+      }
+      const invoice = result?.invoices?.[0];
+      if (invoice) {
+        await db.Invoice.update({ stripeInvoiceId: stripeInvoice.id }, { where: { id: invoice.id } });
+      }
+    }
+
+    await document.reload();
+
+    // Resolve the invoice to mark paid: normally the one just wired above; on
+    // the race-condition path (admin converted first) it isn't linked to this
+    // Stripe invoice yet, so fall back to the client's most recent unpaid one.
+    let localInvoice = await db.Invoice.findOne({ where: { stripeInvoiceId: stripeInvoice.id } });
+    if (!localInvoice && document.convertedClientId) {
+      localInvoice = await db.Invoice.findOne({
+        where: { orgId: document.orgId, clientId: document.convertedClientId, status: { [Op.ne]: INVOICE_STATUS.PAID } },
+        order: [['createdAt', 'DESC']],
+      });
+      if (localInvoice) await localInvoice.update({ stripeInvoiceId: stripeInvoice.id });
+    }
+    if (!localInvoice) {
+      console.error(`[StripeService] Paid document ${document.number} but no invoice could be resolved to mark paid — needs manual reconciliation.`);
+      await this._notifyOrgAdmins(document.orgId, {
+        type: 'payment_received',
+        title: `Payment received, invoice not found: ${document.number}`,
+        body: `A card payment for ${document.type} ${document.number} was collected, but no invoice could be matched to mark paid. Please check Billing and reconcile manually.`,
+      });
+      return { ignored: 'no_invoice_to_mark' };
+    }
+
+    return this._markPaidFromStripeInvoice(stripeInvoice);
+  }
+
   async _onPaymentFailed(stripeInvoice) {
     const invoice = await this._localInvoiceFor(stripeInvoice);
     if (!invoice) return { ignored: 'unknown_invoice' };
@@ -688,6 +927,21 @@ class StripeService {
       })));
     } catch (err) {
       console.error('[StripeService] staff notification failed:', err.message);
+    }
+  }
+
+  /** Same recipients as _notifyStaff, for cases with no Invoice row yet to hang the notification off. */
+  async _notifyOrgAdmins(orgId, payload) {
+    try {
+      const users = await db.User.findAll({
+        where: { orgId },
+        include: [{ model: db.Role, as: 'role' }],
+      });
+      const recipients = users.filter((u) =>
+        ['super_admin', 'admin'].includes(u.role?.key) || u.role?.permissions?.['billing.read']);
+      await Promise.all(recipients.map((u) => NotificationService.notify(u.id, orgId, payload)));
+    } catch (err) {
+      console.error('[StripeService] admin notification failed:', err.message);
     }
   }
 }

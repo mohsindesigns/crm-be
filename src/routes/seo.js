@@ -107,6 +107,14 @@ router.post('/projects/:projectId/keywords/bulk-delete', adminOnly, rbac('projec
   } catch (e) { next(e); }
 });
 
+// Not adminOnly, same as PATCH /keywords/:id { status: 'active' } — reactivating
+// isn't destructive, so it's gated the same way the per-row status dropdown is.
+router.post('/projects/:projectId/keywords/bulk-activate', rbac('projects.act'), async (req, res, next) => {
+  try {
+    res.json(await SeoService.bulkActivateKeywords(req.params.projectId, req.orgId, req.body?.ids));
+  } catch (e) { next(e); }
+});
+
 // ─── Rank Snapshots / Monthly Reporting ───────────────────────────────────────
 router.post('/keywords/:keywordId/rankings', rbac('projects.act'), async (req, res, next) => {
   try {
@@ -266,6 +274,12 @@ router.delete('/content/:id', rbac('projects.act'), async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+router.post('/projects/:projectId/content/bulk-delete', rbac('projects.act'), async (req, res, next) => {
+  try {
+    res.json(await SeoService.bulkDeleteContent(req.params.projectId, req.orgId, req.body?.ids, req.user));
+  } catch (e) { next(e); }
+});
+
 // ─── Blog Tasks ───────────────────────────────────────────────────────────────
 router.get('/projects/:projectId/blogs', rbac('projects.read'), async (req, res, next) => {
   try {
@@ -363,6 +377,18 @@ router.post('/blog-sheet/:id/activate', adminOnly, rbac('projects.act'), async (
   try {
     const bt = await SeoService.deleteBlogTask(req.params.id, req.orgId, true);
     res.json({ message: 'Blog set to Active', blog: bt });
+  } catch (e) { next(e); }
+});
+
+router.post('/projects/:projectId/blog-sheet/bulk-delete', rbac('projects.act'), async (req, res, next) => {
+  try {
+    res.json(await SeoService.bulkDeleteBlogTasks(req.params.projectId, req.orgId, req.body?.ids, req.user));
+  } catch (e) { next(e); }
+});
+
+router.post('/projects/:projectId/blog-sheet/bulk-activate', rbac('projects.act'), async (req, res, next) => {
+  try {
+    res.json(await SeoService.bulkActivateBlogTasks(req.params.projectId, req.orgId, req.body?.ids));
   } catch (e) { next(e); }
 });
 

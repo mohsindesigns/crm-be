@@ -33,12 +33,29 @@ class CustomerDocumentService {
     if (!isTruthy(filters.includeInactive)) where.isActive = true;
     if (filters.status) where.status = filters.status;
     if (filters.type) where.type = filters.type;
+    // Documents raised against an existing client have clientId set; older
+    // ones (raised before that flow existed) only get a client at approval
+    // time, via convertedClientId — match either so a client's document
+    // history isn't missing pre-flow rows (see the clientId column comment).
+    // Kept in Op.and (rather than assigning where[Op.or] directly) so it
+    // composes with the search Op.or below instead of one clobbering the other.
+    if (filters.clientId) {
+      where[Op.and] = [
+        ...(where[Op.and] || []),
+        { [Op.or]: [{ clientId: filters.clientId }, { convertedClientId: filters.clientId }] },
+      ];
+    }
     if (filters.search) {
-      where[Op.or] = [
-        { number: { [Op.like]: `%${filters.search}%` } },
-        { prospectName: { [Op.like]: `%${filters.search}%` } },
-        { businessName: { [Op.like]: `%${filters.search}%` } },
-        { email: { [Op.like]: `%${filters.search}%` } },
+      where[Op.and] = [
+        ...(where[Op.and] || []),
+        {
+          [Op.or]: [
+            { number: { [Op.like]: `%${filters.search}%` } },
+            { prospectName: { [Op.like]: `%${filters.search}%` } },
+            { businessName: { [Op.like]: `%${filters.search}%` } },
+            { email: { [Op.like]: `%${filters.search}%` } },
+          ],
+        },
       ];
     }
 

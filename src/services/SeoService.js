@@ -404,6 +404,31 @@ async function bulkDeleteKeywords(projectId, orgId, ids) {
   return { deleted: deleted.length, deactivated: deleted.length, skipped };
 }
 
+/**
+ * Bulk reactivate keywords — the counterpart to bulkDeleteKeywords. Unlike
+ * deactivation, there's no lock check: putting an already-inactive keyword
+ * back in the pool can't orphan anything, so any keyword on the project can
+ * be reactivated.
+ */
+async function bulkActivateKeywords(projectId, orgId, ids) {
+  await assertProjectAccess(projectId, orgId);
+  const idList = Array.isArray(ids) ? [...new Set(ids.filter(Boolean))] : [];
+  if (!idList.length) {
+    throw Object.assign(new Error('No keyword IDs provided.'), { status: 400 });
+  }
+  if (idList.length > 200) {
+    throw Object.assign(new Error('You can change at most 200 keywords at a time.'), { status: 400 });
+  }
+
+  const rows = await Keyword.findAll({ where: { id: idList, projectId }, attributes: ['id'] });
+  const found = rows.map((r) => r.id);
+  if (found.length) {
+    await Keyword.update({ status: 'active' }, { where: { id: found, projectId } });
+  }
+  const skipped = idList.filter((id) => !found.includes(id)).map((id) => ({ id, reason: 'not_found' }));
+  return { activated: found.length, skipped };
+}
+
 // ─── Rank Snapshots ───────────────────────────────────────────────────────────
 
 function todayDateOnly() {
@@ -1261,6 +1286,48 @@ async function deleteContent(id, orgId, actor) {
   return { ok: true };
 }
 
+/**
+ * Bulk-delete content submissions — permanently removes them (see
+ * deleteContent: ContentSubmission isn't soft-deletable, it's a review-
+ * workflow artifact, not a core record). Only ever touches unapproved rows —
+ * approved and superseded submissions are always skipped here, regardless of
+ * role, so a bulk action can't accidentally wipe out approval history.
+ */
+async function bulkDeleteContent(projectId, orgId, ids, actor) {
+  await assertProjectAccess(projectId, orgId);
+  const idList = Array.isArray(ids) ? [...new Set(ids.filter(Boolean))] : [];
+  if (!idList.length) {
+    throw Object.assign(new Error('No content IDs provided.'), { status: 400 });
+  }
+  if (idList.length > 200) {
+    throw Object.assign(new Error('You can change at most 200 items at a time.'), { status: 400 });
+  }
+
+  const isManager = ['super_admin', 'admin'].includes(actor?.role?.key)
+    || !!actor?.role?.permissions?.['projects.manage'];
+
+  const rows = await ContentSubmission.findAll({
+    where: { id: idList, projectId },
+    attributes: ['id', 'status', 'submittedBy'],
+  });
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const deleted = [];
+  const skipped = [];
+
+  for (const id of idList) {
+    const cs = byId.get(id);
+    if (!cs) { skipped.push({ id, reason: 'not_found' }); continue; }
+    if (['approved', 'superseded'].includes(cs.status)) { skipped.push({ id, reason: 'approved' }); continue; }
+    if (!isManager && cs.submittedBy !== actor?.id) { skipped.push({ id, reason: 'not_owner' }); continue; }
+    deleted.push(id);
+  }
+
+  if (deleted.length) {
+    await ContentSubmission.destroy({ where: { id: deleted } });
+  }
+  return { deleted: deleted.length, skipped };
+}
+
 /** Heal older content tasks left as "done" after the submission was approved. */
 async function syncApprovedContentTasks(orgId, userId) {
   const submissions = await ContentSubmission.findAll({
@@ -1772,6 +1839,65 @@ async function deleteBlogTask(id, orgId, active = false, actor = null) {
   return bt;
 }
 
+/**
+ * Bulk deactivate blog rows — same rule as the single-row path: the person
+ * who added a row (or an admin/manager) can take it back, but only while it
+ * hasn't been approved yet.
+ */
+async function bulkDeleteBlogTasks(projectId, orgId, ids, actor) {
+  await assertProjectAccess(projectId, orgId);
+  const idList = Array.isArray(ids) ? [...new Set(ids.filter(Boolean))] : [];
+  if (!idList.length) {
+    throw Object.assign(new Error('No blog IDs provided.'), { status: 400 });
+  }
+  if (idList.length > 200) {
+    throw Object.assign(new Error('You can change at most 200 blogs at a time.'), { status: 400 });
+  }
+
+  const isManager = ['super_admin', 'admin'].includes(actor?.role?.key)
+    || !!actor?.role?.permissions?.['projects.manage'];
+
+  const rows = await BlogTask.findAll({
+    where: { id: idList, projectId },
+    attributes: ['id', 'status', 'createdBy'],
+  });
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const deleted = [];
+  const skipped = [];
+
+  for (const id of idList) {
+    const bt = byId.get(id);
+    if (!bt) { skipped.push({ id, reason: 'not_found' }); continue; }
+    if (bt.status === 'approved') { skipped.push({ id, reason: 'approved' }); continue; }
+    if (!isManager && bt.createdBy !== actor?.id) { skipped.push({ id, reason: 'not_owner' }); continue; }
+    deleted.push(id);
+  }
+
+  if (deleted.length) {
+    await BlogTask.update({ isActive: false }, { where: { id: deleted, projectId } });
+  }
+  return { deactivated: deleted.length, skipped };
+}
+
+/** Bulk reactivate blog rows — no restriction, same as bulkActivateKeywords. */
+async function bulkActivateBlogTasks(projectId, orgId, ids) {
+  await assertProjectAccess(projectId, orgId);
+  const idList = Array.isArray(ids) ? [...new Set(ids.filter(Boolean))] : [];
+  if (!idList.length) {
+    throw Object.assign(new Error('No blog IDs provided.'), { status: 400 });
+  }
+  if (idList.length > 200) {
+    throw Object.assign(new Error('You can change at most 200 blogs at a time.'), { status: 400 });
+  }
+  const rows = await BlogTask.findAll({ where: { id: idList, projectId }, attributes: ['id'] });
+  const found = rows.map((r) => r.id);
+  if (found.length) {
+    await BlogTask.update({ isActive: true }, { where: { id: found, projectId } });
+  }
+  const skipped = idList.filter((id) => !found.includes(id)).map((id) => ({ id, reason: 'not_found' }));
+  return { activated: found.length, skipped };
+}
+
 /** Same row set as the Blog Sheet tab (every row, active or inactive) — spreadsheet-friendly. */
 async function generateBlogCsv(projectId, orgId) {
   const project = await assertProjectAccess(projectId, orgId);
@@ -2026,12 +2152,12 @@ async function generateBacklinkReportBuffer(projectId, orgId, letterheadFields) 
 }
 
 module.exports = {
-  listKeywords, createKeyword, bulkImportKeywords, updateKeyword, deleteKeyword, clearKeywords, bulkDeleteKeywords,
+  listKeywords, createKeyword, bulkImportKeywords, updateKeyword, deleteKeyword, clearKeywords, bulkDeleteKeywords, bulkActivateKeywords,
   addRankSnapshot, listRankings, recordRankings, deleteRankingDate, bulkImportRankings,
   listBacklinks, createBacklink, updateBacklink, deleteBacklink, clearBacklinks, bulkDeleteBacklinks, bulkImportBacklinks, bulkUpdateBacklinkStatus,
-  listContent, createContent, reviewContent, deleteContent, syncApprovedContentTasks,
+  listContent, createContent, reviewContent, deleteContent, bulkDeleteContent, syncApprovedContentTasks,
   listBlogTasks, createBlogTask, updateBlogTask,
   listBlogSheet, createBlogSheetRow, submitBlogDeliverable, bulkImportBlogTasks,
-  reviewBlogTask, deleteBlogTask, syncApprovedBlogTasks,
+  reviewBlogTask, deleteBlogTask, bulkDeleteBlogTasks, bulkActivateBlogTasks, syncApprovedBlogTasks,
   generateKeywordReportBuffer, generateBacklinkReportBuffer, generateKeywordCsv, generateBlogCsv,
 };

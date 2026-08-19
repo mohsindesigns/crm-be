@@ -236,6 +236,24 @@ class ClientService {
     return { client, updatedInvoices: updated };
   }
 
+  /**
+   * Whether the org's card processing fee rate is added on top for this
+   * client's Stripe payments, or absorbed by the agency instead. Read at
+   * charge time (StripeService.processingFeeFor) for every invoice AND
+   * quotation/agreement/proposal payment — nothing to backfill here, it just
+   * takes effect on the next payment attempt.
+   */
+  async setChargeCardFee(id, orgId, chargeCardFee) {
+    if (typeof chargeCardFee !== 'boolean') {
+      const err = new Error('chargeCardFee must be true or false.');
+      err.status = 400;
+      throw err;
+    }
+    const client = await this.findById(id, orgId);
+    await client.update({ chargeCardFee });
+    return { client };
+  }
+
   // Blocks deletion if the client has any projects, invoices, retainers, or sold
   // packages on record — deleting those out from under their history would be
   // destructive and irreversible. Change the client's status instead if it's just

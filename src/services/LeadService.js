@@ -152,6 +152,11 @@ async function list(orgId, query = {}, scopeClientId = null) {
   if (query.formId) where.formId = query.formId;
   if (query.assignedToUserId) where.assignedToUserId = query.assignedToUserId;
   if (query.source) where.source = query.source;
+  if (query.dateFrom || query.dateTo) {
+    where.createdAt = {};
+    if (query.dateFrom) where.createdAt[Op.gte] = new Date(`${String(query.dateFrom).slice(0, 10)}T00:00:00`);
+    if (query.dateTo) where.createdAt[Op.lte] = new Date(`${String(query.dateTo).slice(0, 10)}T23:59:59.999`);
+  }
   if (query.q) {
     const like = `%${query.q}%`;
     where[Op.or] = [

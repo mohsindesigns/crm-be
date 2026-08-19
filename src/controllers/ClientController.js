@@ -51,6 +51,12 @@ class ClientController {
     } catch (err) { next(err); }
   }
 
+  async setChargeCardFee(req, res, next) {
+    try {
+      res.json(await ClientService.setChargeCardFee(req.params.id, req.orgId, req.body?.chargeCardFee));
+    } catch (err) { next(err); }
+  }
+
   // Deactivates, never destroys — see services/SoftDeleteService.js.
   async remove(req, res, next) {
     try {
