@@ -82,6 +82,7 @@ const modelFiles = [
   'LeadForm',
   'Lead',
   'LeadEvent',
+  'ActivityLog',
 ];
 
 modelFiles.forEach((name) => {

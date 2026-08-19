@@ -34,7 +34,9 @@ const publicLeadFormsRouter = require('./routes/publicLeadForms');
 const leadsRouter = require('./routes/leads');
 const portalLeadFormsRouter = require('./routes/portalLeadForms');
 const portalLeadsRouter = require('./routes/portalLeads');
+const activityLogsRouter = require('./routes/activityLogs');
 const errorHandler = require('./middleware/errorHandler');
+const activityLogger = require('./middleware/activityLogger');
 
 const { WhiteLabelConfig, Org } = require('./models');
 
@@ -55,6 +57,12 @@ app.use('/api/stripe', stripeWebhookRouter);
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Records every mutating authenticated API call for the Activity Logs page —
+// must come after auth/tenancy run on req (it reads req.user/req.orgId via a
+// res.on('finish') listener, so it's safe to mount ahead of the routers
+// themselves; see middleware/activityLogger.js for why).
+app.use(activityLogger);
 
 // Health
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
@@ -115,6 +123,7 @@ app.use('/api/public/lead-forms', publicLeadFormsRouter);
 app.use('/api/leads', leadsRouter);
 app.use('/api/portal/lead-forms', portalLeadFormsRouter);
 app.use('/api/portal/leads', portalLeadsRouter);
+app.use('/api/activity-logs', activityLogsRouter);
 
 // 404
 app.use((req, res) => res.status(404).json({ message: 'Not found.' }));
@@ -323,6 +332,7 @@ app.schemaReady = (async () => {
     await db.LeadForm.ensureSchema();  // new table; depends on projects
     await db.Lead.ensureSchema();      // new table; depends on lead_forms/projects/clients
     await db.LeadEvent.ensureSchema(); // new table; depends on leads
+    await db.ActivityLog.ensureSchema(); // new table; Activity Logs sidebar page — depends on orgs/users
   } catch (err) {
     console.error('[Schema] ensureSchema failed:', err.message);
   }
