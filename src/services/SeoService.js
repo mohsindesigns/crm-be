@@ -110,6 +110,28 @@ async function ensureBlogTask(orgId, project, title, assigneeId, actorUserId) {
   }, actorUserId);
 }
 
+/** Same pipeline, for the designer who illustrates an already-approved blog. */
+async function ensureBlogImageTask(orgId, project, title, assigneeId, actorUserId) {
+  if (!assigneeId || !title) return;
+  const existing = await Task.findOne({
+    where: {
+      projectId: project.id,
+      type: 'blog_image',
+      pageName: title,
+      assigneeId,
+      status: { [Op.notIn]: ['done', 'approved'] },
+    },
+  });
+  if (existing) return existing;
+  return TaskService.create(orgId, project.id, {
+    type: 'blog_image',
+    title: `Design blog image — ${title}`,
+    assigneeId,
+    pageName: title,
+    stageKey: project.currentStageKey,
+  }, actorUserId);
+}
+
 async function markBlogTasksSubmitted(orgId, projectId, title, assigneeId, actorUserId) {
   if (!assigneeId || !title) return;
   const openTasks = await Task.findAll({
@@ -1439,6 +1461,7 @@ async function listBlogSheet(projectId, orgId, { includeInactive = false } = {})
     include: [
       { association: 'submitter', attributes: ['id', 'name'] },
       { association: 'assignedWriter', attributes: ['id', 'name'] },
+      { association: 'assignedDesigner', attributes: ['id', 'name'] },
       { association: 'reviewer', attributes: ['id', 'name'] },
     ],
     order: SHEET_ORDER,
@@ -1534,6 +1557,7 @@ async function submitBlogDeliverable(projectId, data, orgId, caller) {
   if (!resolvedFileUrl) {
     throw Object.assign(new Error('Attach a file or paste a deliverable link.'), { status: 400 });
   }
+  const resolvedFileName = fileUrl ? (data.fileName || null) : (bt?.fileName || null);
 
   if (bt) {
     await bt.update({
@@ -1544,6 +1568,7 @@ async function submitBlogDeliverable(projectId, data, orgId, caller) {
       submittedBy: caller.id,
       assignedWriterId: writerId,
       fileUrl: resolvedFileUrl,
+      fileName: resolvedFileName,
       title: resolvedTitle,
       ...(data.mainKeyword != null ? { mainKeyword: data.mainKeyword } : {}),
       ...(data.contentType != null ? { contentType: data.contentType } : {}),
@@ -1561,6 +1586,7 @@ async function submitBlogDeliverable(projectId, data, orgId, caller) {
       urlSlug: data.urlSlug || null,
       targetServicePage: data.targetServicePage || null,
       fileUrl: resolvedFileUrl,
+      fileName: resolvedFileName,
       status: 'pending',
       submittedBy: caller.id,
       assignedWriterId: writerId,
@@ -1604,13 +1630,22 @@ async function updateBlogTask(id, updates, orgId, actorUserId) {
   if (bt.status === 'approved' && Object.prototype.hasOwnProperty.call(updates, 'assignedWriterId')) {
     throw Object.assign(new Error('Cannot reassign writer on an approved blog.'), { status: 400 });
   }
+  // Mirror image: nothing to illustrate until the copy itself is approved, so a
+  // designer can't be assigned any earlier.
+  if (bt.status !== 'approved' && Object.prototype.hasOwnProperty.call(updates, 'assignedDesignerId')) {
+    throw Object.assign(new Error('A designer can only be assigned once the blog is approved.'), { status: 400 });
+  }
 
   const patch = { ...updates };
   const assigningWriter = patch.assignedWriterId && patch.assignedWriterId !== bt.assignedWriterId;
+  const assigningDesigner = patch.assignedDesignerId && patch.assignedDesignerId !== bt.assignedDesignerId;
   await bt.update(patch);
 
   if (assigningWriter) {
     await ensureBlogTask(orgId, bt.project, bt.title, patch.assignedWriterId, actorUserId);
+  }
+  if (assigningDesigner) {
+    await ensureBlogImageTask(orgId, bt.project, bt.title, patch.assignedDesignerId, actorUserId);
   }
   return bt;
 }

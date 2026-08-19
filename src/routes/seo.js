@@ -343,9 +343,13 @@ router.post('/projects/:projectId/blog-sheet/submit', rbac('projects.act'), uplo
   try {
     // Same as content: uploaded file OR pasted link counts as the deliverable.
     let fileUrl = String(req.body.fileUrl || '').trim() || undefined;
+    let fileName = String(req.body.fileName || '').trim() || undefined;
     if (req.file) {
       const media = await MediaService.upload(req.file.buffer, req.file.originalname, req.file.mimetype);
       fileUrl = media.url;
+      fileName = req.file.originalname;
+    } else if (fileUrl && !fileName) {
+      fileName = 'Link';
     }
     const bt = await SeoService.submitBlogDeliverable(req.params.projectId, {
       blogId: req.body.blogId || null,
@@ -354,6 +358,7 @@ router.post('/projects/:projectId/blog-sheet/submit', rbac('projects.act'), uplo
       mainKeyword: req.body.mainKeyword,
       assignedWriterId: req.body.assignedWriterId || null,
       fileUrl,
+      fileName,
     }, req.orgId, req.user);
     res.status(201).json(bt);
   } catch (e) { next(e); }
