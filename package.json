@@ -10,6 +10,7 @@
     "db:migrate:undo": "sequelize-cli db:migrate:undo",
     "db:seed": "node src/seeders/seed.js",
     "db:seed:qa": "node src/seeders/seedQaDemo.js",
+    "db:seed:client-requests": "node src/seeders/seedClientRequestsDemo.js",
     "email:test": "node src/scripts/testEmail.js",
     "db:reset": "sequelize-cli db:migrate:undo:all && sequelize-cli db:migrate && node src/seeders/seed.js"
   },

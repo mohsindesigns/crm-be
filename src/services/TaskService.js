@@ -6,7 +6,7 @@ const NotificationService = require('./NotificationService');
 const EmailService = require('./EmailService');
 const { computeReminderAt } = require('../utils/taskDates');
 
-/** Deep-link payload for Header → `/projects/:id?task=` (projectId + taskId). */
+/** Deep-link payload for Header → `/tasks/:projectId/:taskId` (projectId + taskId). */
 function taskNotifyRef(projectId, taskId) {
   return { refTable: 'project_tasks', refId: `${projectId}:${taskId}` };
 }
@@ -53,7 +53,7 @@ class TaskService {
       include: [
         { model: db.User, as: 'assignee', attributes: ['id', 'name', 'avatarUrl'] },
         { model: db.User, as: 'reviewer', attributes: ['id', 'name', 'avatarUrl'] },
-        { model: db.User, as: 'creator', attributes: ['id', 'name'] },
+        { model: db.User, as: 'creator', attributes: ['id', 'name', 'avatarUrl'] },
         { model: db.User, as: 'pendingAssignee', attributes: ['id', 'name', 'avatarUrl'] },
       ],
       order: type ? [['createdAt', 'DESC']] : [['createdAt', 'ASC']],
@@ -66,7 +66,7 @@ class TaskService {
       include: [
         { model: db.User, as: 'assignee', attributes: ['id', 'name', 'avatarUrl'] },
         { model: db.User, as: 'reviewer', attributes: ['id', 'name', 'avatarUrl'] },
-        { model: db.User, as: 'creator', attributes: ['id', 'name'] },
+        { model: db.User, as: 'creator', attributes: ['id', 'name', 'avatarUrl'] },
         { model: db.User, as: 'pendingAssignee', attributes: ['id', 'name', 'avatarUrl'] },
         {
           model: db.Project,
@@ -78,7 +78,7 @@ class TaskService {
           model: db.TaskEvent,
           as: 'events',
           include: [
-            { model: db.User, as: 'actor', attributes: ['id', 'name'] },
+            { model: db.User, as: 'actor', attributes: ['id', 'name', 'avatarUrl'] },
             { model: db.Artifact, as: 'attachments', where: { isActive: true }, required: false },
           ],
           separate: true,

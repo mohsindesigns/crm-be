@@ -665,7 +665,7 @@ async function sendClientRequestForm({
   const bodyHtml = `
     <p style="margin:0 0 12px;color:#374151;font-size:15px;line-height:1.6;">Hi <strong>${safeName}</strong>,</p>
     <p style="margin:0;color:#374151;font-size:15px;line-height:1.6;">
-      To get started on <strong>${escapeHtml(projectName)}</strong>, we need a few details from you.
+      For <strong>${escapeHtml(projectName)}</strong>, we need a few details from you.
       ${fieldCount ? `The form below has <strong>${fieldCount}</strong> question${fieldCount === 1 ? '' : 's'} and takes just a couple of minutes.` : ''}
     </p>
     ${messageBlock}
