@@ -52,7 +52,12 @@ function isApprover(user) {
 
 /** Tells every admin in the org that something is waiting on them. Mirrors
  *  PublicDocumentService#_notifyAdmins — fire-and-forget, and a notification
- *  failure must never fail the compose the sender is waiting on. */
+ *  failure must never fail the compose the sender is waiting on.
+ *
+ *  refTable/refId point at the PROJECT, not at the client_requests row: the
+ *  frontend's notification-link map (crm-fe Header.tsx) resolves a notification
+ *  to a page, and the requirements tab lives at /projects/:id?tab=client-requests
+ *  — there is no standalone page for one request to link to. */
 async function notifyApprovers(request, { title, body }) {
   try {
     const users = await db.User.findAll({
@@ -64,8 +69,8 @@ async function notifyApprovers(request, { title, body }) {
       type: 'client_request_approval',
       title,
       body,
-      refTable: 'client_requests',
-      refId: request.id,
+      refTable: 'projects',
+      refId: request.projectId,
     })));
   } catch (err) {
     console.error('[ClientRequestService] Failed to notify approvers:', err.message);
@@ -302,8 +307,8 @@ async function approve(id, orgId, user) {
       body: emailSent
         ? `${user.name || 'An admin'} approved your requirements form — it's been emailed to ${request.recipientName || request.recipientEmail}.`
         : `${user.name || 'An admin'} approved your requirements form, but the email could not be sent — share the link manually.`,
-      refTable: 'client_requests',
-      refId: request.id,
+      refTable: 'projects',
+      refId: request.projectId,
     }).catch(() => {});
   }
 
@@ -340,8 +345,8 @@ async function reject(id, orgId, user, rawReason) {
       type: 'client_request_rejected',
       title: `Rejected: ${request.subject}`,
       body: `${user.name || 'An admin'} did not approve your requirements form: "${reason}"`,
-      refTable: 'client_requests',
-      refId: request.id,
+      refTable: 'projects',
+      refId: request.projectId,
     }).catch(() => {});
   }
 
@@ -521,8 +526,8 @@ async function submitPublic(token, body, req) {
       type: 'client_request_responded',
       title: `Client replied: ${request.subject}`,
       body: `${request.recipientName || request.recipientEmail} submitted the requirements form for ${request.project?.name || 'a project'}.`,
-      refTable: 'client_requests',
-      refId: request.id,
+      refTable: 'projects',
+      refId: request.projectId,
     }).catch(() => {});
   }
 
