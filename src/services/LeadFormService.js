@@ -1,7 +1,7 @@
 const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const db = require('../models');
-const { LEAD_FORM_FIELD_TYPES } = require('../config/constants');
+const { normalizeFields } = require('../utils/formFields');
 const { activeWhere, setActive } = require('./SoftDeleteService');
 
 function notFound(message = 'Lead form not found.') {
@@ -10,39 +10,6 @@ function notFound(message = 'Lead form not found.') {
 
 function badRequest(message) {
   return Object.assign(new Error(message), { status: 400 });
-}
-
-/** Validates and normalizes the field list a form is built from. Never trusts
- *  client-supplied `key`s blindly — they become the storage keys on every
- *  submission this form ever receives, so duplicates/blank keys are rejected
- *  up front rather than corrupting fieldData later. */
-function normalizeFields(rawFields) {
-  if (!Array.isArray(rawFields) || rawFields.length === 0) {
-    throw badRequest('A form needs at least one field.');
-  }
-  const seenKeys = new Set();
-  return rawFields.map((f, i) => {
-    const label = String(f?.label || '').trim();
-    if (!label) throw badRequest(`Field ${i + 1} needs a label.`);
-    const type = String(f?.type || 'text').trim();
-    if (!LEAD_FORM_FIELD_TYPES.includes(type)) {
-      throw badRequest(`Field "${label}" has an unsupported type "${type}".`);
-    }
-    const key = String(f?.key || label)
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '_')
-      .replace(/^_+|_+$/g, '') || `field_${i + 1}`;
-    if (seenKeys.has(key)) throw badRequest(`Duplicate field key "${key}" — give each field a unique label.`);
-    seenKeys.add(key);
-    const options = type === 'select'
-      ? (Array.isArray(f?.options) ? f.options.map(String).filter(Boolean) : [])
-      : undefined;
-    if (type === 'select' && (!options || options.length === 0)) {
-      throw badRequest(`Field "${label}" is a dropdown but has no options.`);
-    }
-    return { key, label, type, required: !!f?.required, hidden: !!f?.hidden, ...(options ? { options } : {}) };
-  });
 }
 
 const BORDER_RADIUS_VALUES = ['sharp', 'rounded', 'pill'];
@@ -74,6 +41,7 @@ function normalizeTheme(raw) {
   }
   if (src.showLogo !== undefined) t.showLogo = !!src.showLogo;
   if (src.showName !== undefined) t.showName = !!src.showName;
+  if (src.showHeadline !== undefined) t.showHeadline = !!src.showHeadline;
   if (src.borderRadius) {
     const v = String(src.borderRadius);
     if (!BORDER_RADIUS_VALUES.includes(v)) throw badRequest('Invalid border radius option.');
@@ -100,6 +68,11 @@ function effectiveTheme(form) {
     backgroundColor: t.backgroundColor || '#FFFFFF',
     showLogo: t.showLogo !== undefined ? t.showLogo : legacyShowBranding,
     showName: t.showName !== undefined ? t.showName : legacyShowBranding,
+    // Independent of the logo/name row — this is the h1 built from the public
+    // headline override (or, absent one, the internal Form name; see below).
+    // No legacy flag to fall back to: forms saved before this existed always
+    // showed it, so the default is simply "on".
+    showHeadline: t.showHeadline !== undefined ? t.showHeadline : true,
     borderRadius: BORDER_RADIUS_VALUES.includes(t.borderRadius) ? t.borderRadius : 'rounded',
   };
 }

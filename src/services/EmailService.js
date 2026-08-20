@@ -69,7 +69,7 @@ function emailLayout({ brandName, title, accentColor, badgeLabel, badgeBg, badge
   `;
 }
 
-async function sendMail({ to, subject, html, from, attachments }) {
+async function sendMail({ to, subject, html, from, attachments, cc }) {
   if (!process.env.SMTP_USER) {
     console.warn(`[EmailService] SMTP_USER not configured; skipping email to ${to}`);
     return null;
@@ -78,6 +78,7 @@ async function sendMail({ to, subject, html, from, attachments }) {
     return await getTransporter().sendMail({
       from: from || process.env.EMAIL_FROM || '"Mohsin Designs Project Management" <noreply@mohsindesigns.com>',
       to,
+      ...(cc?.length ? { cc } : {}),
       subject,
       html,
       ...(attachments?.length ? { attachments } : {}),
@@ -606,4 +607,98 @@ async function sendAppraisalUpdate({
   });
 }
 
-module.exports = { sendMail, sendPayrollReady, sendLeaveUpdate, sendProfileReviewUpdate, sendAppraisalUpdate, sendProjectAssigned, sendTaskAssigned, sendTaskReminder, sendPasswordReset, sendAdminPasswordReset, sendStageAdvance, sendUserInvite, sendPortalInvite, sendPortalLoginCode, sendEmailChangeCode, sendDocumentReviewLink, sendDocumentRemind, sendInvoiceEmail };
+
+/** The requirements form a staff member composes on a project and sends to a
+ *  client contact (see services/ClientRequestService.js#send). `formUrl` is a
+ *  tokenized public link — no login, same as the document review links above. */
+async function sendClientRequestForm({
+  to, cc, recipientName, brandName, projectName, subject, message, formUrl, dueAt, fieldCount,
+}) {
+  const safeName = escapeHtml(recipientName || 'there');
+  const dueLabel = dueAt ? formatEmailDate(dueAt) : null;
+  const messageBlock = message
+    ? `<div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:16px 18px;margin:20px 0 0;">
+         <p style="margin:0;color:#374151;font-size:14px;line-height:1.7;white-space:pre-wrap;">${escapeHtml(message)}</p>
+       </div>`
+    : '';
+  const dueBlock = dueLabel
+    ? `<p style="margin:20px 0 0;color:#374151;font-size:14px;line-height:1.6;">Please complete it by <strong>${escapeHtml(dueLabel)}</strong> so we can keep the project moving.</p>`
+    : '';
+
+  const bodyHtml = `
+    <p style="margin:0 0 12px;color:#374151;font-size:15px;line-height:1.6;">Hi <strong>${safeName}</strong>,</p>
+    <p style="margin:0;color:#374151;font-size:15px;line-height:1.6;">
+      To get started on <strong>${escapeHtml(projectName)}</strong>, we need a few details from you.
+      ${fieldCount ? `The form below has <strong>${fieldCount}</strong> question${fieldCount === 1 ? '' : 's'} and takes just a couple of minutes.` : ''}
+    </p>
+    ${messageBlock}
+    ${dueBlock}
+    <a href="${formUrl}" style="display:inline-block;margin-top:24px;background:${BRAND_ACCENT};color:${BRAND_PRIMARY};text-decoration:none;padding:12px 22px;border-radius:8px;font-size:14px;font-weight:700;">Fill in the form</a>
+    <p style="margin:20px 0 0;color:#9ca3af;font-size:12px;line-height:1.6;">
+      No account or password needed — just click the button. If it doesn't work, copy this link into your browser:<br>
+      <span style="color:#6b7280;word-break:break-all;">${formUrl}</span>
+    </p>
+  `;
+
+  return sendMail({
+    to,
+    cc,
+    subject,
+    html: emailLayout({
+      brandName,
+      title: subject,
+      accentColor: BRAND_PRIMARY,
+      badgeLabel: 'Action needed',
+      badgeBg: '#fef3c7',
+      badgeColor: BRAND_PRIMARY,
+      bodyHtml,
+      footerHtml: `You're receiving this because ${escapeHtml(brandName)} is working with you on ${escapeHtml(projectName)}. Reply to this email if you have any questions.`,
+    }),
+  });
+}
+
+/** Nudge for a requirements form that's still unanswered. `automated: true`
+ *  when it comes from ClientRequestReminderScheduler rather than a staff member
+ *  clicking "Send reminder" — the wording softens accordingly. */
+async function sendClientRequestReminder({
+  to, cc, recipientName, brandName, projectName, subject, formUrl, dueAt, automated,
+}) {
+  const safeName = escapeHtml(recipientName || 'there');
+  const dueLabel = dueAt ? formatEmailDate(dueAt) : null;
+  const overdue = dueAt ? new Date(`${String(dueAt).slice(0, 10)}T23:59:59`) < new Date() : false;
+
+  const bodyHtml = `
+    <p style="margin:0 0 12px;color:#374151;font-size:15px;line-height:1.6;">Hi <strong>${safeName}</strong>,</p>
+    <p style="margin:0;color:#374151;font-size:15px;line-height:1.6;">
+      ${automated ? 'A quick automatic reminder' : 'Just a friendly reminder'} — the requirements form for
+      <strong>${escapeHtml(projectName)}</strong> is still waiting on you.
+    </p>
+    ${dueLabel
+      ? `<p style="margin:18px 0 0;color:#374151;font-size:14px;line-height:1.6;">${overdue
+          ? `It was due on <strong>${escapeHtml(dueLabel)}</strong>.`
+          : `It's due on <strong>${escapeHtml(dueLabel)}</strong>.`}</p>`
+      : ''}
+    <a href="${formUrl}" style="display:inline-block;margin-top:24px;background:${BRAND_ACCENT};color:${BRAND_PRIMARY};text-decoration:none;padding:12px 22px;border-radius:8px;font-size:14px;font-weight:700;">Fill in the form</a>
+    <p style="margin:20px 0 0;color:#9ca3af;font-size:12px;line-height:1.6;">
+      Already sent it over? You can ignore this message.
+    </p>
+  `;
+
+  return sendMail({
+    to,
+    cc,
+    subject: `Reminder: ${subject}`,
+    html: emailLayout({
+      brandName,
+      title: subject,
+      accentColor: overdue ? '#dc2626' : BRAND_PRIMARY,
+      badgeLabel: overdue ? 'Overdue' : 'Reminder',
+      badgeBg: overdue ? '#fee2e2' : '#fef3c7',
+      badgeColor: overdue ? '#991b1b' : BRAND_PRIMARY,
+      bodyHtml,
+      footerHtml: `You're receiving this because ${escapeHtml(brandName)} is working with you on ${escapeHtml(projectName)}. Reply to this email if you have any questions.`,
+    }),
+  });
+}
+
+module.exports = { sendMail, sendPayrollReady, sendLeaveUpdate, sendProfileReviewUpdate, sendAppraisalUpdate, sendProjectAssigned, sendTaskAssigned, sendTaskReminder, sendPasswordReset, sendAdminPasswordReset, sendStageAdvance, sendUserInvite, sendPortalInvite, sendPortalLoginCode, sendEmailChangeCode, sendDocumentReviewLink, sendDocumentRemind, sendInvoiceEmail, sendClientRequestForm, sendClientRequestReminder };

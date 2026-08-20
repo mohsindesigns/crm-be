@@ -1,23 +1,37 @@
 /**
- * Card payments for portal invoices, via real Stripe Invoices.
+ * Card payments for portal invoices, via Stripe Checkout Sessions (mode:
+ * "payment") — deliberately NOT Stripe Invoices.
  *
- * Deliberately NOT Checkout Sessions. A Checkout Session is a throwaway payment
- * page — nothing durable lands in the Stripe dashboard, so reconciling a bank
- * payout against "which client paid which invoice" means digging through payment
- * intents. Creating an actual Stripe Invoice means the charge exists as a first
- * class invoice on Stripe's side too: it carries our invoice number, the same
- * line items, the customer's history, and Stripe's own PDF/receipt. Its
- * `hosted_invoice_url` IS a hosted payment page, so the client experience is the
- * same redirect — we just get a real record out of it.
+ * We used to create a real Stripe Invoice per payment (`stripe.invoices.*`).
+ * That's the wrong tool here: Stripe's Invoicing product bills an extra ~0.4%
+ * fee per paid invoice, on top of ordinary card processing, and we don't need
+ * anything Invoicing provides — our own InvoiceService/EmailService already
+ * generates and emails the invoice document the client actually sees. Stripe's
+ * invoice was never shown to the client as "the invoice"; only its
+ * `hosted_invoice_url` payment page was ever used, built fresh on demand each
+ * time the client clicked Pay. A Checkout Session gives the exact same
+ * redirect-to-pay experience (`session.url`) without ever touching the
+ * Invoicing API, so the 0.4% fee simply doesn't apply.
+ *
+ * Reconciliation — the reason Invoices were chosen originally — is preserved
+ * through `metadata.cadenceInvoiceId`/`cadenceDocumentId` on the session
+ * instead of through a durable Stripe-side invoice record: the webhook (and
+ * `syncFromStripe`) resolve our row from that metadata, never from a Stripe
+ * invoice object.
+ *
+ * IMPORTANT: never set `invoice_creation` on a Checkout Session created here.
+ * That flag is what turns a session back into a real Stripe Invoice and
+ * re-introduces the fee this rewrite exists to remove.
  *
  * The flow:
  *   1. Client picks "Credit / Debit Card" on a portal invoice.
- *   2. startPayment() ensures a Stripe Customer, creates a Stripe Invoice with
- *      one line per InvoiceLine (plus a processing-fee line if the client is
- *      absorbing it), finalizes it, and hands back hosted_invoice_url.
- *   3. Client pays on Stripe.
- *   4. Stripe POSTs `invoice.paid` to /api/stripe/webhook, which records the
- *      Payment and flips our invoice to `paid`. No human in the loop.
+ *   2. startPayment() ensures a Stripe Customer, creates a Checkout Session
+ *      with one line item per InvoiceLine (plus a processing-fee line if the
+ *      client is absorbing it), and hands back session.url.
+ *   3. Client pays on Stripe's hosted Checkout page.
+ *   4. Stripe POSTs `checkout.session.completed` (or the async variant) to
+ *      /api/stripe/webhook, which records the Payment and flips our invoice to
+ *      `paid`. No human in the loop.
  *
  * Everything here degrades to a clean 503 when STRIPE_ENABLED is off or the
  * secret key is blank, so the rest of billing keeps working un-configured.
@@ -109,26 +123,23 @@ async function processingFeeFor(orgId, amount, currency, { chargeFee = true } = 
 }
 
 /**
- * A stable reference for the money that settled a Stripe invoice, used as the
- * dedupe key for Payment rows.
- *
- * `invoice.payment_intent` was a top-level field on older API versions and moved
- * under `invoice.payments[]` on newer ones, so both shapes are probed. The Stripe
- * invoice id is the last resort — it is unique per invoice, which is all the
- * idempotency guard actually needs.
+ * A stable reference for the money that settled a Checkout Session, used as
+ * the dedupe key for Payment rows. `session.payment_intent` is always a flat
+ * string id on a Checkout Session (no object-vs-string ambiguity like an
+ * Invoice's payment_intent had), so it's used directly; the session id is the
+ * last-resort fallback — unique per session, which is all the idempotency
+ * guard actually needs.
  */
-function extractPaymentRef(stripeInvoice) {
-  const pi = stripeInvoice?.payment_intent;
+function extractPaymentRef(session) {
+  const pi = session?.payment_intent;
   if (typeof pi === 'string' && pi) return pi;
   if (pi?.id) return pi.id;
+  return session?.id || null;
+}
 
-  const first = stripeInvoice?.payments?.data?.[0]?.payment;
-  const nested = first?.payment_intent;
-  if (typeof nested === 'string' && nested) return nested;
-  if (nested?.id) return nested.id;
-  if (typeof first?.charge === 'string' && first.charge) return first.charge;
-
-  return stripeInvoice?.id || null;
+/** Where the Front End lives, for building Checkout success/cancel redirects. */
+function frontendBase() {
+  return String(process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/$/, '');
 }
 
 class StripeService {
@@ -173,9 +184,12 @@ class StripeService {
   }
 
   /**
-   * Reuse the Stripe invoice already attached to this row when it's still
+   * Reuse the Checkout Session already attached to this row when it's still
    * payable, so a client who closed the tab lands back on the same page instead
-   * of creating a second invoice for the same money.
+   * of creating a second session for the same money.
+   *
+   * `invoice.stripeInvoiceId` holds a Checkout Session id (field name kept from
+   * the pre-rewrite Invoice-based flow to avoid a schema change).
    *
    * Returns a hosted URL to resume, `{ alreadyPaid: true }` if Stripe says it's
    * settled (in which case we reconcile immediately), or null to create fresh.
@@ -185,25 +199,22 @@ class StripeService {
     const s = stripe();
     let existing;
     try {
-      existing = await s.invoices.retrieve(invoice.stripeInvoiceId);
+      existing = await s.checkout.sessions.retrieve(invoice.stripeInvoiceId);
     } catch {
       return null; // Vanished or belongs to another Stripe account — start over.
     }
 
-    if (existing.status === 'paid') {
+    if (existing.status === 'complete') {
       // Reconciles it here and now. `fullySettled` distinguishes "the invoice is
       // done" from "an earlier part payment cleared" — the second is a reason to
       // carry on and collect the rest, not to stop.
-      const result = await this._markPaidFromStripeInvoice(existing);
+      const result = await this._markPaidFromSession(existing);
       return { alreadyPaid: true, fullySettled: result?.fullySettled !== false };
     }
-    if (existing.status === 'open' && existing.hosted_invoice_url) {
-      return { url: existing.hosted_invoice_url, stripeInvoiceId: existing.id, resumed: true };
+    if (existing.status === 'open' && existing.url) {
+      return { url: existing.url, stripeInvoiceId: existing.id, resumed: true };
     }
-    // draft / void / uncollectible — abandon it and build a new one.
-    if (existing.status === 'draft') {
-      await s.invoices.del(existing.id).catch(() => {});
-    }
+    // expired — abandon it and build a new one.
     return null;
   }
 
@@ -324,14 +335,14 @@ class StripeService {
       return { url: resumed.url, resumed: true, chargeAmount, amountDue, isPartPayment: false };
     }
     if (resumed?.url) {
-      // The void MUST succeed before we forget this invoice. Swallowing the
+      // The expire MUST succeed before we forget this invoice. Swallowing the
       // error left a still-payable Stripe page live with no reference to it on
       // our side — the client could pay the old page and the new one, and with
       // no webhook we'd never learn about the first. Failing loudly keeps the
       // old page as the only payable one, which is recoverable; orphaning it is
       // not.
       try {
-        await s.invoices.voidInvoice(openStripeInvoiceId);
+        await s.checkout.sessions.expire(openStripeInvoiceId);
       } catch (err) {
         const e = new Error('Could not cancel the previous payment page. Please refresh and try again in a moment.');
         e.status = 409;
@@ -348,114 +359,119 @@ class StripeService {
 
     const customerId = await this._ensureCustomer(invoice.client, billingContact);
     const fee = await processingFeeFor(orgId, chargeAmount, currency, { chargeFee: invoice.client?.chargeCardFee !== false });
-    // How long the client has to pay, set by the admin rather than the deploy.
+    // How long the payment page stays open, set by the admin rather than the
+    // deploy. Checkout Sessions cap out at 24h regardless of what's configured.
     const settings = await db.PaymentSetting.resolve(orgId).catch(() => null);
     const dueDays = Math.max(0, settings?.invoiceDueDays ?? 7);
+    const expiresAt = Math.floor(Date.now() / 1000)
+      + Math.min(Math.max(dueDays, 1) * 86400, 23 * 3600 + 59 * 60);
 
-    // Create the invoice FIRST with pending_invoice_items_behavior: 'exclude',
-    // then attach items to it explicitly. The alternative (create items, then an
-    // invoice that sweeps up pending items) can pull in stray items left behind
-    // by an earlier failed attempt and overcharge the client.
-    const draft = await s.invoices.create({
-      customer: customerId,
-      currency,
-      collection_method: 'send_invoice',
-      days_until_due: dueDays,
-      pending_invoice_items_behavior: 'exclude',
-      auto_advance: false,
-      description: `Payment for invoice ${invoice.number}`,
-      // Echoed back on every webhook — this is how we map Stripe's callback to
-      // our row without trusting anything client-supplied.
-      metadata: {
-        cadenceInvoiceId: invoice.id,
-        cadenceOrgId: orgId,
-        cadenceInvoiceNumber: invoice.number,
-        cadenceClientId: invoice.clientId,
-        cadenceProcessingFee: String(fee),
-        cadenceChargeAmount: String(chargeAmount),
-        cadencePartPayment: isPartPayment ? '1' : '0',
-        cadenceMethodLabel: method?.label || 'Credit / Debit Card (Stripe)',
-      },
-      custom_fields: [{ name: 'Invoice', value: String(invoice.number).slice(0, 30) }],
-    });
-
+    const lineItems = [];
     if (isPartPayment) {
       // One explicit line. Mirroring the full scope and then discounting it down
       // would show the client a page they can't reconcile against the figure they
       // just typed.
-      await s.invoiceItems.create({
-        customer: customerId,
-        invoice: draft.id,
-        currency,
-        amount: toMinorUnits(chargeAmount, currency),
-        description: `Part payment for invoice ${invoice.number} (balance ${invoice.currency} ${(amountDue - chargeAmount).toFixed(2)} remains)`.slice(0, 300),
+      lineItems.push({
+        price_data: {
+          currency,
+          unit_amount: toMinorUnits(chargeAmount, currency),
+          product_data: {
+            name: `Part payment for invoice ${invoice.number} (balance ${invoice.currency} ${(amountDue - chargeAmount).toFixed(2)} remains)`.slice(0, 300),
+          },
+        },
+        quantity: 1,
       });
     } else {
-      const lines = invoice.lines || [];
+      // Partial prior payments already cleared: a Checkout line item can't go
+      // negative like the old Stripe-invoice credit line could, so a partially
+      // paid invoice collects the remaining balance as a single line instead of
+      // mirroring the full scope alongside a credit.
+      const alreadyPaid = Math.round((total - amountDue) * 100) / 100;
+      const lines = alreadyPaid > 0 ? [] : (invoice.lines || []);
       if (lines.length) {
         for (const line of lines) {
           const lineAmount = Number(line.amount) || (Number(line.qty) || 0) * (Number(line.unitPrice) || 0);
           if (lineAmount <= 0) continue;
-          await s.invoiceItems.create({
-            customer: customerId,
-            invoice: draft.id,
-            currency,
-            amount: toMinorUnits(lineAmount, currency),
-            description: String(line.description || 'Services').slice(0, 300),
+          lineItems.push({
+            price_data: {
+              currency,
+              unit_amount: toMinorUnits(lineAmount, currency),
+              product_data: { name: String(line.description || 'Services').slice(0, 300) },
+            },
+            quantity: 1,
           });
         }
-      } else {
-        await s.invoiceItems.create({
-          customer: customerId,
-          invoice: draft.id,
-          currency,
-          amount: toMinorUnits(amountDue, currency),
-          description: `Invoice ${invoice.number}`,
-        });
       }
-
-      // Partial prior payments: credit them so the client is only asked for the
-      // remaining balance, even though the line items show the full scope.
-      const alreadyPaid = Math.round((total - amountDue) * 100) / 100;
-      if (alreadyPaid > 0) {
-        await s.invoiceItems.create({
-          customer: customerId,
-          invoice: draft.id,
-          currency,
-          amount: -toMinorUnits(alreadyPaid, currency),
-          description: 'Less: payments already received',
+      if (!lineItems.length) {
+        lineItems.push({
+          price_data: {
+            currency,
+            unit_amount: toMinorUnits(amountDue, currency),
+            product_data: { name: `Invoice ${invoice.number}` },
+          },
+          quantity: 1,
         });
       }
     }
 
     if (fee > 0) {
-      await s.invoiceItems.create({
-        customer: customerId,
-        invoice: draft.id,
-        currency,
-        amount: toMinorUnits(fee, currency),
-        description: 'Card processing fee',
+      lineItems.push({
+        price_data: {
+          currency,
+          unit_amount: toMinorUnits(fee, currency),
+          product_data: { name: 'Card processing fee' },
+        },
+        quantity: 1,
       });
     }
 
-    const finalized = await s.invoices.finalizeInvoice(draft.id, { auto_advance: false });
-    if (!finalized.hosted_invoice_url) {
+    const metadata = {
+      cadenceInvoiceId: invoice.id,
+      cadenceOrgId: orgId,
+      cadenceInvoiceNumber: invoice.number,
+      cadenceClientId: invoice.clientId,
+      cadenceProcessingFee: String(fee),
+      cadenceChargeAmount: String(chargeAmount),
+      cadencePartPayment: isPartPayment ? '1' : '0',
+      cadenceMethodLabel: method?.label || 'Credit / Debit Card (Stripe)',
+    };
+
+    const returnBase = invoice.publicToken
+      ? `${frontendBase()}/invoice/${invoice.publicToken}`
+      : `${frontendBase()}/invoices/${invoice.id}`;
+
+    // Deliberately no `invoice_creation` here — that's what would turn this
+    // back into a billed Stripe Invoice. See the file header.
+    const session = await s.checkout.sessions.create({
+      mode: 'payment',
+      customer: customerId,
+      line_items: lineItems,
+      success_url: `${returnBase}?payment=success`,
+      cancel_url: `${returnBase}?payment=cancelled`,
+      expires_at: expiresAt,
+      // Echoed back on every webhook — this is how we map Stripe's callback to
+      // our row without trusting anything client-supplied.
+      metadata,
+      payment_intent_data: { metadata },
+    });
+
+    if (!session.url) {
       const err = new Error('Stripe did not return a payment link. Please try again or use another payment method.');
       err.status = 502;
       throw err;
     }
 
     await invoice.update({
-      stripeInvoiceId: finalized.id,
-      stripeHostedUrl: finalized.hosted_invoice_url,
-      // Remembered so a later attempt for a different figure knows to void this
+      stripeInvoiceId: session.id,
+      stripeHostedUrl: session.url,
+      // Remembered so a later attempt for a different figure knows to expire this
       // page rather than sending the client back to the old amount.
       stripePartialAmount: isPartPayment ? chargeAmount : null,
     });
 
     return {
-      url: finalized.hosted_invoice_url,
-      stripeInvoiceId: finalized.id,
+      url: session.url,
+      stripeInvoiceId: session.id,
       amountDue,
       chargeAmount,
       isPartPayment,
@@ -518,16 +534,17 @@ class StripeService {
 
     // Resume an already-open Stripe page for this same document (refresh, or a
     // second click before the first page loaded) instead of spawning a second
-    // payable page for the same money.
+    // payable page for the same money. `document.stripeInvoiceId` holds a
+    // Checkout Session id (field name kept from the pre-rewrite Invoice-based
+    // flow to avoid a schema change).
     if (document.stripeInvoiceId) {
       try {
-        const existing = await s.invoices.retrieve(document.stripeInvoiceId);
-        if (existing.status === 'open' && existing.hosted_invoice_url) {
-          return { url: existing.hosted_invoice_url, resumed: true, amount, currency: document.currency };
+        const existing = await s.checkout.sessions.retrieve(document.stripeInvoiceId);
+        if (existing.status === 'open' && existing.url) {
+          return { url: existing.url, resumed: true, amount, currency: document.currency };
         }
-        if (existing.status === 'draft') await s.invoices.del(existing.id).catch(() => {});
-        // 'paid' means the webhook already converted this (convertedClientId
-        // would be set above); 'void'/'uncollectible' falls through to create fresh.
+        // 'complete' means the webhook already converted this (convertedClientId
+        // would be set above); 'expired' falls through to create fresh.
       } catch {
         // Vanished or belongs to another Stripe account — fall through and build a new one.
       }
@@ -559,56 +576,62 @@ class StripeService {
     const fee = await processingFeeFor(orgId, amount, currency, { chargeFee });
     const settings = await db.PaymentSetting.resolve(orgId).catch(() => null);
     const dueDays = Math.max(0, settings?.invoiceDueDays ?? 7);
+    const expiresAt = Math.floor(Date.now() / 1000)
+      + Math.min(Math.max(dueDays, 1) * 86400, 23 * 3600 + 59 * 60);
     const typeLabel = String(document.type || 'document');
     const typeTitle = typeLabel.charAt(0).toUpperCase() + typeLabel.slice(1);
 
-    const draft = await s.invoices.create({
-      customer: customerId,
-      currency,
-      collection_method: 'send_invoice',
-      days_until_due: dueDays,
-      pending_invoice_items_behavior: 'exclude',
-      auto_advance: false,
-      description: `Payment for ${typeLabel} ${document.number}`,
-      // Distinguishes this from an ordinary invoice payment in the webhook —
-      // see StripeService.handleEvent. No cadenceInvoiceId: none exists yet.
-      metadata: {
-        cadenceDocumentId: document.id,
-        cadenceOrgId: orgId,
-        cadenceDocumentNumber: document.number,
-        cadenceProcessingFee: String(fee),
-        cadenceMethodLabel: 'Credit / Debit Card (Stripe)',
-      },
-      custom_fields: [{ name: typeTitle, value: String(document.number).slice(0, 30) }],
-    });
-
-    await s.invoiceItems.create({
-      customer: customerId,
-      invoice: draft.id,
-      currency,
-      amount: toMinorUnits(amount, currency),
-      description: `${typeTitle} ${document.number}`,
-    });
-    if (fee > 0) {
-      await s.invoiceItems.create({
-        customer: customerId,
-        invoice: draft.id,
+    const lineItems = [{
+      price_data: {
         currency,
-        amount: toMinorUnits(fee, currency),
-        description: 'Card processing fee',
+        unit_amount: toMinorUnits(amount, currency),
+        product_data: { name: `${typeTitle} ${document.number}` },
+      },
+      quantity: 1,
+    }];
+    if (fee > 0) {
+      lineItems.push({
+        price_data: {
+          currency,
+          unit_amount: toMinorUnits(fee, currency),
+          product_data: { name: 'Card processing fee' },
+        },
+        quantity: 1,
       });
     }
 
-    const finalized = await s.invoices.finalizeInvoice(draft.id, { auto_advance: false });
-    if (!finalized.hosted_invoice_url) {
+    const metadata = {
+      // Distinguishes this from an ordinary invoice payment in the webhook —
+      // see StripeService.handleEvent. No cadenceInvoiceId: none exists yet.
+      cadenceDocumentId: document.id,
+      cadenceOrgId: orgId,
+      cadenceDocumentNumber: document.number,
+      cadenceProcessingFee: String(fee),
+      cadenceMethodLabel: 'Credit / Debit Card (Stripe)',
+    };
+    const returnBase = `${frontendBase()}/review/${document.publicToken}`;
+
+    // Deliberately no `invoice_creation` here — see the file header.
+    const session = await s.checkout.sessions.create({
+      mode: 'payment',
+      customer: customerId,
+      line_items: lineItems,
+      success_url: `${returnBase}?payment=success`,
+      cancel_url: `${returnBase}?payment=cancelled`,
+      expires_at: expiresAt,
+      metadata,
+      payment_intent_data: { metadata },
+    });
+
+    if (!session.url) {
       const err = new Error('Stripe did not return a payment link. Please try again or use another payment method.');
       err.status = 502;
       throw err;
     }
 
-    await document.update({ stripeInvoiceId: finalized.id, stripeHostedUrl: finalized.hosted_invoice_url });
+    await document.update({ stripeInvoiceId: session.id, stripeHostedUrl: session.url });
 
-    return { url: finalized.hosted_invoice_url, resumed: false, amount, currency: document.currency, processingFee: fee };
+    return { url: session.url, resumed: false, amount, currency: document.currency, processingFee: fee };
   }
 
   /**
@@ -636,17 +659,17 @@ class StripeService {
       throw err;
     }
 
-    let stripeInvoice;
+    let session;
     try {
-      stripeInvoice = await stripe().invoices.retrieve(invoice.stripeInvoiceId);
+      session = await stripe().checkout.sessions.retrieve(invoice.stripeInvoiceId);
     } catch (err) {
       const e = new Error(`Could not reach Stripe for this invoice: ${err.message}`);
       e.status = 502;
       throw e;
     }
 
-    if (stripeInvoice.status === 'paid') {
-      const result = await this._markPaidFromStripeInvoice(stripeInvoice);
+    if (session.status === 'complete') {
+      const result = await this._markPaidFromSession(session);
       if (result?.fullySettled === false) {
         return {
           status: 'part_paid',
@@ -657,8 +680,8 @@ class StripeService {
     }
 
     return {
-      status: stripeInvoice.status,
-      message: `Stripe reports this invoice as "${stripeInvoice.status}" — no payment has cleared yet.`,
+      status: session.status,
+      message: `Stripe reports this payment page as "${session.status}" — no payment has cleared yet.`,
     };
   }
 
@@ -677,34 +700,38 @@ class StripeService {
 
   async handleEvent(event) {
     switch (event.type) {
-      case 'invoice.paid':
-      case 'invoice.payment_succeeded': {
+      case 'checkout.session.completed':
+      case 'checkout.session.async_payment_succeeded': {
         const obj = event.data.object;
+        if (event.type === 'checkout.session.completed' && obj?.payment_status !== 'paid') {
+          // Card payments settle synchronously, so this only fires for an
+          // async payment method still pending — wait for the async event.
+          return { ignored: 'payment_not_yet_paid' };
+        }
         // A pay-before-convert document payment (see startDocumentPayment)
         // carries cadenceDocumentId instead of cadenceInvoiceId — no Invoice
         // row exists yet, so it needs the conversion step first.
         if (obj?.metadata?.cadenceDocumentId) return this._convertAndMarkPaidFromDocument(obj);
-        return this._markPaidFromStripeInvoice(obj);
+        return this._markPaidFromSession(obj);
       }
-      case 'invoice.payment_failed':
+      case 'checkout.session.async_payment_failed':
         return this._onPaymentFailed(event.data.object);
-      case 'invoice.voided':
-      case 'invoice.marked_uncollectible':
+      case 'checkout.session.expired':
         return this._onInvoiceCancelled(event.data.object);
       default:
         return { ignored: event.type };
     }
   }
 
-  /** Resolve our Invoice row from a Stripe invoice object. */
-  async _localInvoiceFor(stripeInvoice) {
-    const localId = stripeInvoice?.metadata?.cadenceInvoiceId;
+  /** Resolve our Invoice row from a Checkout Session object. */
+  async _localInvoiceFor(session) {
+    const localId = session?.metadata?.cadenceInvoiceId;
     if (localId) {
       const byMeta = await db.Invoice.findByPk(localId);
       if (byMeta) return byMeta;
     }
-    if (stripeInvoice?.id) {
-      return db.Invoice.findOne({ where: { stripeInvoiceId: stripeInvoice.id } });
+    if (session?.id) {
+      return db.Invoice.findOne({ where: { stripeInvoiceId: session.id } });
     }
     return null;
   }
@@ -714,30 +741,28 @@ class StripeService {
    * notifies both sides.
    *
    * Idempotent on the Stripe reference: Stripe retries webhooks, and both
-   * `invoice.paid` and `invoice.payment_succeeded` fire for a single payment, so
-   * this runs 2+ times per payment as a matter of course. Without the guard the
-   * client would show as having paid twice.
+   * `checkout.session.completed` and `checkout.session.async_payment_succeeded`
+   * can fire for a single payment, so this runs 2+ times per payment as a
+   * matter of course. Without the guard the client would show as having paid
+   * twice.
    */
-  async _markPaidFromStripeInvoice(stripeInvoice) {
-    const invoice = await this._localInvoiceFor(stripeInvoice);
+  async _markPaidFromSession(session) {
+    const invoice = await this._localInvoiceFor(session);
     if (!invoice) return { ignored: 'unknown_invoice' };
 
-    const providerRef = extractPaymentRef(stripeInvoice);
+    const providerRef = extractPaymentRef(session);
 
     const existing = await db.Payment.findOne({
       where: { invoiceId: invoice.id, providerRef },
     });
     if (existing) return { ok: true, deduped: true };
 
-    const currency = stripeInvoice.currency || invoice.currency;
-    const fee = Number(stripeInvoice.metadata?.cadenceProcessingFee) || 0;
+    const currency = session.currency || invoice.currency;
+    const fee = Number(session.metadata?.cadenceProcessingFee) || 0;
     // What Stripe collected, less any surcharge — the surcharge is fee recovery,
     // not revenue against the invoice, so the invoice settles to exactly its own
     // total instead of looking overpaid.
-    const collected = fromMinorUnits(
-      stripeInvoice.amount_paid != null ? stripeInvoice.amount_paid : stripeInvoice.amount_due,
-      currency,
-    );
+    const collected = fromMinorUnits(session.amount_total, currency);
     const applied = Math.max(0, Math.round((collected - fee) * 100) / 100);
 
     await db.Payment.create({
@@ -747,16 +772,14 @@ class StripeService {
       providerRef,
       amount: applied,
       processingFee: fee,
-      methodLabel: stripeInvoice.metadata?.cadenceMethodLabel || 'Credit / Debit Card (Stripe)',
-      paidAt: stripeInvoice.status_transitions?.paid_at
-        ? new Date(stripeInvoice.status_transitions.paid_at * 1000)
-        : new Date(),
+      methodLabel: session.metadata?.cadenceMethodLabel || 'Credit / Debit Card (Stripe)',
+      paidAt: new Date(),
     });
 
-    // Stripe saying "this Stripe invoice is paid" is not the same as "our invoice
-    // is settled" once part payments exist: a $500 charge against a $2,000
-    // invoice settles Stripe's side in full while $1,500 is still owed here. Our
-    // own Payment rows are the source of truth for that.
+    // Stripe saying "this Checkout Session is complete" is not the same as "our
+    // invoice is settled" once part payments exist: a $500 charge against a
+    // $2,000 invoice settles Stripe's side in full while $1,500 is still owed
+    // here. Our own Payment rows are the source of truth for that.
     const total = Number(invoice.total) || 0;
     const paidRows = await db.Payment.findAll({ where: { invoiceId: invoice.id }, attributes: ['amount'] });
     const totalPaid = Math.round(paidRows.reduce((sum, p) => sum + (parseFloat(p.amount) || 0), 0) * 100) / 100;
@@ -768,8 +791,8 @@ class StripeService {
         await invoice.update({ status: INVOICE_STATUS.PAID });
       }
     } else {
-      // Detach the settled Stripe invoice so the next attempt builds a fresh page
-      // for the new, smaller balance instead of resuming a paid one.
+      // Detach the completed Checkout Session so the next attempt builds a fresh
+      // page for the new, smaller balance instead of resuming a paid one.
       const stillOpen = invoice.dueAt && invoice.dueAt < new Date().toISOString().split('T')[0]
         ? INVOICE_STATUS.OVERDUE
         : INVOICE_STATUS.SENT;

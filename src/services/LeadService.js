@@ -6,12 +6,7 @@ const { activeWhere } = require('./SoftDeleteService');
 const NotificationService = require('./NotificationService');
 const LeadFormService = require('./LeadFormService');
 const CaptchaService = require('./CaptchaService');
-
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-// Digits with optional leading +, spaces/dashes/dots/parens as separators —
-// permissive on formatting (no country-specific shape assumed) but rejects
-// obvious junk like "abc" or a single digit.
-const PHONE_RE = /^\+?[\d\s().-]{7,20}$/;
+const { validateAnswers } = require('../utils/formFields');
 
 const VALID_STATUSES = Object.values(LEAD_STATUS);
 
@@ -49,40 +44,22 @@ function checkRateLimit(ip) {
   }
 }
 
-/** Validates submitted answers against the form's field definitions and builds
- *  the fieldData object + the pulled-out fullName/email/phone. */
+/** Validates submitted answers against the form's field definitions (shared
+ *  with requirement forms via utils/formFields) and pulls out the
+ *  fullName/email/phone a Lead row needs as real columns. */
 function buildFieldData(fields, answers) {
-  const fieldData = {};
+  const fieldData = validateAnswers(fields, answers);
   let fullName = null;
   let email = null;
   let phone = null;
 
   for (const field of fields) {
-    // Hidden fields never render on the public form, so a visitor can never
-    // answer them — skip validation entirely rather than blocking every
-    // submission on a required field nobody could see.
-    if (field.hidden) continue;
-    const raw = answers?.[field.key];
-    const value = typeof raw === 'string' ? raw.trim() : raw;
-    if (field.required && (value === undefined || value === null || value === '')) {
-      throw badRequest(`"${field.label}" is required.`);
-    }
-    if (field.type === 'select' && value && !field.options?.includes(value)) {
-      throw badRequest(`"${value}" is not a valid option for "${field.label}".`);
-    }
-    if (field.type === 'email' && value && !EMAIL_RE.test(value)) {
-      throw badRequest(`"${field.label}" must be a valid email address.`);
-    }
-    if (field.type === 'phone' && value && !PHONE_RE.test(value)) {
-      throw badRequest(`"${field.label}" must be a valid phone number.`);
-    }
-    if (value !== undefined && value !== null && value !== '') {
-      fieldData[field.key] = value;
-      if (field.type === 'email' && !email) email = String(value);
-      if (field.type === 'phone' && !phone) phone = String(value);
-      if (field.type === 'text' && !fullName && (field.key === 'name' || field.key.includes('name'))) {
-        fullName = String(value);
-      }
+    const value = fieldData[field.key];
+    if (value === undefined) continue;
+    if (field.type === 'email' && !email) email = String(value);
+    if (field.type === 'phone' && !phone) phone = String(value);
+    if (field.type === 'text' && !fullName && (field.key === 'name' || field.key.includes('name'))) {
+      fullName = String(value);
     }
   }
   // Fallback: no field looked like a name — use the first text answer we have.

@@ -35,6 +35,9 @@ const leadsRouter = require('./routes/leads');
 const portalLeadFormsRouter = require('./routes/portalLeadForms');
 const portalLeadsRouter = require('./routes/portalLeads');
 const activityLogsRouter = require('./routes/activityLogs');
+const requirementFormsRouter = require('./routes/requirementForms');
+const clientRequestsRouter = require('./routes/clientRequests');
+const publicClientRequestsRouter = require('./routes/publicClientRequests');
 const errorHandler = require('./middleware/errorHandler');
 const activityLogger = require('./middleware/activityLogger');
 
@@ -124,6 +127,9 @@ app.use('/api/leads', leadsRouter);
 app.use('/api/portal/lead-forms', portalLeadFormsRouter);
 app.use('/api/portal/leads', portalLeadsRouter);
 app.use('/api/activity-logs', activityLogsRouter);
+app.use('/api/requirement-forms', requirementFormsRouter);
+app.use('/api/projects/:projectId/client-requests', clientRequestsRouter);
+app.use('/api/public/client-requests', publicClientRequestsRouter);
 
 // 404
 app.use((req, res) => res.status(404).json({ message: 'Not found.' }));
@@ -333,6 +339,8 @@ app.schemaReady = (async () => {
     await db.Lead.ensureSchema();      // new table; depends on lead_forms/projects/clients
     await db.LeadEvent.ensureSchema(); // new table; depends on leads
     await db.ActivityLog.ensureSchema(); // new table; Activity Logs sidebar page — depends on orgs/users
+    await db.RequirementFormTemplate.ensureSchema(); // new table; reusable client requirement forms
+    await db.ClientRequest.ensureSchema();           // new table; depends on requirement_form_templates/projects/clients/contacts
   } catch (err) {
     console.error('[Schema] ensureSchema failed:', err.message);
   }

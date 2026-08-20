@@ -105,6 +105,10 @@ class ProjectService {
       include: [
         { model: db.Client, as: 'client', attributes: ['id', 'name'] },
         { model: db.WorkflowTemplate, as: 'template', attributes: ['id', 'name'] },
+        // Package name for the list table's Package column — project.name already
+        // bakes this in (see utils/projectName.js), but the table now shows it as
+        // its own column instead of parsing it back out of the combined string.
+        { model: db.Package, as: 'package', attributes: ['id', 'name'] },
         { model: db.ProjectAssignment, as: 'assignments', separate: true, include: [{ model: db.User, as: 'user', attributes: ['id', 'name', 'avatarUrl'] }] },
       ],
       order: [['createdAt', 'DESC']],

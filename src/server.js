@@ -11,6 +11,7 @@ const { startScheduler: startTaskReminderScheduler } = require('./services/TaskR
 const { startChatRetentionScheduler } = require('./services/ChatRetentionScheduler');
 const { startScheduler: startAttendanceAbsentScheduler } = require('./services/AttendanceAbsentScheduler');
 const { startScheduler: startDiscountExpiryScheduler } = require('./services/DiscountExpiryScheduler');
+const { startScheduler: startClientRequestReminderScheduler } = require('./services/ClientRequestReminderScheduler');
 
 const PORT = process.env.PORT || 4000;
 
@@ -36,6 +37,7 @@ async function start() {
       startChatRetentionScheduler();
       startAttendanceAbsentScheduler();
       startDiscountExpiryScheduler();
+      startClientRequestReminderScheduler();
     });
   } catch (err) {
     console.error('Failed to start server:', err);
