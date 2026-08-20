@@ -6,10 +6,16 @@ let transporter = null;
 
 function getTransporter() {
   if (!transporter) {
+    const port = parseInt(process.env.SMTP_PORT || '587', 10);
+    const secure = process.env.SMTP_SECURE === 'true';
     transporter = nodemailer.createTransport({
       host: process.env.SMTP_HOST || 'smtp.mailtrap.io',
-      port: parseInt(process.env.SMTP_PORT || '587', 10),
-      secure: process.env.SMTP_SECURE === 'true',
+      port,
+      secure,
+      // On the submission port the connection starts plaintext and upgrades via
+      // STARTTLS. Relays like Brevo always offer it, so demand it rather than
+      // letting nodemailer silently fall back to sending credentials in the clear.
+      ...(secure ? {} : { requireTLS: true }),
       auth: {
         user: process.env.SMTP_USER,
         pass: process.env.SMTP_PASS,
@@ -84,8 +90,36 @@ async function sendMail({ to, subject, html, from, attachments, cc }) {
       ...(attachments?.length ? { attachments } : {}),
     });
   } catch (err) {
-    console.error('[EmailService] Failed to send email:', err.message);
+    // Every caller treats a null return as "not delivered" and carries on, so this
+    // log is the only trace a failed send leaves — include the SMTP-level detail
+    // (auth rejection vs. unverified sender vs. connection) or it is undiagnosable.
+    console.error(
+      `[EmailService] Failed to send email to ${to}: ${err.message}`
+      + `${err.code ? ` [code=${err.code}]` : ''}`
+      + `${err.responseCode ? ` [smtp=${err.responseCode}]` : ''}`
+      + `${err.response ? ` ${err.response}` : ''}`,
+    );
     return null;
+  }
+}
+
+// Called once at boot so a bad host/login surfaces in the startup log instead of
+// on the first invite or password reset a user happens to trigger.
+async function verifyTransport() {
+  if (!process.env.SMTP_USER) {
+    console.warn('[EmailService] SMTP_USER not configured — outbound email is disabled.');
+    return false;
+  }
+  try {
+    await getTransporter().verify();
+    console.log(`[EmailService] SMTP ready (${process.env.SMTP_HOST} as ${process.env.SMTP_USER}).`);
+    return true;
+  } catch (err) {
+    console.error(
+      `[EmailService] SMTP verification FAILED — email will not send: ${err.message}`
+      + `${err.responseCode ? ` [smtp=${err.responseCode}]` : ''}`,
+    );
+    return false;
   }
 }
 
@@ -701,4 +735,4 @@ async function sendClientRequestReminder({
   });
 }
 
-module.exports = { sendMail, sendPayrollReady, sendLeaveUpdate, sendProfileReviewUpdate, sendAppraisalUpdate, sendProjectAssigned, sendTaskAssigned, sendTaskReminder, sendPasswordReset, sendAdminPasswordReset, sendStageAdvance, sendUserInvite, sendPortalInvite, sendPortalLoginCode, sendEmailChangeCode, sendDocumentReviewLink, sendDocumentRemind, sendInvoiceEmail, sendClientRequestForm, sendClientRequestReminder };
+module.exports = { sendMail, verifyTransport, sendPayrollReady, sendLeaveUpdate, sendProfileReviewUpdate, sendAppraisalUpdate, sendProjectAssigned, sendTaskAssigned, sendTaskReminder, sendPasswordReset, sendAdminPasswordReset, sendStageAdvance, sendUserInvite, sendPortalInvite, sendPortalLoginCode, sendEmailChangeCode, sendDocumentReviewLink, sendDocumentRemind, sendInvoiceEmail, sendClientRequestForm, sendClientRequestReminder };

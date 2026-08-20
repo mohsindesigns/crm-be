@@ -12,6 +12,7 @@ const { startChatRetentionScheduler } = require('./services/ChatRetentionSchedul
 const { startScheduler: startAttendanceAbsentScheduler } = require('./services/AttendanceAbsentScheduler');
 const { startScheduler: startDiscountExpiryScheduler } = require('./services/DiscountExpiryScheduler');
 const { startScheduler: startClientRequestReminderScheduler } = require('./services/ClientRequestReminderScheduler');
+const { verifyTransport } = require('./services/EmailService');
 
 const PORT = process.env.PORT || 4000;
 
@@ -38,6 +39,9 @@ async function start() {
       startAttendanceAbsentScheduler();
       startDiscountExpiryScheduler();
       startClientRequestReminderScheduler();
+      // Non-blocking: a bad SMTP login must not stop the API from booting, but it
+      // should be visible in the log rather than only failing at first send.
+      verifyTransport().catch(() => {});
     });
   } catch (err) {
     console.error('Failed to start server:', err);
