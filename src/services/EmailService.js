@@ -54,13 +54,16 @@ function titleCaseWords(value) {
     .join(' ');
 }
 
-function emailLayout({ brandName, title, accentColor, badgeLabel, badgeBg, badgeColor, bodyHtml, footerHtml }) {
+function emailLayout({ brandName, logoUrl, title, accentColor, badgeLabel, badgeBg, badgeColor, bodyHtml, footerHtml }) {
+  const brandBlock = logoUrl
+    ? `<img src="${escapeHtml(logoUrl)}" alt="${escapeHtml(brandName)}" style="height:24px;width:auto;max-width:180px;object-fit:contain;display:block;margin:0 0 14px;">`
+    : `<p style="margin:0 0 6px;color:#6b7280;font-size:12px;letter-spacing:0.08em;text-transform:uppercase;">${escapeHtml(brandName)}</p>`;
   return `
     <div style="margin:0;padding:32px 16px;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif;">
       <div style="max-width:560px;margin:0 auto;background:#ffffff;border:1px solid #e5e7eb;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.06);">
         <div style="height:4px;background:${accentColor};"></div>
         <div style="padding:28px 32px 8px;">
-          <p style="margin:0 0 6px;color:#6b7280;font-size:12px;letter-spacing:0.08em;text-transform:uppercase;">${escapeHtml(brandName)}</p>
+          ${brandBlock}
           <h1 style="margin:0;color:#111827;font-size:22px;line-height:1.3;font-weight:700;">${escapeHtml(title || badgeLabel)}</h1>
           <span style="display:inline-block;margin-top:14px;padding:6px 12px;border-radius:999px;background:${badgeBg};color:${badgeColor};font-size:12px;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;">${escapeHtml(badgeLabel)}</span>
         </div>
@@ -646,7 +649,7 @@ async function sendAppraisalUpdate({
  *  client contact (see services/ClientRequestService.js#send). `formUrl` is a
  *  tokenized public link — no login, same as the document review links above. */
 async function sendClientRequestForm({
-  to, cc, recipientName, brandName, projectName, subject, message, formUrl, dueAt, fieldCount,
+  to, cc, recipientName, brandName, logoUrl, projectName, subject, message, formUrl, dueAt, fieldCount,
 }) {
   const safeName = escapeHtml(recipientName || 'there');
   const dueLabel = dueAt ? formatEmailDate(dueAt) : null;
@@ -680,6 +683,7 @@ async function sendClientRequestForm({
     subject,
     html: emailLayout({
       brandName,
+      logoUrl,
       title: subject,
       accentColor: BRAND_PRIMARY,
       badgeLabel: 'Action needed',
@@ -695,7 +699,7 @@ async function sendClientRequestForm({
  *  when it comes from ClientRequestReminderScheduler rather than a staff member
  *  clicking "Send reminder" — the wording softens accordingly. */
 async function sendClientRequestReminder({
-  to, cc, recipientName, brandName, projectName, subject, formUrl, dueAt, automated,
+  to, cc, recipientName, brandName, logoUrl, projectName, subject, formUrl, dueAt, automated,
 }) {
   const safeName = escapeHtml(recipientName || 'there');
   const dueLabel = dueAt ? formatEmailDate(dueAt) : null;
@@ -724,6 +728,7 @@ async function sendClientRequestReminder({
     subject: `Reminder: ${subject}`,
     html: emailLayout({
       brandName,
+      logoUrl,
       title: subject,
       accentColor: overdue ? '#dc2626' : BRAND_PRIMARY,
       badgeLabel: overdue ? 'Overdue' : 'Reminder',

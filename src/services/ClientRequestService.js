@@ -120,7 +120,18 @@ async function send(projectId, orgId, data, userId) {
   const subject = String(data.subject || template?.defaultSubject || `Project requirements — ${project.name}`).trim();
   if (!subject) throw badRequest('The email needs a subject.');
 
-  const ccEmails = normalizeCc(data.ccEmails);
+  // The org's own contact address is always CC'd, on top of whatever staff
+  // typed — so there's always an internal copy of what was asked for. Not
+  // staff-removable: it's appended after normalizeCc, not merged into the
+  // editable input. Guarded with EMAIL_RE (rather than normalizeCc, which
+  // throws) so a malformed org contact address never blocks a send.
+  const branding = await db.WhiteLabelConfig.findOne({ where: { orgId } });
+  const orgCc = branding?.contactEmail && EMAIL_RE.test(String(branding.contactEmail).trim())
+    ? String(branding.contactEmail).trim()
+    : null;
+  const ccEmails = [...new Set([...normalizeCc(data.ccEmails), ...(orgCc ? [orgCc] : [])])]
+    .filter((e) => e.toLowerCase() !== recipientEmail.toLowerCase())
+    .slice(0, 10);
   const publicToken = crypto.randomBytes(24).toString('base64url');
 
   const request = await db.ClientRequest.create({
@@ -149,12 +160,12 @@ async function send(projectId, orgId, data, userId) {
   // it, the caller needs to know the client never got the link.
   // EmailService.sendMail swallows send failures and returns null, so a null
   // result is the failure signal.
-  const branding = await db.WhiteLabelConfig.findOne({ where: { orgId } });
   const sent = await EmailService.sendClientRequestForm({
     to: recipientEmail,
     cc: ccEmails,
     recipientName: request.recipientName,
     brandName: branding?.brandName || 'Your agency',
+    logoUrl: branding?.logoUrl || null,
     projectName: project.name,
     subject,
     message: request.message,
@@ -225,6 +236,7 @@ async function remind(id, orgId, { automated = false } = {}) {
     cc: request.ccEmails || [],
     recipientName: request.recipientName,
     brandName: branding?.brandName || 'Your agency',
+    logoUrl: branding?.logoUrl || null,
     projectName: request.project?.name || 'your project',
     subject: request.subject,
     formUrl: publicUrl(request.publicToken),

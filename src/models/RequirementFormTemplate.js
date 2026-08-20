@@ -27,6 +27,14 @@ module.exports = (sequelize, DataTypes) => {
     description: {
       type: DataTypes.TEXT,
     },
+    // When set, this is the "Client Req Boilerplate" default for that
+    // ServiceType.key — the compose modal on a project auto-selects it based
+    // on the project's own serviceTypeKey. At most one active template per
+    // (orgId, serviceTypeKey) may carry this — enforced in
+    // RequirementFormService, not a DB constraint (see schemaSync.js header).
+    serviceTypeKey: {
+      type: DataTypes.STRING(100),
+    },
     // Ordered field definitions: [{ key, label, type, required, options? }],
     // the same shape lead forms use (see utils/formFields#normalizeFields).
     fields: {

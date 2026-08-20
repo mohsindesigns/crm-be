@@ -1,4 +1,5 @@
 const { v4: uuidv4 } = require('uuid');
+const { Op } = require('sequelize');
 const db = require('../models');
 const { normalizeFields } = require('../utils/formFields');
 const { activeWhere, setActive } = require('./SoftDeleteService');
@@ -15,9 +16,23 @@ function badRequest(message) {
   return Object.assign(new Error(message), { status: 400 });
 }
 
+/** At most one active template per (orgId, serviceTypeKey) can be the default
+ *  offered for that service — setting a new one silently un-defaults whatever
+ *  held that slot before, same "picking a new one replaces the old" UX as a
+ *  radio button rather than a checkbox. */
+async function clearOtherDefaults(orgId, serviceTypeKey, exceptId = null) {
+  if (!serviceTypeKey) return;
+  await db.RequirementFormTemplate.update(
+    { serviceTypeKey: null },
+    { where: { orgId, serviceTypeKey, ...(exceptId ? { id: { [Op.ne]: exceptId } } : {}) } },
+  );
+}
+
 async function create(orgId, data, userId = null) {
   const name = String(data?.name || '').trim();
   if (!name) throw badRequest('Give the form a name.');
+  const serviceTypeKey = data.serviceTypeKey || null;
+  if (serviceTypeKey) await clearOtherDefaults(orgId, serviceTypeKey);
   return db.RequirementFormTemplate.create({
     id: uuidv4(),
     orgId,
@@ -27,6 +42,7 @@ async function create(orgId, data, userId = null) {
     defaultSubject: data.defaultSubject || null,
     defaultMessage: data.defaultMessage || null,
     successMessage: data.successMessage || null,
+    serviceTypeKey,
     createdBy: userId,
   });
 }
@@ -73,6 +89,10 @@ async function update(id, orgId, data) {
   if (data.defaultSubject !== undefined) patch.defaultSubject = data.defaultSubject || null;
   if (data.defaultMessage !== undefined) patch.defaultMessage = data.defaultMessage || null;
   if (data.successMessage !== undefined) patch.successMessage = data.successMessage || null;
+  if (data.serviceTypeKey !== undefined) {
+    patch.serviceTypeKey = data.serviceTypeKey || null;
+    if (patch.serviceTypeKey) await clearOtherDefaults(orgId, patch.serviceTypeKey, id);
+  }
   await template.update(patch);
   return template;
 }

@@ -1,4 +1,5 @@
 const { LEAD_FORM_FIELD_TYPES } = require('../config/constants');
+const { isValidForRecognizedCountry } = require('./phoneCountries');
 
 // Shared definition/validation layer for every user-built form in the app —
 // lead-capture forms (LeadForm/LeadService) and the client requirement forms
@@ -74,6 +75,13 @@ function validateAnswers(fields, answers) {
     }
     if (field.type === 'phone' && value && !PHONE_RE.test(value)) {
       throw badRequest(`"${field.label}" must be a valid phone number.`);
+    }
+    // A value carrying a recognized "+<country dial code>" is checked against
+    // that country's expected digit count too — PHONE_RE alone is loose enough
+    // to admit e.g. a US number 3 digits short. Unrecognized dial codes (or no
+    // "+") skip this and rely on PHONE_RE alone, see phoneCountries.js.
+    if (field.type === 'phone' && value && !isValidForRecognizedCountry(value)) {
+      throw badRequest(`"${field.label}" doesn't match the expected length for that country code.`);
     }
     if (value !== undefined && value !== null && value !== '') {
       fieldData[field.key] = value;
