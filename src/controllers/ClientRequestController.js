@@ -26,24 +26,55 @@ class ClientRequestController {
     } catch (err) { next(err); }
   }
 
+  /** Compose + submit. Passes the whole `req.user`, not just the id — the
+   *  service needs the role to decide whether this send skips the approval
+   *  queue (admins) or joins it (everyone else). */
   async send(req, res, next) {
     try {
       const result = await ClientRequestService.send(
         req.params.projectId,
         req.orgId,
         req.body,
-        req.user.id,
+        req.user,
       );
-      // 201 either way — the request row exists and its link is live. `emailSent`
-      // is how the UI knows to warn that SMTP didn't deliver it (unconfigured
-      // SMTP_USER in dev, or a rejected send) and to offer the link for manual
-      // sharing instead of silently claiming success.
+      // 201 in all three cases — the row exists. Which of the three it was is
+      // what the UI needs to say next: still queued, emailed, or emailed-but-
+      // SMTP-refused (unconfigured SMTP_USER in dev, or a rejected send), in
+      // which case the link is offered for manual sharing rather than
+      // silently claiming success.
       res.status(201).json({
         ...result,
-        message: result.emailSent
-          ? 'Requirements form sent to the client.'
-          : 'Request created, but the email could not be sent — share the link manually.',
+        message: result.status === 'pending_approval'
+          ? 'Sent to an admin for approval — the client is emailed once it\'s approved.'
+          : result.emailSent
+            ? 'Requirements form sent to the client.'
+            : 'Approved, but the email could not be sent — share the link manually.',
       });
+    } catch (err) { next(err); }
+  }
+
+  /** Admin releases a pending request — this is what emails the client. */
+  async approve(req, res, next) {
+    try {
+      const result = await ClientRequestService.approve(req.params.requestId, req.orgId, req.user);
+      res.json({
+        ...result,
+        message: result.emailSent
+          ? 'Approved — the requirements form has been emailed to the client.'
+          : 'Approved, but the email could not be sent — share the link manually.',
+      });
+    } catch (err) { next(err); }
+  }
+
+  async reject(req, res, next) {
+    try {
+      const request = await ClientRequestService.reject(
+        req.params.requestId,
+        req.orgId,
+        req.user,
+        req.body?.reason,
+      );
+      res.json({ message: 'Rejected — the sender has been told why. Nothing was emailed to the client.', request });
     } catch (err) { next(err); }
   }
 

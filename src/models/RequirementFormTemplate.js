@@ -41,6 +41,14 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.JSON,
       allowNull: false,
     },
+    // Appearance override for the public page a client fills in — same shape
+    // and same "unset key falls back to org branding / a sensible default"
+    // rule as LeadForm.theme (see RequirementFormService#normalizeTheme /
+    // #effectiveTheme). Copied onto the resulting ClientRequest at send time,
+    // same snapshot rule as `fields` above.
+    theme: {
+      type: DataTypes.JSON,
+    },
     // Prefilled into the compose step so the common case is "pick template,
     // click send". Both remain editable per send.
     defaultSubject: {

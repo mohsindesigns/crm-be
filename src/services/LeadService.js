@@ -81,7 +81,7 @@ async function submitPublic(token, body, req) {
   }
 
   checkRateLimit(req?.ip);
-  CaptchaService.verify(body?.captchaToken, body?.captchaAnswer);
+  await CaptchaService.verify(body?.turnstileToken, req?.ip);
 
   const form = await db.LeadForm.findOne({ where: { publicToken: token, status: 'active', isActive: true } });
   if (!form) throw notFound('This form is no longer available.');
