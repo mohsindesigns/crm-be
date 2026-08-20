@@ -196,12 +196,15 @@ module.exports = (sequelize, DataTypes) => {
     respondedAt: {
       type: DataTypes.DATE,
     },
-    // Pay-before-convert: a client paying by card is sent straight to Stripe for
-    // the document's own total, BEFORE any Client/Project/Invoice exists — see
+    // Pay-before-convert: a client paying by card is sent straight to a Stripe
+    // Checkout Session (mode: "payment", not a Stripe Invoice — see
+    // StripeService.js header) for the document's own total, BEFORE any
+    // Client/Project/Invoice exists — see
     // StripeService.startDocumentPayment/_convertAndMarkPaidFromDocument. Nothing
     // is created if they abandon the page, which is the whole point: raising an
     // invoice (or spinning up a project) for a sale that was never actually paid
-    // is the liability this flow exists to avoid.
+    // is the liability this flow exists to avoid. Column names hold the Checkout
+    // Session's id/url (kept from the pre-rewrite Invoice-based flow).
     stripeInvoiceId: {
       type: DataTypes.STRING(255),
     },

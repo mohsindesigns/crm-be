@@ -61,12 +61,16 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.TEXT,
     },
     // ─── Stripe ────────────────────────────────────────────────────────────────
-    // Set when a client starts a card payment from the portal. We create a real
-    // Stripe Invoice (not a throwaway Checkout Session) so the charge exists as a
-    // proper invoice on the Stripe side too, and store its id + hosted payment URL
-    // here. Keeping the id is what lets the webhook map Stripe's callback back to
-    // our row, and lets a client who abandoned the page resume the same Stripe
-    // invoice instead of generating a second one for the same money.
+    // Set when a client starts a card payment from the portal. We create a
+    // Checkout Session (mode: "payment") — deliberately NOT a Stripe Invoice,
+    // which bills an extra ~0.4% Invoicing fee we don't need since our own
+    // InvoiceService already generates the invoice document — and store its id +
+    // hosted payment URL here. Column names kept from the pre-rewrite
+    // Invoice-based flow to avoid a schema change; they now hold the Checkout
+    // Session's id/url. Keeping the id is what lets the webhook map Stripe's
+    // callback back to our row, and lets a client who abandoned the page resume
+    // the same session instead of generating a second one for the same money.
+    // See StripeService.js for the full rationale.
     stripeInvoiceId: {
       type: DataTypes.STRING(255),
     },

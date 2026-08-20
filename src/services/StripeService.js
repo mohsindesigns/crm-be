@@ -109,9 +109,9 @@ function fromMinorUnits(amount, currency) {
  * The card processing fee passed on to the client, from the org's per-currency
  * rule in Admin → Payments.
  *
- * Charged to the client by default — it becomes a line on the Stripe invoice so
- * the agency receives its invoice total intact. A currency with no configured
- * rule charges nothing, rather than inventing a surcharge for a rate nobody
+ * Charged to the client by default — it becomes a line item on the Checkout
+ * Session so the agency receives its invoice total intact. A currency with no
+ * configured rule charges nothing, rather than inventing a surcharge for a rate nobody
  * set. `chargeFee: false` (Client.chargeCardFee unticked — see the Pay via CRM
  * section on the client page) absorbs it into the agency's side instead, for
  * both ordinary invoices and quotation/agreement/proposal payments.
@@ -219,23 +219,23 @@ class StripeService {
   }
 
   /**
-   * Create + finalize a Stripe Invoice for one of our invoices and return the
+   * Create a Stripe Checkout Session for one of our invoices and return the
    * hosted payment URL the portal should redirect to.
    *
    * `payAmount` lets the client settle part of the balance now — a $2,000 invoice
    * can be paid $500 at a time, with the remainder staying outstanding here. When
-   * it's a part payment the Stripe invoice carries a single "part payment" line
+   * it's a part payment the session carries a single "part payment" line item
    * for exactly that amount instead of mirroring the full line items, so the page
    * the client lands on asks for the figure they chose and nothing else.
    */
   /**
    * Serialize payment attempts per invoice.
    *
-   * Two concurrent calls both read the same open Stripe invoice, both void it,
-   * and both create a replacement — leaving two payable pages for one balance.
-   * A public, unauthenticated endpoint makes that trivially reachable by anyone
-   * holding the link (double-click, refresh loop, or deliberately), and with no
-   * webhook the second payment would go unnoticed.
+   * Two concurrent calls both read the same open Checkout Session, both expire
+   * it, and both create a replacement — leaving two payable pages for one
+   * balance. A public, unauthenticated endpoint makes that trivially reachable
+   * by anyone holding the link (double-click, refresh loop, or deliberately),
+   * and with no webhook the second payment would go unnoticed.
    *
    * In-process, which covers a single API instance. Behind multiple instances
    * this needs a shared lock (DB row lock or Redis) — see startPayment.
@@ -288,7 +288,7 @@ class StripeService {
 
     const currency = String(invoice.currency || 'USD').toLowerCase();
 
-    // Reconcile any existing Stripe invoice FIRST, so the balance below is
+    // Reconcile any existing Checkout Session FIRST, so the balance below is
     // computed against payments that have actually cleared — including one that
     // settled while a webhook was missed.
     const openStripeInvoiceId = invoice.stripeInvoiceId;
@@ -834,22 +834,23 @@ class StripeService {
    * up-front payment cleared, so NOW — for the first time — convert it into a
    * real Client/Project/Invoice (the exact same CustomerDocumentService.convert
    * an admin's "Convert to Project" button calls), then mark the invoice it
-   * produced as paid via the normal _markPaidFromStripeInvoice path.
+   * produced as paid via the normal _markPaidFromSession path.
    *
-   * Idempotent: a webhook retry (or invoice.paid + invoice.payment_succeeded
-   * both firing) finds the document already converted and skips straight to
-   * marking paid, which is itself deduped on the Stripe payment reference.
+   * Idempotent: a webhook retry (or `checkout.session.completed` +
+   * `checkout.session.async_payment_succeeded` both firing) finds the document
+   * already converted and skips straight to marking paid, which is itself
+   * deduped on the Stripe payment reference.
    */
-  async _convertAndMarkPaidFromDocument(stripeInvoice) {
-    const documentId = stripeInvoice?.metadata?.cadenceDocumentId;
+  async _convertAndMarkPaidFromDocument(session) {
+    const documentId = session?.metadata?.cadenceDocumentId;
     if (!documentId) return { ignored: 'no_document_id' };
 
     const document = await db.CustomerDocument.findByPk(documentId);
     if (!document) return { ignored: 'unknown_document' };
 
-    const stripeCustomerId = typeof stripeInvoice.customer === 'string'
-      ? stripeInvoice.customer
-      : stripeInvoice.customer?.id || null;
+    // Always a flat string id on a Checkout Session — no object-vs-string
+    // branch needed here (unlike the old Invoice object's `customer` field).
+    const stripeCustomerId = session.customer || null;
 
     if (!document.convertedClientId && !document.convertedProjectId) {
       const CustomerDocumentService = require('./CustomerDocumentService');
@@ -881,7 +882,7 @@ class StripeService {
       }
       const invoice = result?.invoices?.[0];
       if (invoice) {
-        await db.Invoice.update({ stripeInvoiceId: stripeInvoice.id }, { where: { id: invoice.id } });
+        await db.Invoice.update({ stripeInvoiceId: session.id }, { where: { id: invoice.id } });
       }
     }
 
@@ -889,14 +890,14 @@ class StripeService {
 
     // Resolve the invoice to mark paid: normally the one just wired above; on
     // the race-condition path (admin converted first) it isn't linked to this
-    // Stripe invoice yet, so fall back to the client's most recent unpaid one.
-    let localInvoice = await db.Invoice.findOne({ where: { stripeInvoiceId: stripeInvoice.id } });
+    // session yet, so fall back to the client's most recent unpaid one.
+    let localInvoice = await db.Invoice.findOne({ where: { stripeInvoiceId: session.id } });
     if (!localInvoice && document.convertedClientId) {
       localInvoice = await db.Invoice.findOne({
         where: { orgId: document.orgId, clientId: document.convertedClientId, status: { [Op.ne]: INVOICE_STATUS.PAID } },
         order: [['createdAt', 'DESC']],
       });
-      if (localInvoice) await localInvoice.update({ stripeInvoiceId: stripeInvoice.id });
+      if (localInvoice) await localInvoice.update({ stripeInvoiceId: session.id });
     }
     if (!localInvoice) {
       console.error(`[StripeService] Paid document ${document.number} but no invoice could be resolved to mark paid — needs manual reconciliation.`);
@@ -908,11 +909,11 @@ class StripeService {
       return { ignored: 'no_invoice_to_mark' };
     }
 
-    return this._markPaidFromStripeInvoice(stripeInvoice);
+    return this._markPaidFromSession(session);
   }
 
-  async _onPaymentFailed(stripeInvoice) {
-    const invoice = await this._localInvoiceFor(stripeInvoice);
+  async _onPaymentFailed(session) {
+    const invoice = await this._localInvoiceFor(session);
     if (!invoice) return { ignored: 'unknown_invoice' };
     await this._notifyStaff(invoice, {
       type: 'payment_failed',
@@ -923,11 +924,11 @@ class StripeService {
   }
 
   /**
-   * The Stripe invoice was voided or written off. Detach it so the client can
-   * start a clean payment rather than being redirected to a dead Stripe page.
+   * The Checkout Session expired unpaid. Detach it so the client can start a
+   * clean payment rather than being redirected to a dead Stripe page.
    */
-  async _onInvoiceCancelled(stripeInvoice) {
-    const invoice = await this._localInvoiceFor(stripeInvoice);
+  async _onInvoiceCancelled(session) {
+    const invoice = await this._localInvoiceFor(session);
     if (!invoice) return { ignored: 'unknown_invoice' };
     if (invoice.status === INVOICE_STATUS.PAID || invoice.status === 'paid') return { ok: true };
     await invoice.update({ stripeInvoiceId: null, stripeHostedUrl: null });
