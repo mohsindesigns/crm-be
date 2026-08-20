@@ -41,7 +41,7 @@ const publicClientRequestsRouter = require('./routes/publicClientRequests');
 const errorHandler = require('./middleware/errorHandler');
 const activityLogger = require('./middleware/activityLogger');
 
-const { WhiteLabelConfig, Org } = require('./models');
+const { WhiteLabelConfig, Org, ServiceType } = require('./models');
 
 const app = express();
 
@@ -72,6 +72,13 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 // Public branding — used by login page before auth
 // GET /api/brand?subdomain=mohsindesigns
+//
+// UNAUTHENTICATED, so everything returned here is public by definition. That
+// is fine for what it carries: the brand name/logo/colour already appear on
+// every invoice and client-facing page, and `services` is the org's own
+// "what we do" list, which the login page shows as a shopfront. Nothing
+// tenant-private (counts, clients, staff, pricing) belongs in this response —
+// keep it to marketing-surface fields only.
 app.get('/api/brand', async (req, res) => {
   try {
     const { subdomain } = req.query;
@@ -82,17 +89,28 @@ app.get('/api/brand', async (req, res) => {
         include: [{ model: WhiteLabelConfig, as: 'brand' }],
       });
       if (org) {
+        // The org's active service lines, in a stable order (there is no
+        // sortOrder column — name keeps it from reshuffling between requests).
+        // `icon` is a kebab-case lucide name; crm-fe maps it to a component and
+        // falls back to a neutral one for anything it doesn't know, so adding a
+        // service type with a new icon never breaks the page.
+        const services = await ServiceType.findAll({
+          where: { orgId: org.id, isActive: true },
+          attributes: ['key', 'name', 'icon'],
+          order: [['name', 'ASC']],
+        });
         brand = {
           orgId: org.id,
           brandName: org.brand?.brandName || 'Mohsin Designs Project Management',
           primaryColor: org.brand?.primaryColor || DEFAULT_BRAND_COLOR,
           logoUrl: org.brand?.logoUrl || null,
+          services: services.map((s) => s.toJSON()),
         };
       }
     }
-    res.json(brand || { orgId: null, brandName: 'Mohsin Designs Project Management', primaryColor: DEFAULT_BRAND_COLOR, logoUrl: null });
+    res.json(brand || { orgId: null, brandName: 'Mohsin Designs Project Management', primaryColor: DEFAULT_BRAND_COLOR, logoUrl: null, services: [] });
   } catch {
-    res.json({ brandName: 'Mohsin Designs Project Management', primaryColor: DEFAULT_BRAND_COLOR, logoUrl: null });
+    res.json({ brandName: 'Mohsin Designs Project Management', primaryColor: DEFAULT_BRAND_COLOR, logoUrl: null, services: [] });
   }
 });
 
