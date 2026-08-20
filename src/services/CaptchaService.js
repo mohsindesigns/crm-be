@@ -32,6 +32,11 @@ async function verify(token, remoteIp) {
   }
 
   if (!result?.success) {
+    // The client only gets a generic message — the actual reason (bad
+    // secret, expired/reused token, wrong sitekey pairing, etc.) is only
+    // useful server-side. See Cloudflare's error-codes reference:
+    // https://developers.cloudflare.com/turnstile/get-started/server-side-validation/#error-codes
+    console.error('[Turnstile] siteverify rejected token:', result?.['error-codes'] || result);
     throw badRequest('Verification failed — please try again.');
   }
 }
