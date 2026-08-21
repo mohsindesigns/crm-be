@@ -2,6 +2,15 @@ const { v4: uuidv4 } = require('uuid');
 const db = require('../models');
 const { isTruthy } = require('./SoftDeleteService');
 const { ensureExampleTemplates } = require('../seeders/documentTemplateDefaults');
+const { sanitizeDocumentHtml } = require('../utils/htmlSanitizer');
+
+// service_fragment bodies stay plain {{token}} text (rendered inside
+// {{services_block}}, never through the rich-text HTML path) — only the
+// standalone document types are authored in the rich-text editor.
+function sanitizeIfHtmlType(type, value) {
+  if (!value) return value;
+  return type === 'service_fragment' ? value : sanitizeDocumentHtml(value);
+}
 
 class DocumentTemplateService {
   async list(orgId, query = {}) {
@@ -39,20 +48,23 @@ class DocumentTemplateService {
       type: data.type,
       serviceTypeKey: data.serviceTypeKey,
       name: data.name,
-      body: data.body,
-      defaultTerms: data.defaultTerms || null,
+      body: sanitizeIfHtmlType(data.type, data.body),
+      defaultTerms: data.defaultTerms ? sanitizeIfHtmlType(data.type, data.defaultTerms) : null,
       isActive: data.isActive ?? true,
     });
   }
 
   async update(id, orgId, data) {
     const template = await this.findById(id, orgId);
+    const type = data.type ?? template.type;
     await template.update({
-      type: data.type ?? template.type,
+      type,
       serviceTypeKey: data.serviceTypeKey ?? template.serviceTypeKey,
       name: data.name ?? template.name,
-      body: data.body ?? template.body,
-      defaultTerms: data.defaultTerms ?? template.defaultTerms,
+      body: data.body !== undefined ? sanitizeIfHtmlType(type, data.body) : template.body,
+      defaultTerms: data.defaultTerms !== undefined
+        ? (data.defaultTerms ? sanitizeIfHtmlType(type, data.defaultTerms) : null)
+        : template.defaultTerms,
       isActive: data.isActive ?? template.isActive,
     });
     return template;

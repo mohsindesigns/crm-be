@@ -10,8 +10,9 @@
  * changing the address once updates every document type.
  */
 const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
-const { money, formatDate, wrapText } = require('./pdfLetterheadUtils');
+const { money, formatDate, wrapText, wrapRuns } = require('./pdfLetterheadUtils');
 const { resolveLetterhead, drawPdfLibLetterhead } = require('./letterhead');
+const { htmlToBlocks } = require('../utils/richTextPdf');
 
 const TEXT = rgb(0.13, 0.13, 0.13);
 const MUTED = rgb(0.42, 0.45, 0.50);
@@ -45,6 +46,9 @@ async function buildDocumentPdfOnLetterhead(docData) {
 
   const font = await outDoc.embedFont(StandardFonts.Helvetica);
   const fontBold = await outDoc.embedFont(StandardFonts.HelveticaBold);
+  const fontItalic = await outDoc.embedFont(StandardFonts.HelveticaOblique);
+  const fontBoldItalic = await outDoc.embedFont(StandardFonts.HelveticaBoldOblique);
+  const richFonts = { regular: font, bold: fontBold, italic: fontItalic, boldItalic: fontBoldItalic };
 
   const width = PAGE_WIDTH;
   const height = PAGE_HEIGHT;
@@ -114,6 +118,78 @@ async function buildDocumentPdfOnLetterhead(docData) {
     y -= 16;
   }
 
+  // Draws one already-wrapped line of styled tokens (see wrapRuns()) left to
+  // right, each in its own measured font — this is how bold/italic segments
+  // inside a single paragraph line get drawn with the right glyphs.
+  function drawRunLine(line, startX, size, color, forceBold) {
+    let x = startX;
+    for (const token of line) {
+      const f = forceBold ? fontBold : token.font;
+      page.drawText(token.text, { x, y: y - size, size, font: f, color });
+      const w = f.widthOfTextAtSize(token.text, size);
+      if (token.underline) {
+        page.drawLine({ start: { x, y: y - size - 1 }, end: { x: x + w, y: y - size - 1 }, thickness: 0.6, color });
+      }
+      x += w;
+    }
+  }
+
+  // Draws the parsed rich-text blocks (see utils/richTextPdf.js) that make up
+  // an authored document narrative — headings, paragraphs, lists, quotes —
+  // with real bold/italic/underline instead of the flat monospace dump the
+  // PDF used to fall back to.
+  async function drawRichBlocks(blocks, opts = {}) {
+    const bodySize = opts.size || 10;
+    for (const block of blocks) {
+      if (block.type === 'h2' || block.type === 'h3') {
+        const size = block.type === 'h2' ? 13 : 11;
+        const color = block.type === 'h2' ? BRAND : TEXT;
+        await ensureSpace(size + 10);
+        y -= block.type === 'h2' ? 4 : 2;
+        for (const line of wrapRuns(block.runs, richFonts, size, contentWidth)) {
+          await ensureSpace(size + 6);
+          drawRunLine(line, marginLeft, size, color, true);
+          y -= size + 4;
+        }
+        y -= block.type === 'h2' ? 4 : 3;
+        continue;
+      }
+      if (block.type === 'bullet' || block.type === 'number') {
+        const marker = block.type === 'bullet' ? '•' : `${block.index}.`;
+        const indent = 14;
+        const lines = wrapRuns(block.runs, richFonts, bodySize, contentWidth - indent);
+        let first = true;
+        for (const line of lines) {
+          await ensureSpace(bodySize + 5);
+          if (first) page.drawText(marker, { x: marginLeft, y: y - bodySize, size: bodySize, font, color: TEXT });
+          drawRunLine(line, marginLeft + indent, bodySize, TEXT, false);
+          y -= bodySize + 5;
+          first = false;
+        }
+        continue;
+      }
+      if (block.type === 'quote') {
+        const indent = 12;
+        const lines = wrapRuns(block.runs, richFonts, bodySize, contentWidth - indent);
+        for (const line of lines) {
+          await ensureSpace(bodySize + 5);
+          page.drawLine({ start: { x: marginLeft, y: y - bodySize - 1 }, end: { x: marginLeft, y: y + 2 }, thickness: 1.5, color: RULE });
+          drawRunLine(line, marginLeft + indent, bodySize, MUTED, false);
+          y -= bodySize + 5;
+        }
+        y -= 3;
+        continue;
+      }
+      // Plain paragraph.
+      for (const line of wrapRuns(block.runs, richFonts, bodySize, contentWidth)) {
+        await ensureSpace(bodySize + 5);
+        drawRunLine(line, marginLeft, bodySize, TEXT, false);
+        y -= bodySize + 5;
+      }
+      y -= 5;
+    }
+  }
+
   // ── Build page 1 ──────────────────────────────────────────────────────────
   await newPage();
 
@@ -152,11 +228,26 @@ async function buildDocumentPdfOnLetterhead(docData) {
   // "Prepared for" now lives in the letterhead's right column, level with the
   // company block — repeating it here would print the recipient twice.
 
+  // Agreements/proposals lead with the admin's own authored narrative (the
+  // template body, rendered to rich HTML — see htmlToBlocks()) rather than an
+  // invoice-shaped pricing table, so the PDF actually reads as a contract:
+  // "This Agreement is entered into between…", numbered clauses, etc. The
+  // pricing table below becomes a compact "Investment" section instead of the
+  // document's lead content. Quotations keep the pricing-first layout, since a
+  // price quote reading like a quote is correct — its narrative (if any) is
+  // appended at the very end instead (see "Details" below).
+  const isNarrativeLed = docData.type === 'agreement' || docData.type === 'proposal';
+  const narrativeBlocks = docData.narrativeHtml ? htmlToBlocks(docData.narrativeHtml) : [];
+  if (isNarrativeLed && narrativeBlocks.length) {
+    await drawRichBlocks(narrativeBlocks);
+    y -= 4;
+  }
+
   // Services table
   const services = Array.isArray(docData.services) ? docData.services : [];
   const hideServiceAmounts = !!docData.hideServiceAmounts;
   if (services.length) {
-    await drawSectionTitle(hideServiceAmounts ? 'Services included' : 'Services');
+    await drawSectionTitle(hideServiceAmounts ? 'Included in this agreement' : (isNarrativeLed ? 'Investment' : 'Services'));
     const colService = contentWidth * (hideServiceAmounts ? 0.95 : 0.68);
 
     await ensureSpace(22);
@@ -221,15 +312,21 @@ async function buildDocumentPdfOnLetterhead(docData) {
       if (svc.packageLabel) {
         await drawWrapped(`Package: ${svc.packageLabel}`, { size: 9, color: MUTED, gap: 12 });
       }
-      if (svc.featuresText) {
-        await drawWrapped("What's included:", { size: 9, bold: true, gap: 12 });
-        await drawWrapped(svc.featuresText, { size: 9, color: MUTED, gap: 12 });
-      }
-      if (svc.scope) {
-        await drawWrapped(svc.featuresText ? 'Additional notes:' : "What's included:", {
-          size: 9, bold: true, gap: 12,
-        });
-        await drawWrapped(svc.scope, { size: 9, color: MUTED, gap: 12 });
+      // Feature/scope detail is covered in the narrative above for
+      // agreements/proposals — repeating it here would put the invoice-style
+      // itemization right back in, which is exactly what this section exists
+      // to avoid. Quotations (no narrative lead) still spell it out in full.
+      if (!isNarrativeLed) {
+        if (svc.featuresText) {
+          await drawWrapped("What's included:", { size: 9, bold: true, gap: 12 });
+          await drawWrapped(svc.featuresText, { size: 9, color: MUTED, gap: 12 });
+        }
+        if (svc.scope) {
+          await drawWrapped(svc.featuresText ? 'Additional notes:' : "What's included:", {
+            size: 9, bold: true, gap: 12,
+          });
+          await drawWrapped(svc.scope, { size: 9, color: MUTED, gap: 12 });
+        }
       }
 
       // Separator between services — drawn BELOW the block that was just written.
@@ -330,7 +427,7 @@ async function buildDocumentPdfOnLetterhead(docData) {
 
   // Pricing summary
   await drawRule();
-  await drawSectionTitle('Summary');
+  await drawSectionTitle(isNarrativeLed ? 'Investment Summary' : 'Summary');
   const summaryMode = docData.summaryMode || 'fixed';
   let summaryRows;
   if (summaryMode === 'menu_pending') {
@@ -404,14 +501,13 @@ async function buildDocumentPdfOnLetterhead(docData) {
     await drawWrapped(docData.terms, { size: 9, color: TEXT, gap: 12 });
   }
 
-  // Optional narrative body (template text) — kept short / secondary
-  if (docData.bodyText) {
-    const cleaned = String(docData.bodyText).trim();
-    if (cleaned) {
-      await drawRule();
-      await drawSectionTitle('Details');
-      await drawWrapped(cleaned, { size: 9, color: TEXT, gap: 12 });
-    }
+  // Quotations don't lead with the narrative (see isNarrativeLed above) — it's
+  // appended here instead, so a quote's own wording still shows up somewhere
+  // rather than being silently dropped from the PDF.
+  if (!isNarrativeLed && narrativeBlocks.length) {
+    await drawRule();
+    await drawSectionTitle('Details');
+    await drawRichBlocks(narrativeBlocks, { size: 9 });
   }
 
   // Page numbers, matching the invoice PDF.

@@ -60,6 +60,9 @@ function normalizeWorkerUpdates(updates) {
     if (!(f in clean) || typeof clean[f] !== 'string') return;
     clean[f] = clean[f].trim();
   });
+  // '' means "Default" in the Timing Policy picker — coerce to null rather
+  // than writing an empty string into the CHAR(36) column.
+  if ('shiftScheduleId' in clean && !clean.shiftScheduleId) clean.shiftScheduleId = null;
   return clean;
 }
 
@@ -103,6 +106,8 @@ async function listWorkers(orgId) {
       as: 'user',
       attributes: ['id', 'name', 'email', 'avatarUrl'],
       include: [{ model: Role, as: 'role', attributes: ['key'] }],
+    }, {
+      model: ShiftSchedule, as: 'shiftSchedule', attributes: ['id', 'label', 'isArchived'], required: false,
     }],
     order: [['createdAt', 'DESC']],
   });
@@ -116,6 +121,8 @@ async function getWorker(id, orgId) {
       as: 'user',
       attributes: ['id', 'name', 'email', 'avatarUrl', 'phone'],
       include: [{ association: 'role', attributes: ['id', 'name', 'key', 'color'] }],
+    }, {
+      model: ShiftSchedule, as: 'shiftSchedule', attributes: ['id', 'label', 'isArchived'], required: false,
     }],
   });
   if (!w) throw Object.assign(new Error('Worker not found'), { status: 404 });
@@ -458,7 +465,10 @@ async function confirmEmailChange(userId, orgId, { email: emailRaw, code: codeRa
   };
 }
 
-const workerUserInclude = [{ model: User, as: 'user', attributes: ['id', 'name', 'email'] }];
+const workerUserInclude = [
+  { model: User, as: 'user', attributes: ['id', 'name', 'email'] },
+  { model: ShiftSchedule, as: 'shiftSchedule', attributes: ['id', 'label', 'isArchived'], required: false },
+];
 
 async function notifyProfileReviewDecision(worker, orgId, { action, reason, isAmendment }) {
   if (action !== 'reject') return;
@@ -712,9 +722,32 @@ async function deleteShiftSchedule(id, orgId, archived = true) {
  * whose range covers that date, falling back to the org's PayrollSettings.
  * Everything that judges lateness or shift length goes through this, so a
  * Ramadan schedule automatically applies to Ramadan days and to nothing else.
+ *
+ * If `worker` carries a `shiftScheduleId` (a permanent per-employee policy
+ * assignment — see Worker.js), that schedule wins outright and short-circuits
+ * the date-range matching below entirely: an assigned employee stays on
+ * their assigned policy every day, Active toggle and date range notwithstanding,
+ * until the assignment is changed or cleared. Falls through to the normal
+ * date-based resolution if the assigned schedule has since been archived.
  */
-async function resolveShiftTimings(orgId, dateStr, settings) {
+async function resolveShiftTimings(orgId, dateStr, settings, worker) {
   const base = settings || await getOrCreatePayrollSettings(orgId);
+
+  if (worker?.shiftScheduleId) {
+    const assigned = await ShiftSchedule.findOne({
+      where: { id: worker.shiftScheduleId, orgId, isArchived: false },
+    });
+    if (assigned) {
+      return {
+        shiftStartTime: assigned.shiftStartTime,
+        shiftEndTime: assigned.shiftEndTime,
+        lateGraceMinutes: assigned.lateGraceMinutes,
+        source: 'assigned',
+        label: assigned.label,
+      };
+    }
+  }
+
   const day = String(dateStr || '').slice(0, 10);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return { ...timingsFrom(base), source: 'default', label: null };
 
@@ -926,7 +959,7 @@ async function upsertAttendance(data, orgId, actorUserId) {
   };
 
   // Derive hours and lateness from the times given, against that date's shift.
-  const timings = await resolveShiftTimings(orgId, date);
+  const timings = await resolveShiftTimings(orgId, date, null, worker);
   if (checkIn && checkOut) patch.hours = workedHours(checkIn, checkOut);
   else if (data.hours != null && data.hours !== '') patch.hours = Number(data.hours);
   if (checkIn) {
@@ -1103,8 +1136,9 @@ async function selfCheckIn(userId, orgId, { lat, lng }) {
   const checkInDate = getAttendanceDate(localDate, checkIn);
   const settings = await getOrCreatePayrollSettings(orgId);
   // Lateness is judged against the timings in force on this attendance date, so
-  // a seasonal schedule (e.g. Ramadan) applies automatically.
-  const timings = await resolveShiftTimings(orgId, checkInDate, settings);
+  // a seasonal schedule (e.g. Ramadan) applies automatically — or the
+  // worker's own assigned policy, if they have one.
+  const timings = await resolveShiftTimings(orgId, checkInDate, settings, worker);
 
   const openSession = await Attendance.findOne({
     where: {
@@ -1184,9 +1218,48 @@ async function selfCheckOut(userId, orgId, { lat, lng }) {
 
   const hours = workedHours(record.checkIn, checkOut);
   const settings = await getOrCreatePayrollSettings(orgId);
-  const timings = await resolveShiftTimings(orgId, record.date, settings);
+  const timings = await resolveShiftTimings(orgId, record.date, settings, worker);
   const { status, note } = await classifyCheckoutStatus(orgId, worker.id, record.date, hours, settings, timings);
   await record.update({ checkOut, hours, checkOutLat: lat, checkOutLng: lng, status, note: note || record.note });
+  return record;
+}
+
+// Resolves a stale open session (checked in on a previous attendance day,
+// never checked out) using a time-of-day the employee supplies for that
+// day's shift end, instead of "now" — selfCheckOut's `nowInKarachi()` stamp
+// only makes sense for a session still open on today's attendance date.
+// Everything else (hours, lateness-independent half-day/absent
+// classification, restricted-day rules) reuses the exact same logic as a
+// normal checkout, just anchored to the open session's own date.
+async function selfCheckOutForOpenSession(userId, orgId, checkOutTime) {
+  if (!/^\d{2}:\d{2}$/.test(String(checkOutTime || ''))) {
+    throw Object.assign(new Error('Enter a valid check-out time.'), { status: 400 });
+  }
+  const worker = await Worker.findOne({ where: { userId, orgId } });
+  if (!worker) throw Object.assign(new Error('No worker profile found'), { status: 404 });
+
+  const record = await Attendance.findOne({
+    where: { workerId: worker.id, checkIn: { [Op.ne]: null }, checkOut: null },
+    order: [['date', 'DESC']],
+  });
+  if (!record) throw Object.assign(new Error('No open check-in found.'), { status: 400 });
+
+  const { date: todayDate, time: todayTime } = nowInKarachi();
+  const todayAttendanceDate = getAttendanceDate(todayDate, todayTime);
+  if (record.date === todayAttendanceDate) {
+    throw Object.assign(new Error("Today's check-in isn't stale — use the regular check-out instead."), { status: 400 });
+  }
+
+  const hours = workedHours(record.checkIn, checkOutTime);
+  const settings = await getOrCreatePayrollSettings(orgId);
+  const timings = await resolveShiftTimings(orgId, record.date, settings, worker);
+  const { status, note } = await classifyCheckoutStatus(orgId, worker.id, record.date, hours, settings, timings);
+  await record.update({
+    checkOut: checkOutTime,
+    hours,
+    status,
+    note: note ? `${note} Checked out late (entered manually).` : 'Checked out late — time entered manually after the fact.',
+  });
   return record;
 }
 
@@ -1225,10 +1298,18 @@ async function getSelfAttendanceStatus(userId, orgId) {
   const [holiday, settings, timings] = await Promise.all([
     attendanceDate ? findHolidayFor(orgId, attendanceDate) : null,
     getOrCreatePayrollSettings(orgId),
-    resolveShiftTimings(orgId, attendanceDate),
+    resolveShiftTimings(orgId, attendanceDate, null, worker),
   ]);
   const weekendDays = normalizeWeekendDays(settings.weekendDays);
   const isWeekend = attendanceDate ? isWeekendDate(attendanceDate, weekendDays) : false;
+
+  // Stale = an open session left over from an earlier attendance day, not
+  // today's — the "forgot to check out" popup only fires for this, never for
+  // a session still legitimately open on the current shift.
+  const openSessionIsStale = !!(openSession && openSession.date !== attendanceDate);
+  const openSessionShiftEnd = openSessionIsStale
+    ? (await resolveShiftTimings(orgId, openSession.date, settings, worker)).shiftEndTime
+    : null;
 
   return {
     applicable: true,
@@ -1236,6 +1317,10 @@ async function getSelfAttendanceStatus(userId, orgId) {
     cutoffHour: 12,
     record: openSession || dayRecord,
     openSession: openSession || null,
+    openSessionIsStale,
+    // The shift-end time in force on the stale day itself (not today's) —
+    // used only to pre-fill a suggested check-out time in the popup.
+    openSessionSuggestedCheckOut: openSessionShiftEnd,
     // Surfaced so the widget can say "Today is a public holiday — Eid al-Fitr"
     // and show which shift timings are in force today.
     holiday: holiday ? { name: holiday.name, date: holiday.date, endDate: holiday.endDate } : null,
@@ -2760,7 +2845,7 @@ module.exports = {
   listWorkers, getWorker, createWorker, updateWorker, inviteWorker,
   updateMyAvatar, submitProfile, requestEmailChange, confirmEmailChange, onboardWorker,
   listAttendance, getAttendanceSummary, upsertAttendance, bulkMarkAttendance, markAbsentForUnmarkedWorkers,
-  selfCheckIn, selfCheckOut, getSelfAttendanceStatus,
+  selfCheckIn, selfCheckOut, selfCheckOutForOpenSession, getSelfAttendanceStatus,
   listHolidays, createHoliday, updateHoliday, deleteHoliday, findHolidayFor,
   listShiftSchedules, createShiftSchedule, updateShiftSchedule, deleteShiftSchedule, resolveShiftTimings,
   isNonAttendanceRole,

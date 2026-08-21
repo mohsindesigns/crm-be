@@ -37,6 +37,7 @@ const portalLeadsRouter = require('./routes/portalLeads');
 const activityLogsRouter = require('./routes/activityLogs');
 const requirementFormsRouter = require('./routes/requirementForms');
 const clientRequestsRouter = require('./routes/clientRequests');
+const approvalsRouter = require('./routes/approvals');
 const publicClientRequestsRouter = require('./routes/publicClientRequests');
 const errorHandler = require('./middleware/errorHandler');
 const activityLogger = require('./middleware/activityLogger');
@@ -147,6 +148,7 @@ app.use('/api/portal/leads', portalLeadsRouter);
 app.use('/api/activity-logs', activityLogsRouter);
 app.use('/api/requirement-forms', requirementFormsRouter);
 app.use('/api/projects/:projectId/client-requests', clientRequestsRouter);
+app.use('/api/approvals', approvalsRouter);
 app.use('/api/public/client-requests', publicClientRequestsRouter);
 
 // 404

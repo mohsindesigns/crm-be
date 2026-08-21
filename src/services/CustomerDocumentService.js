@@ -7,10 +7,11 @@ const RetainerService = require('./RetainerService');
 const InvoiceService = require('./InvoiceService');
 const EmailService = require('./EmailService');
 const { buildProjectName } = require('../utils/projectName');
-const { buildMergeTokens, renderTemplate, defaultServiceFragment, formatFeatures } = require('../utils/documentRenderer');
+const { buildMergeTokens, renderTemplate, renderHtmlTemplate, ensureHtml, defaultServiceFragment, formatFeatures } = require('../utils/documentRenderer');
 const { buildDocumentPdfOnLetterhead } = require('./DocumentLetterheadPdf');
 const { letterheadForOrg, letterheadForClient, billingCompanyFor } = require('./letterhead');
 const { isTruthy } = require('./SoftDeleteService');
+const { sanitizeDocumentHtml } = require('../utils/htmlSanitizer');
 
 const EDITABLE_STATUSES = ['draft', 'rejected', 'expired'];
 // Templates saved with this serviceTypeKey aren't tied to any service — they
@@ -439,7 +440,7 @@ class CustomerDocumentService {
       amount: this._applyDiscount(baseAmount, discountType, discountValue),
       lineItems: (isCompare || isMenu) ? null : (Array.isArray(data.lineItems) && data.lineItems.length ? data.lineItems : null),
       validUntil,
-      scopeTerms: data.scopeTerms || null,
+      scopeTerms: data.scopeTerms ? sanitizeDocumentHtml(data.scopeTerms) : null,
       status: 'draft',
       createdBy: userId,
     });
@@ -535,7 +536,9 @@ class CustomerDocumentService {
         ? null
         : (data.lineItems !== undefined ? (data.lineItems.length ? data.lineItems : null) : document.lineItems),
       validUntil: data.validUntil !== undefined ? data.validUntil : document.validUntil,
-      scopeTerms: data.scopeTerms !== undefined ? data.scopeTerms : document.scopeTerms,
+      scopeTerms: data.scopeTerms !== undefined
+        ? (data.scopeTerms ? sanitizeDocumentHtml(data.scopeTerms) : null)
+        : document.scopeTerms,
     });
 
     return document;
@@ -646,7 +649,7 @@ class CustomerDocumentService {
       packageFeatures: firstPkg?.features,
       subtotal,
     });
-    if (!document.scopeTerms && template.defaultTerms) tokens.terms = template.defaultTerms;
+    if (!document.scopeTerms && template.defaultTerms) tokens.terms = ensureHtml(template.defaultTerms);
 
     // Whatever represents "the services" goes into {{services_block}} itself —
     // never appended after the whole rendered body — so it lands exactly where
@@ -699,7 +702,14 @@ class CustomerDocumentService {
       }).join('\n\n');
     }
 
-    const rendered = renderTemplate(template.body, tokens);
+    // template.body is authored HTML (the rich-text editor) — `terms`/`scope`
+    // are inserted raw since they're sanitized HTML in their own right (see
+    // htmlSanitizer.js); every other token is plain text/auto-generated, so it
+    // gets HTML-escaped + newline-to-<br> by renderHtmlTemplate. ensureHtml()
+    // upgrades a template body saved before the rich-text editor existed
+    // (plain text, no tags) the same way, so old templates keep their line
+    // breaks instead of collapsing into one paragraph.
+    const rendered = renderHtmlTemplate(ensureHtml(template.body), tokens, ['terms', 'scope']);
     return { rendered, brand };
   }
 
@@ -728,7 +738,7 @@ class CustomerDocumentService {
       discountType: data.discountType || null,
       discountValue: data.discountValue || null,
       discountCycles: data.discountCycles || null,
-      scopeTerms: data.scopeTerms || '',
+      scopeTerms: data.scopeTerms ? sanitizeDocumentHtml(data.scopeTerms) : '',
       validUntil: data.validUntil || '',
     };
     const { rendered } = await this._renderBody(orgId, fakeDocument, template);
@@ -1359,6 +1369,13 @@ class CustomerDocumentService {
     // CRM, LLP otherwise — so the quotation matches the invoice it becomes.
     const letterhead = await this._letterheadForDocument(orgId, document);
 
+    // The template's authored narrative (rich HTML — see htmlSanitizer.js /
+    // renderHtmlTemplate) — this is the actual "This Agreement is entered into
+    // between…" content the admin wrote, not just the structured pricing
+    // tables below. Agreements/proposals lead the PDF with this; quotations
+    // keep the pricing-first layout (see DocumentLetterheadPdf.js).
+    const { rendered: narrativeHtml } = await this._renderBody(orgId, document, document.template);
+
     // Structured letterhead layout — no free-text template dump (that looked odd).
     const buffer = await buildDocumentPdfOnLetterhead({
       // Drives the coded letterhead header — see services/letterhead.js.
@@ -1387,12 +1404,11 @@ class CustomerDocumentService {
       optionMinAmount: optionMin != null ? applyDisc(optionMin) : null,
       optionMaxAmount: optionMax != null ? applyDisc(optionMax) : null,
       hideServiceAmounts: isCompare && !selectedPkg,
-      // Org invoice T&Cs (Admin → Branding), same text invoices use — not the
-      // per-document scopeTerms / template default (those stay on the review UI).
+      // Org invoice T&Cs (Admin → Branding), same text invoices use.
       terms: (letterhead.invoiceTerms && String(letterhead.invoiceTerms).trim())
         || (branding?.invoiceTerms && String(branding.invoiceTerms).trim())
         || DEFAULT_DOCUMENT_TERMS,
-      bodyText: '',
+      narrativeHtml,
     });
 
     return { buffer, document };

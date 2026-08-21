@@ -671,6 +671,17 @@ router.post('/me/attendance/check-out', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// Resolves a *stale* open session — a check-in from a previous attendance day
+// that never got a check-out — using a time-of-day the employee enters rather
+// than "now" (the regular check-out endpoint below always stamps the current
+// moment, which would be wrong for a session that's already a day or more
+// old). No GPS required: this isn't happening live at the office.
+router.post('/me/attendance/check-out-late', async (req, res, next) => {
+  try {
+    res.json(await HrService.selfCheckOutForOpenSession(req.user.id, req.orgId, req.body.checkOutTime));
+  } catch (e) { next(e); }
+});
+
 router.get('/me/attendance/status', async (req, res, next) => {
   try {
     res.json(await HrService.getSelfAttendanceStatus(req.user.id, req.orgId));
