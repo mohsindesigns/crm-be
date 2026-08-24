@@ -2053,9 +2053,10 @@ function keywordStatusTier(status) {
 /**
  * @param {string[]|null} [letterheadFields] Which company detail fields (logo,
  *   address, tax number, email, phone, website — see services/letterhead.js)
- *   print on this export's letterhead. Set from the "Company details" checkbox
- *   list next to the report's View/Download buttons; null means "not
- *   specified" — show everything, the pre-existing default.
+ *   print on this export's letterhead. Set from a `?fields=` query override;
+ *   null means "not specified" — fall back to the org's configured default
+ *   (Admin → Branding → seoReportLetterheadFields), which itself defaults to
+ *   logo-only for orgs that never configured it.
  */
 async function _loadSeoReportContext(projectId, orgId, letterheadFields) {
   const project = await Project.findOne({
@@ -2069,7 +2070,12 @@ async function _loadSeoReportContext(projectId, orgId, letterheadFields) {
   // SEO reports go to the client, so they carry the billing entity's letterhead
   // (the same one that appears on their invoices and quotations) rather than the
   // HR entity — see services/letterhead.js.
-  const fields = normalizeLetterheadFields(letterheadFields);
+  const requestedFields = letterheadFields != null
+    ? letterheadFields
+    : (brandConfig?.seoReportLetterheadFields
+      ? brandConfig.seoReportLetterheadFields.split(',').map((s) => s.trim()).filter(Boolean)
+      : ['logo']);
+  const fields = normalizeLetterheadFields(requestedFields);
   const letterhead = filterLetterheadFields(await letterheadForOrg(orgId, 'billing'), fields);
   // drawPdfKitLetterhead treats an explicit `null` logo as "draw nothing" but
   // `undefined` as "use the bundled default" — loadLetterheadLogo itself falls

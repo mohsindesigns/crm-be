@@ -2,8 +2,16 @@ const { Op, fn, col } = require('sequelize');
 const db = require('../models');
 
 const {
-  User, Role, Task, Project, Backlink, Keyword, ContentSubmission,
+  User, Role, Task, Project, Backlink, Keyword, ContentSubmission, ProjectAssignment, Client, Package, WhiteLabelConfig, sequelize,
 } = db;
+
+const { createPdfBuffer, drawTable, drawReportFooter, drawStatCards, drawPill, BRAND_COLOR } = require('./PdfService');
+const { letterheadForOrg, loadLetterheadLogo, drawPdfKitLetterhead, normalizeLetterheadFields, filterLetterheadFields, letterheadShowsLogo } = require('./letterhead');
+
+// Mirrors crm-fe's STRATEGIST_ROLE_PRIORITY (projects/page.tsx) — every project
+// gets a Project Strategist slot, falling back to whichever service-specific
+// lead is actually filled in when that slot is empty. Keep the two in sync.
+const STRATEGIST_ROLE_SLOTS = ['project_strategist', 'social_manager', 'ads_manager', 'account_manager', 'project_manager'];
 
 // Mirrors the workflow engine's own treatment of task completion (see
 // workflow/engine.js's ADVANCE_RULE comment) — 'done' and 'approved' are the
@@ -181,4 +189,370 @@ async function getMemberDetail(orgId, userId, { from: fromStr, to: toStr } = {})
   };
 }
 
-module.exports = { getMembersOverview, getMemberDetail };
+// Cross-project keyword sheet, filterable by project, strategist and
+// volume/difficulty ranges. Unlike SeoService#listKeywords (scoped to one
+// project's sheet), this reads across the whole org, so filtering starts from
+// a project-id set (same idConstraints-style narrowing ProjectService.list
+// uses) rather than a single findAndCountAll with nested hasMany includes —
+// joining Project -> ProjectAssignment there would multiply keyword rows per
+// matching role slot and break LIMIT/OFFSET pagination.
+async function getKeywordReport(orgId, filters = {}) {
+  const page = Math.max(1, parseInt(filters.page, 10) || 1);
+  const limit = Math.min(100, parseInt(filters.limit, 10) || 25);
+  const offset = (page - 1) * limit;
+
+  let projectIds;
+  if (filters.projectId) {
+    const project = await Project.findOne({ where: { id: filters.projectId, orgId }, attributes: ['id'] });
+    projectIds = project ? [project.id] : [];
+  } else {
+    projectIds = await getOrgProjectIds(orgId);
+  }
+
+  if (filters.strategistId && projectIds.length) {
+    const assigned = await ProjectAssignment.findAll({
+      where: {
+        userId: filters.strategistId,
+        roleSlot: { [Op.in]: STRATEGIST_ROLE_SLOTS },
+        projectId: { [Op.in]: projectIds },
+      },
+      attributes: ['projectId'],
+      raw: true,
+    });
+    const allowed = new Set(assigned.map((a) => a.projectId));
+    projectIds = projectIds.filter((id) => allowed.has(id));
+  }
+
+  if (!projectIds.length) {
+    return { data: [], total: 0, page, totalPages: 1, limit };
+  }
+
+  const where = { projectId: { [Op.in]: projectIds } };
+  const volumeMin = filters.volumeMin != null && filters.volumeMin !== '' ? parseInt(filters.volumeMin, 10) : null;
+  const volumeMax = filters.volumeMax != null && filters.volumeMax !== '' ? parseInt(filters.volumeMax, 10) : null;
+  if (volumeMin != null || volumeMax != null) {
+    where.volume = {};
+    if (volumeMin != null) where.volume[Op.gte] = volumeMin;
+    if (volumeMax != null) where.volume[Op.lte] = volumeMax;
+  }
+  const difficultyMin = filters.difficultyMin != null && filters.difficultyMin !== '' ? parseInt(filters.difficultyMin, 10) : null;
+  const difficultyMax = filters.difficultyMax != null && filters.difficultyMax !== '' ? parseInt(filters.difficultyMax, 10) : null;
+  if (difficultyMin != null || difficultyMax != null) {
+    where.kd = {};
+    if (difficultyMin != null) where.kd[Op.gte] = difficultyMin;
+    if (difficultyMax != null) where.kd[Op.lte] = difficultyMax;
+  }
+  if (filters.status === 'active' || filters.status === 'inactive') {
+    where.status = filters.status;
+  }
+  if (filters.search) {
+    const term = `%${filters.search}%`;
+    where[Op.or] = [
+      { primaryKeyword: { [Op.like]: term } },
+      { secondaryKeywords: { [Op.like]: term } },
+    ];
+  }
+
+  // Current rank = latest RankSnapshot per keyword (by date). Pulled as a
+  // correlated subquery rather than a second query so it can also drive
+  // ORDER BY when sorting by rank, and pagination stays correct — Keyword's
+  // only include here is a belongsTo (Project), so Sequelize keeps `Keyword`
+  // as the literal main-table alias instead of wrapping in a subquery.
+  const currentRankLiteral = sequelize.literal(
+    '(SELECT `rs`.`position` FROM `rank_snapshots` AS `rs` WHERE `rs`.`keywordId` = `Keyword`.`id` ORDER BY `rs`.`date` DESC LIMIT 1)',
+  );
+
+  const dir = String(filters.sortDir).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+  let order;
+  if (filters.sortBy === 'volume') order = [['volume', dir]];
+  else if (filters.sortBy === 'difficulty') order = [['kd', dir]];
+  else if (filters.sortBy === 'rank') order = [[currentRankLiteral, dir]];
+  else order = [['createdAt', 'DESC']];
+
+  const { count, rows } = await Keyword.findAndCountAll({
+    where,
+    include: [{ 
+      model: Project, 
+      as: 'project', 
+      attributes: ['id', 'name'],
+      include: [
+        { model: Client, as: 'client', attributes: ['name'] },
+        { model: Package, as: 'package', attributes: ['name', 'tier'] },
+      ],
+    }],
+    attributes: { include: [[currentRankLiteral, 'currentRank']] },
+    order,
+    limit,
+    offset,
+  });
+
+  // Resolve strategist per project for just this page's rows, not the whole org.
+  const pageProjectIds = [...new Set(rows.map((r) => r.projectId))];
+  const assignments = pageProjectIds.length
+    ? await ProjectAssignment.findAll({
+      where: { projectId: { [Op.in]: pageProjectIds }, roleSlot: { [Op.in]: STRATEGIST_ROLE_SLOTS } },
+      include: [{ model: User, as: 'user', attributes: ['id', 'name'] }],
+    })
+    : [];
+  const strategistByProject = {};
+  for (const slot of STRATEGIST_ROLE_SLOTS) {
+    for (const a of assignments) {
+      if (a.roleSlot === slot && !strategistByProject[a.projectId] && a.user) {
+        strategistByProject[a.projectId] = { id: a.user.id, name: a.user.name };
+      }
+    }
+  }
+
+  const data = rows.map((kw) => ({
+    id: kw.id,
+    projectId: kw.projectId,
+    projectName: kw.project?.name || '—',
+    clientName: kw.project?.client?.name || '—',
+    packageName: kw.project?.package ? (kw.project.package.tier || kw.project.package.name) : '—',
+    strategist: strategistByProject[kw.projectId] || null,
+    primaryKeyword: kw.primaryKeyword,
+    secondaryKeywords: kw.secondaryKeywords,
+    volume: kw.volume,
+    kd: kw.kd,
+    targetLocation: kw.targetLocation,
+    pageName: kw.pageName,
+    status: kw.status,
+    currentRank: kw.get('currentRank'),
+  }));
+
+  return { data, total: count, page, totalPages: Math.ceil(count / limit) || 1, limit };
+}
+
+async function getKeywordSummary(orgId, filters = {}) {
+  const page = Math.max(1, parseInt(filters.page, 10) || 1);
+  const limit = Math.min(100, parseInt(filters.limit, 10) || 25);
+  const offset = (page - 1) * limit;
+
+  let projectIds;
+  if (filters.projectId) {
+    const project = await Project.findOne({ where: { id: filters.projectId, orgId }, attributes: ['id'] });
+    projectIds = project ? [project.id] : [];
+  } else {
+    projectIds = await getOrgProjectIds(orgId);
+  }
+
+  if (filters.strategistId && projectIds.length) {
+    const assigned = await ProjectAssignment.findAll({
+      where: {
+        userId: filters.strategistId,
+        roleSlot: { [Op.in]: STRATEGIST_ROLE_SLOTS },
+        projectId: { [Op.in]: projectIds },
+      },
+      attributes: ['projectId'],
+      raw: true,
+    });
+    const allowed = new Set(assigned.map((a) => a.projectId));
+    projectIds = projectIds.filter((id) => allowed.has(id));
+  }
+
+  if (!projectIds.length) {
+    return { data: [], total: 0, page, totalPages: 1, limit };
+  }
+
+  const projects = await Project.findAndCountAll({
+    where: { id: { [Op.in]: projectIds } },
+    include: [
+      { model: Client, as: 'client', attributes: ['name'] },
+      { model: Package, as: 'package', attributes: ['name', 'tier'] },
+    ],
+    limit,
+    offset,
+    order: [['createdAt', 'DESC']]
+  });
+
+  const pageProjectIds = projects.rows.map(p => p.id);
+
+  const keywords = pageProjectIds.length ? await Keyword.findAll({
+    where: { projectId: { [Op.in]: pageProjectIds }, status: 'active' },
+    attributes: ['projectId', 'volume', 'kd'],
+  }) : [];
+
+  const assignments = pageProjectIds.length
+    ? await ProjectAssignment.findAll({
+      where: { projectId: { [Op.in]: pageProjectIds }, roleSlot: { [Op.in]: STRATEGIST_ROLE_SLOTS } },
+      include: [{ model: User, as: 'user', attributes: ['id', 'name'] }],
+    })
+    : [];
+  
+  const strategistByProject = {};
+  for (const slot of STRATEGIST_ROLE_SLOTS) {
+    for (const a of assignments) {
+      if (a.roleSlot === slot && !strategistByProject[a.projectId] && a.user) {
+        strategistByProject[a.projectId] = { id: a.user.id, name: a.user.name };
+      }
+    }
+  }
+
+  // Aggregate keywords per project
+  const statsByProject = {};
+  for (const kw of keywords) {
+    if (!statsByProject[kw.projectId]) {
+      statsByProject[kw.projectId] = { total: 0, volSum: 0, volCount: 0, kdSum: 0, kdCount: 0 };
+    }
+    const st = statsByProject[kw.projectId];
+    st.total += 1;
+    if (kw.volume != null) { st.volSum += Number(kw.volume); st.volCount += 1; }
+    if (kw.kd != null) { st.kdSum += Number(kw.kd); st.kdCount += 1; }
+  }
+
+  const data = projects.rows.map(p => {
+    const st = statsByProject[p.id] || { total: 0, volSum: 0, volCount: 0, kdSum: 0, kdCount: 0 };
+    return {
+      projectId: p.id,
+      projectName: p.name,
+      clientName: p.client?.name || '—',
+      packageName: p.package ? (p.package.tier || p.package.name) : '—',
+      strategist: strategistByProject[p.id] || null,
+      totalKeywords: st.total,
+      avgVolume: st.volCount ? Math.round(st.volSum / st.volCount) : null,
+      avgKd: st.kdCount ? Math.round(st.kdSum / st.kdCount) : null,
+    };
+  });
+
+  return { data, total: projects.count, page, totalPages: Math.ceil(projects.count / limit) || 1, limit };
+}
+
+function keywordDifficultyTier(kd) {
+  if (kd == null) return { label: '—', bg: '#F3F4F6', color: '#6B7280' };
+  if (kd <= 14) return { label: 'Very easy', bg: '#DCFCE7', color: '#166534' };
+  if (kd <= 29) return { label: 'Easy', bg: '#FEF08A', color: '#854D0E' };
+  if (kd <= 49) return { label: 'Possible', bg: '#FED7AA', color: '#9A3412' };
+  if (kd <= 69) return { label: 'Hard', bg: '#FECACA', color: '#991B1B' };
+  if (kd <= 84) return { label: 'Very hard', bg: '#FCA5A5', color: '#7F1D1D' };
+  return { label: 'Super hard', bg: '#EF4444', color: '#450A0A' };
+}
+
+async function _loadGlobalSeoReportContext(orgId, letterheadFields) {
+  const brandConfig = await WhiteLabelConfig.findOne({ where: { orgId } });
+  const brandName = brandConfig?.brandName || 'Mohsin Designs Project Management';
+  const brandColor = brandConfig?.primaryColor || BRAND_COLOR;
+  const requestedFields = letterheadFields != null
+    ? letterheadFields
+    : (brandConfig?.seoReportLetterheadFields
+      ? brandConfig.seoReportLetterheadFields.split(',').map((s) => s.trim()).filter(Boolean)
+      : ['logo']);
+  const fields = normalizeLetterheadFields(requestedFields);
+  const letterhead = filterLetterheadFields(await letterheadForOrg(orgId, 'billing'), fields);
+  const logo = letterheadShowsLogo(fields) ? await loadLetterheadLogo(letterhead.logoUrl) : null;
+  return { brandName, brandColor, letterhead, logo };
+}
+
+async function exportKeywords(orgId, format, ids, filters = {}, letterheadFields = null) {
+  let data;
+  if (ids && ids.length) {
+    const page = await getKeywordReport(orgId, { ...filters, limit: 10000 });
+    data = page.data.filter(r => ids.includes(r.id));
+  } else {
+    const page = await getKeywordReport(orgId, { ...filters, limit: 10000 });
+    data = page.data;
+  }
+
+  if (format === 'csv') {
+    const headers = ['Client', 'Package', 'Strategist', 'Main Keyword', 'Supporting Keywords', 'Volume', 'Difficulty', 'Rank', 'Location', 'Page'];
+    const rows = data.map(k => [
+      k.clientName || '', k.packageName || '', k.strategist?.name || '',
+      k.primaryKeyword || '', k.secondaryKeywords || '', k.volume ?? '', k.kd ?? '',
+      k.currentRank ?? '', k.targetLocation || '', k.pageName || ''
+    ]);
+    const csv = [headers, ...rows].map(r => r.map(v => '"' + String(v ?? '').replace(/"/g, '""') + '"').join(',')).join('\n');
+    return { buffer: Buffer.from(csv, 'utf8'), ext: 'csv', mime: 'text/csv' };
+  } else {
+    const { brandColor, letterhead, logo } = await _loadGlobalSeoReportContext(orgId, letterheadFields);
+    const buffer = await createPdfBuffer((doc) => {
+      drawPdfKitLetterhead(doc, letterhead, {
+        title: 'GLOBAL KEYWORDS REPORT',
+        subtitle: `Generated ${new Date().toLocaleDateString()}`,
+        color: brandColor,
+        logo,
+      });
+      doc.font('Helvetica-Bold').fontSize(13).fillColor('#111111').text('Keyword Details');
+      doc.moveDown(0.5);
+      if (data.length === 0) {
+        doc.font('Helvetica-Oblique').fontSize(10).fillColor('#999999').text('No keywords to export.');
+      } else {
+        drawTable(doc, {
+          headerBg: brandColor,
+          headerTextColor: '#FFFFFF',
+          columns: [
+            { label: 'Client', key: 'clientName', width: 12, align: 'left' },
+            { label: 'Package', key: 'packageName', width: 12, align: 'left' },
+            { label: 'Main Keyword', key: 'primaryKeyword', width: 15 },
+            { label: 'Volume', key: 'volume', width: 8, align: 'right' },
+            {
+              label: 'Difficulty', key: 'kd', width: 9, align: 'center',
+              render: (d, value, box) => {
+                const tier = keywordDifficultyTier(value);
+                drawPill(d, tier.label, box, { bg: tier.bg, color: tier.color });
+              },
+            },
+            { label: 'Rank', key: 'currentRank', width: 6, align: 'right' },
+          ],
+          rows: data
+        });
+      }
+      drawReportFooter(doc, brandColor);
+    });
+    return { buffer, ext: 'pdf', mime: 'application/pdf' };
+  }
+}
+
+async function exportKeywordSummary(orgId, format, ids, filters = {}, letterheadFields = null) {
+  let data;
+  if (ids && ids.length) {
+    const page = await getKeywordSummary(orgId, { ...filters, limit: 10000 });
+    data = page.data.filter(r => ids.includes(r.projectId));
+  } else {
+    const page = await getKeywordSummary(orgId, { ...filters, limit: 10000 });
+    data = page.data;
+  }
+
+  if (format === 'csv') {
+    const headers = ['Client', 'Package', 'Strategist', 'Total Keywords', 'Avg Volume', 'Avg KD'];
+    const rows = data.map(r => [
+      r.clientName || '', r.packageName || '', r.strategist?.name || '',
+      r.totalKeywords || 0, r.avgVolume ?? '', r.avgKd ?? ''
+    ]);
+    const csv = [headers, ...rows].map(row => row.map(v => '"' + String(v ?? '').replace(/"/g, '""') + '"').join(',')).join('\n');
+    return { buffer: Buffer.from(csv, 'utf8'), ext: 'csv', mime: 'text/csv' };
+  } else {
+    const { brandColor, letterhead, logo } = await _loadGlobalSeoReportContext(orgId, letterheadFields);
+    const buffer = await createPdfBuffer((doc) => {
+      drawPdfKitLetterhead(doc, letterhead, {
+        title: 'GLOBAL KEYWORDS SUMMARY',
+        subtitle: `Generated ${new Date().toLocaleDateString()}`,
+        color: brandColor,
+        logo,
+      });
+      doc.font('Helvetica-Bold').fontSize(13).fillColor('#111111').text('Project Summaries');
+      doc.moveDown(0.5);
+      if (data.length === 0) {
+        doc.font('Helvetica-Oblique').fontSize(10).fillColor('#999999').text('No summaries to export.');
+      } else {
+        drawTable(doc, {
+          headerBg: brandColor,
+          headerTextColor: '#FFFFFF',
+          columns: [
+            { label: 'Client', key: 'clientName', width: 15, align: 'left' },
+            { label: 'Package', key: 'packageName', width: 15, align: 'left' },
+            { label: 'Strategist', key: 'strategist', width: 15, render: (d, v) => v ? v.name : '—' },
+            { label: 'Total Keywords', key: 'totalKeywords', width: 10, align: 'right' },
+            { label: 'Avg Volume', key: 'avgVolume', width: 10, align: 'right' },
+            { label: 'Avg KD', key: 'avgKd', width: 10, align: 'right' },
+          ],
+          rows: data
+        });
+      }
+      drawReportFooter(doc, brandColor);
+    });
+    return { buffer, ext: 'pdf', mime: 'application/pdf' };
+  }
+}
+
+module.exports = {
+  getMembersOverview, getMemberDetail, getKeywordReport, getKeywordSummary, exportKeywords, exportKeywordSummary
+};

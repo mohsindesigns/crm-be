@@ -30,9 +30,9 @@ router.post('/projects/:projectId/keywords', rbac('projects.act'), async (req, r
 });
 
 // Which company detail fields (logo, address, tax number, email, phone,
-// website, note) print on the report's letterhead — the "Company details"
-// checkbox list next to the report buttons. Comma-separated; absent means
-// "show everything" (unchanged from before this option existed).
+// website, note) print on the report's letterhead. Comma-separated override
+// for API callers; the app itself no longer sends this — absent means "use
+// the org's configured default" (Admin → Branding), see SeoService.
 function letterheadFieldsFromQuery(req) {
   return typeof req.query.fields === 'string' && req.query.fields.length
     ? req.query.fields.split(',').map((s) => s.trim()).filter(Boolean)

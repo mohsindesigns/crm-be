@@ -223,6 +223,7 @@ class WorkflowAdminService {
       einNumber: data.einNumber,
       contactEmail: data.contactEmail,
       letterheadNote: data.letterheadNote,
+      seoReportLetterheadFields: data.seoReportLetterheadFields,
     });
     return config;
   }
