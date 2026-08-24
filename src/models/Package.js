@@ -21,6 +21,12 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.STRING(255),
       allowNull: false,
     },
+    // Free-text blurb shown alongside the package wherever it's picked for sale —
+    // scope notes, what's excluded, anything that doesn't belong in the
+    // client-facing `features` bullet list.
+    description: {
+      type: DataTypes.TEXT,
+    },
     tier: {
       type: DataTypes.STRING(50),
     },
@@ -80,10 +86,14 @@ module.exports = (sequelize, DataTypes) => {
       defaultValue: false,
     },
     // Installment plan for one-time (non-recurring) package sales: an array of
-    // { percent, offsetDays, label } — e.g. 40% due immediately, 30% in 30 days,
-    // 30% in 60 days. Percents should sum to 100 (validated where this is set).
-    // When set, selling the package generates all N invoices upfront instead of
-    // the default "no invoice created automatically" behavior for one-time sales.
+    // { type: 'percent'|'amount', value, offsetDays, label } — e.g. 40% due
+    // immediately, 30% in 30 days, 30% in 60 days; or a mix of percentages and
+    // flat amounts. Percent-type rows should sum to 100 (validated where this is
+    // set). Older rows saved before `type`/`value` existed still store
+    // { percent, offsetDays, label } and are read as percent-type — see
+    // ClientService#sellPackage's normalization. When set, selling the package
+    // generates all N invoices upfront instead of the default "no invoice
+    // created automatically" behavior for one-time sales.
     installmentPlan: {
       type: DataTypes.JSON,
     },

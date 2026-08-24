@@ -617,8 +617,15 @@ class ClientService {
         const plan = installmentPlan;
         for (let i = 0; i < plan.length; i++) {
           const installment = plan[i];
-          const percent = Number(installment.percent) || 0;
-          if (percent <= 0) continue;
+          // `type`/`value` is the current shape; older rows (and template rows
+          // saved before this existed) only have `percent` — treat those as
+          // percent-type for backward compatibility.
+          const isAmount = installment.type === 'amount';
+          const rawValue = installment.value !== undefined && installment.value !== null && installment.value !== ''
+            ? installment.value
+            : (isAmount ? installment.amount : installment.percent);
+          const value = Number(rawValue) || 0;
+          if (value <= 0) continue;
           let dueAt = null;
           if (installment.dueAt && /^\d{4}-\d{2}-\d{2}/.test(String(installment.dueAt))) {
             dueAt = String(installment.dueAt).slice(0, 10);
@@ -629,7 +636,9 @@ class ClientService {
             const pad = (n) => String(n).padStart(2, '0');
             dueAt = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
           }
-          const amount = Math.round(soldPrice * (percent / 100) * 100) / 100;
+          const amount = isAmount
+            ? Math.round(value * 100) / 100
+            : Math.round(soldPrice * (value / 100) * 100) / 100;
           // A free package produces zero-value installments — nothing to bill, so
           // skip them rather than issuing $0.00 invoices the client can't pay.
           if (!(amount > 0)) continue;
@@ -657,7 +666,7 @@ class ClientService {
         // Silence on a free package is correct, not an error — only flag a plan
         // that was actually worth something but produced nothing.
         if (installmentInvoices.length === 0 && soldPrice > 0) {
-          billingError = 'Installment plan had no valid percentages — no invoices were created.';
+          billingError = 'Installment plan had no valid amounts — no invoices were created.';
         }
       } catch (err) {
         console.error('[ClientService] Failed to generate installment invoices for package sale:', err.stack || err.message);
@@ -772,7 +781,9 @@ class ClientService {
           // the same delivery target/notes from the sale.
           startDate: data.startDate,
           deliveryDate: data.deliveryDate,
-          description: data.description,
+          // Each package in the order can carry its own scope note; falls back to
+          // the sale-wide description when a given entry doesn't set one.
+          description: entry.description || data.description,
         }, userId);
         sold.push(result);
       } catch (err) {
