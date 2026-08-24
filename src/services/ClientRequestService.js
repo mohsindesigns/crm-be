@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const { Op } = require('sequelize');
 const db = require('../models');
@@ -7,6 +8,7 @@ const { activeWhere } = require('./SoftDeleteService');
 const EmailService = require('./EmailService');
 const NotificationService = require('./NotificationService');
 const CaptchaService = require('./CaptchaService');
+const MediaService = require('./MediaService');
 const { normalizeTheme, effectiveTheme } = require('./RequirementFormService');
 
 // Drives the "email the client a requirements form from a project" flow end to
@@ -495,6 +497,22 @@ async function getPublicByToken(token) {
   };
 }
 
+/** Uploads one attachment for a `file`-type question. Scoped by token the same
+ *  way as every other public function here, and only allowed while the form
+ *  is still fillable — same states loadByToken already gates. The returned
+ *  URL is what the client's browser then submits back as that field's answer
+ *  (see utils/formFields#validateAnswers's `file` handling). */
+async function uploadPublicFile(token, tmpPath, originalName, mimetype, req) {
+  checkRateLimit(req?.ip);
+  const request = await loadByToken(token);
+  if (request.status === 'responded') {
+    throw conflict('This form has already been submitted.');
+  }
+  const stream = fs.createReadStream(tmpPath);
+  const result = await MediaService.upload(stream, originalName, mimetype);
+  return { url: result.url, name: result.originalName, size: result.size };
+}
+
 /** The client's reply. This is what flips the project tab to "Responded". */
 async function submitPublic(token, body, req) {
   // Honeypot — see LeadService#submitPublic for why this returns success.
@@ -549,5 +567,6 @@ module.exports = {
   recipientOptions,
   getPublicByToken,
   submitPublic,
+  uploadPublicFile,
   publicUrl,
 };

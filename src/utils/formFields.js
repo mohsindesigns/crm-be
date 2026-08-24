@@ -42,10 +42,10 @@ function normalizeFields(rawFields) {
       .replace(/^_+|_+$/g, '') || `field_${i + 1}`;
     if (seenKeys.has(key)) throw badRequest(`Duplicate field key "${key}" — give each field a unique label.`);
     seenKeys.add(key);
-    const options = type === 'select'
+    const options = (type === 'select' || type === 'multiselect')
       ? (Array.isArray(f?.options) ? f.options.map(String).filter(Boolean) : [])
       : undefined;
-    if (type === 'select' && (!options || options.length === 0)) {
+    if ((type === 'select' || type === 'multiselect') && (!options || options.length === 0)) {
       throw badRequest(`Field "${label}" is a dropdown but has no options.`);
     }
     return { key, label, type, required: !!f?.required, hidden: !!f?.hidden, ...(options ? { options } : {}) };
@@ -64,11 +64,22 @@ function validateAnswers(fields, answers) {
     if (field.hidden) continue;
     const raw = answers?.[field.key];
     const value = typeof raw === 'string' ? raw.trim() : raw;
-    if (field.required && (value === undefined || value === null || value === '')) {
+    const isEmpty = value === undefined || value === null || value === ''
+      || (Array.isArray(value) && value.length === 0);
+    if (field.required && isEmpty) {
       throw badRequest(`"${field.label}" is required.`);
     }
     if (field.type === 'select' && value && !field.options?.includes(value)) {
       throw badRequest(`"${value}" is not a valid option for "${field.label}".`);
+    }
+    if (field.type === 'multiselect' && !isEmpty) {
+      if (!Array.isArray(value)) throw badRequest(`"${field.label}" must be a list of selected options.`);
+      for (const v of value) {
+        if (!field.options?.includes(v)) throw badRequest(`"${v}" is not a valid option for "${field.label}".`);
+      }
+    }
+    if (field.type === 'file' && !isEmpty && typeof value !== 'string') {
+      throw badRequest(`"${field.label}" must be an uploaded file.`);
     }
     if (field.type === 'email' && value && !EMAIL_RE.test(value)) {
       throw badRequest(`"${field.label}" must be a valid email address.`);
@@ -83,7 +94,7 @@ function validateAnswers(fields, answers) {
     if (field.type === 'phone' && value && !isValidForRecognizedCountry(value)) {
       throw badRequest(`"${field.label}" doesn't match the expected length for that country code.`);
     }
-    if (value !== undefined && value !== null && value !== '') {
+    if (!isEmpty) {
       fieldData[field.key] = value;
     }
   }

@@ -1,3 +1,4 @@
+const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const { Op } = require('sequelize');
 const db = require('../models');
@@ -6,6 +7,8 @@ const { activeWhere } = require('./SoftDeleteService');
 const NotificationService = require('./NotificationService');
 const LeadFormService = require('./LeadFormService');
 const CaptchaService = require('./CaptchaService');
+const EmailService = require('./EmailService');
+const MediaService = require('./MediaService');
 const { validateAnswers } = require('../utils/formFields');
 
 const VALID_STATUSES = Object.values(LEAD_STATUS);
@@ -70,6 +73,64 @@ function buildFieldData(fields, answers) {
   return { fieldData, fullName, email, phone };
 }
 
+/** Emails a lead submission over to the client its form is linked to
+ *  (LeadForm.notifyClientId). Recipient resolution mirrors
+ *  InvoiceService#emailContact: the contact ticked "use for invoice" first,
+ *  then whoever has portal access, then just the first active contact — same
+ *  "always reaches someone if anyone's on file" fallback chain. */
+async function notifyLinkedClient(form, { fieldData, fullName, email, phone }) {
+  const client = await db.Client.findOne({
+    where: { id: form.notifyClientId, orgId: form.orgId },
+    include: [{ model: db.Contact, as: 'contacts' }],
+  });
+  if (!client) return;
+
+  const activeContacts = (client.contacts || []).filter((c) => c.isActive !== false && c.email);
+  const recipient = activeContacts.find((c) => c.useForInvoice)
+    || activeContacts.find((c) => c.portalAccess)
+    || activeContacts[0]
+    || null;
+  if (!recipient) return;
+
+  const branding = await db.WhiteLabelConfig.findOne({ where: { orgId: form.orgId } });
+  const org = await db.Org.findOne({ where: { id: form.orgId } });
+
+  const answers = (form.fields || [])
+    .filter((f) => !f.hidden && f.type !== 'email' && f.type !== 'phone' && fieldData[f.key] !== undefined)
+    .map((f) => ({
+      label: f.label,
+      value: Array.isArray(fieldData[f.key]) ? fieldData[f.key].join(', ') : String(fieldData[f.key]),
+      isLink: f.type === 'file',
+    }));
+
+  await EmailService.sendLeadNotification({
+    to: recipient.email,
+    clientName: client.name,
+    brandName: branding?.brandName || org?.name || 'Your agency',
+    logoUrl: branding?.logoUrl || null,
+    formName: form.name,
+    fullName,
+    email,
+    phone,
+    campaign: form.campaign,
+    answers,
+  });
+}
+
+/** Uploads one attachment for a `file`-type question on a lead-capture form.
+ *  Scoped by token exactly like submitPublic's own lookup (active, not
+ *  deactivated) and rate-limited the same way — the returned URL is what the
+ *  visitor's browser then submits back as that field's answer (see
+ *  utils/formFields#validateAnswers's `file` handling). */
+async function uploadPublicFile(token, tmpPath, originalName, mimetype, req) {
+  checkRateLimit(req?.ip);
+  const form = await db.LeadForm.findOne({ where: { publicToken: token, status: 'active', isActive: true } });
+  if (!form) throw notFound('This form is no longer available.');
+  const stream = fs.createReadStream(tmpPath);
+  const result = await MediaService.upload(stream, originalName, mimetype);
+  return { url: result.url, name: result.originalName, size: result.size };
+}
+
 /** Public submission entry point — called from the unauthenticated embed route.
  *  Token is the only scope; never trusts a client-supplied orgId. */
 async function submitPublic(token, body, req) {
@@ -127,6 +188,13 @@ async function submitPublic(token, body, req) {
       refTable: 'leads',
       refId: lead.id,
     }).catch(() => {});
+  }
+
+  // Only when this form has been explicitly linked to a client (staff opt-in
+  // via the form builder, see LeadFormService) — every other form's flow is
+  // unchanged. Fire-and-forget for the same reason as the notification above.
+  if (form.notifyClientId) {
+    notifyLinkedClient(form, { fieldData, fullName, email, phone }).catch(() => {});
   }
 
   return {
@@ -278,4 +346,4 @@ async function convertToClient(id, orgId, actorUser, overrides = {}) {
   return { lead, client };
 }
 
-module.exports = { submitPublic, list, findById, updateStatus, assign, convertToClient };
+module.exports = { submitPublic, uploadPublicFile, list, findById, updateStatus, assign, convertToClient };

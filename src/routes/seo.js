@@ -382,25 +382,43 @@ router.patch('/blog-sheet/:id/review', rbac('projects.act'), async (req, res, ne
   } catch (e) { next(e); }
 });
 
-// Deactivates, never destroys. Not adminOnly: the blog's own submitter can
-// delete it too while it's still unapproved — see SeoService.deleteBlogTask.
+// Permanently deletes — not adminOnly: the blog's own submitter can delete
+// it too while it's still unapproved — see SeoService.deleteBlogTask.
 router.delete('/blog-sheet/:id', rbac('projects.act'), async (req, res, next) => {
   try {
-    const bt = await SeoService.deleteBlogTask(req.params.id, req.orgId, false, req.user);
+    const bt = await SeoService.deleteBlogTask(req.params.id, req.orgId, req.user);
+    res.json({ message: 'Blog deleted', blog: bt });
+  } catch (e) { next(e); }
+});
+
+// Non-destructive: sets a single row to Inactive — same owner/approved guard
+// as delete, split out as its own action now that delete really deletes.
+router.post('/blog-sheet/:id/deactivate', rbac('projects.act'), async (req, res, next) => {
+  try {
+    const bt = await SeoService.deactivateBlogTask(req.params.id, req.orgId, req.user);
     res.json({ message: 'Blog set to Inactive', blog: bt });
   } catch (e) { next(e); }
 });
 
 router.post('/blog-sheet/:id/activate', adminOnly, rbac('projects.act'), async (req, res, next) => {
   try {
-    const bt = await SeoService.deleteBlogTask(req.params.id, req.orgId, true);
+    const bt = await SeoService.setBlogTaskActive(req.params.id, req.orgId, true);
     res.json({ message: 'Blog set to Active', blog: bt });
   } catch (e) { next(e); }
 });
 
-router.post('/projects/:projectId/blog-sheet/bulk-delete', rbac('projects.act'), async (req, res, next) => {
+// Permanently deletes — adminOnly, same gate as bulkDeleteKeywords.
+router.post('/projects/:projectId/blog-sheet/bulk-delete', adminOnly, rbac('projects.act'), async (req, res, next) => {
   try {
-    res.json(await SeoService.bulkDeleteBlogTasks(req.params.projectId, req.orgId, req.body?.ids, req.user));
+    res.json(await SeoService.bulkDeleteBlogTasks(req.params.projectId, req.orgId, req.body?.ids));
+  } catch (e) { next(e); }
+});
+
+// Non-destructive counterpart to bulk-delete (which really deletes now) —
+// same adminOnly gate as bulk-delete since it's still a bulk sheet action.
+router.post('/projects/:projectId/blog-sheet/bulk-deactivate', adminOnly, rbac('projects.act'), async (req, res, next) => {
+  try {
+    res.json(await SeoService.bulkDeactivateBlogTasks(req.params.projectId, req.orgId, req.body?.ids));
   } catch (e) { next(e); }
 });
 

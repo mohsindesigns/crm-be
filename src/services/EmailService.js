@@ -740,4 +740,61 @@ async function sendClientRequestReminder({
   });
 }
 
-module.exports = { sendMail, verifyTransport, sendPayrollReady, sendLeaveUpdate, sendProfileReviewUpdate, sendAppraisalUpdate, sendProjectAssigned, sendTaskAssigned, sendTaskReminder, sendPasswordReset, sendAdminPasswordReset, sendStageAdvance, sendUserInvite, sendPortalInvite, sendPortalLoginCode, sendEmailChangeCode, sendDocumentReviewLink, sendDocumentRemind, sendInvoiceEmail, sendClientRequestForm, sendClientRequestReminder };
+/** Forwards a newly-submitted lead to the client the capturing LeadForm is
+ *  linked to (LeadForm.notifyClientId — see LeadService#submitPublic). Only
+ *  fires when a form has been explicitly linked to a client; unlinked forms
+ *  never trigger this. `answers` is [{ label, value }], already filtered down
+ *  to whatever the form asked beyond name/email/phone. */
+async function sendLeadNotification({
+  to, clientName, brandName, logoUrl, formName, fullName, email, phone, campaign, answers,
+}) {
+  const safeClientName = escapeHtml(clientName || 'there');
+  const rows = [
+    fullName ? { label: 'Name', value: fullName } : null,
+    email ? { label: 'Email', value: email } : null,
+    phone ? { label: 'Phone', value: phone } : null,
+    campaign ? { label: 'Campaign', value: campaign } : null,
+    ...(answers || []),
+  ].filter(Boolean);
+
+  const rowsHtml = rows.map((r) => `
+    <tr>
+      <td style="padding:10px 0;color:#6b7280;font-size:13px;width:140px;vertical-align:top;">${escapeHtml(r.label)}</td>
+      <td style="padding:10px 0;color:#111827;font-size:14px;font-weight:600;">${
+        r.isLink
+          ? `<a href="${escapeHtml(r.value)}" style="color:${BRAND_PRIMARY};">View attachment</a>`
+          : escapeHtml(r.value)
+      }</td>
+    </tr>
+  `).join('');
+
+  const bodyHtml = `
+    <p style="margin:0 0 12px;color:#374151;font-size:15px;line-height:1.6;">Hi <strong>${safeClientName}</strong>,</p>
+    <p style="margin:0;color:#374151;font-size:15px;line-height:1.6;">
+      A new lead just came in through <strong>${escapeHtml(formName)}</strong>.
+    </p>
+    <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:18px 20px;margin:22px 0 0;">
+      <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;">
+        ${rowsHtml}
+      </table>
+    </div>
+  `;
+
+  return sendMail({
+    to,
+    subject: `New lead: ${fullName || email || 'Someone'} via ${formName}`,
+    html: emailLayout({
+      brandName,
+      logoUrl,
+      title: 'New Lead',
+      accentColor: BRAND_PRIMARY,
+      badgeLabel: 'New Lead',
+      badgeBg: '#fef3c7',
+      badgeColor: BRAND_PRIMARY,
+      bodyHtml,
+      footerHtml: `This is an automated message from ${escapeHtml(brandName)} — you're receiving it because this lead form is linked to your account.`,
+    }),
+  });
+}
+
+module.exports = { sendMail, verifyTransport, sendPayrollReady, sendLeaveUpdate, sendProfileReviewUpdate, sendAppraisalUpdate, sendProjectAssigned, sendTaskAssigned, sendTaskReminder, sendPasswordReset, sendAdminPasswordReset, sendStageAdvance, sendUserInvite, sendPortalInvite, sendPortalLoginCode, sendEmailChangeCode, sendDocumentReviewLink, sendDocumentRemind, sendInvoiceEmail, sendClientRequestForm, sendClientRequestReminder, sendLeadNotification };

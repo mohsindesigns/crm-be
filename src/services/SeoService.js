@@ -1913,41 +1913,73 @@ async function syncApprovedBlogTasks(orgId, userId) {
 }
 
 /**
- * Deactivates (or reactivates) a blog row — see models/softDeletable.js.
- *
- * Deactivating is admin-only by default, but same as `deleteKeyword`: the
- * person who added the row can also take it back themselves while it's still
- * theirs to take back — once it's been approved, only an admin/manager can.
- * Reactivating stays admin-only (the route it's called from keeps `adminOnly`),
- * so `actor` is only checked on the deactivate path.
+ * Shared owner/approved guard for the single-row delete and deactivate paths.
+ * Not admin-only: the person who added the row can act on it themselves too,
+ * but only while it's still theirs to take back — once it's been approved,
+ * only an admin/manager (via SoftDeleteService-style checks elsewhere) can
+ * touch it. Mirrors deleteKeyword's guard.
  */
-async function deleteBlogTask(id, orgId, active = false, actor = null) {
+function assertBlogTaskActionable(bt, actor, verb) {
+  const isManager = ['super_admin', 'admin'].includes(actor?.role?.key)
+    || !!actor?.role?.permissions?.['projects.manage'];
+  if (!isManager && bt.createdBy !== actor?.id) {
+    throw Object.assign(new Error(`Only the person who added this blog (or an admin) can ${verb} it.`), { status: 403 });
+  }
+  if (bt.status === 'approved') {
+    throw Object.assign(new Error(`This blog has approved content and cannot be ${verb === 'delete' ? 'deleted' : 'set to Inactive'}.`), { status: 400 });
+  }
+}
+
+/**
+ * Permanently deletes a single blog row — real removal, not a status flip.
+ * Same guard as deleteKeyword: not admin-only, blocked once approved.
+ */
+async function deleteBlogTask(id, orgId, actor) {
   const bt = await BlogTask.findOne({
     where: { id },
     include: [{ model: Project, as: 'project', where: { orgId }, attributes: [] }],
   });
   if (!bt) throw Object.assign(new Error('Blog task not found'), { status: 404 });
 
-  if (!active) {
-    const isManager = ['super_admin', 'admin'].includes(actor?.role?.key)
-      || !!actor?.role?.permissions?.['projects.manage'];
-    if (!isManager && bt.createdBy !== actor?.id) {
-      throw Object.assign(new Error('Only the person who added this blog (or an admin) can set it to Inactive.'), { status: 403 });
-    }
-    if (bt.status === 'approved') {
-      throw Object.assign(new Error('This blog has approved content and cannot be set to Inactive.'), { status: 400 });
-    }
-  }
+  assertBlogTaskActionable(bt, actor, 'delete');
+  await bt.destroy();
+  return bt;
+}
+
+/**
+ * Non-destructive: sets a single row to Inactive — see models/softDeletable.js.
+ * Same owner/approved guard as deleteBlogTask, kept as a separate action now
+ * that delete really deletes. Reversible via setBlogTaskActive.
+ */
+async function deactivateBlogTask(id, orgId, actor) {
+  const bt = await BlogTask.findOne({
+    where: { id },
+    include: [{ model: Project, as: 'project', where: { orgId }, attributes: [] }],
+  });
+  if (!bt) throw Object.assign(new Error('Blog task not found'), { status: 404 });
+
+  assertBlogTaskActionable(bt, actor, 'set it to Inactive');
+  await bt.update({ isActive: false });
+  return bt;
+}
+
+/** Plain status flip, no guard — used by the admin-only /activate route to reactivate a row. */
+async function setBlogTaskActive(id, orgId, active) {
+  const bt = await BlogTask.findOne({
+    where: { id },
+    include: [{ model: Project, as: 'project', where: { orgId }, attributes: [] }],
+  });
+  if (!bt) throw Object.assign(new Error('Blog task not found'), { status: 404 });
   await bt.update({ isActive: active });
   return bt;
 }
 
 /**
- * Bulk deactivate blog rows — same rule as the single-row path: the person
- * who added a row (or an admin/manager) can take it back, but only while it
- * hasn't been approved yet.
+ * Bulk permanently deletes blog rows — real removal, not a status flip.
+ * Route-gated adminOnly (same as bulkDeleteKeywords), so no owner check here:
+ * approved rows are still skipped since they're a record of accepted work.
  */
-async function bulkDeleteBlogTasks(projectId, orgId, ids, actor) {
+async function bulkDeleteBlogTasks(projectId, orgId, ids) {
   await assertProjectAccess(projectId, orgId);
   const idList = Array.isArray(ids) ? [...new Set(ids.filter(Boolean))] : [];
   if (!idList.length) {
@@ -1957,12 +1989,9 @@ async function bulkDeleteBlogTasks(projectId, orgId, ids, actor) {
     throw Object.assign(new Error('You can change at most 200 blogs at a time.'), { status: 400 });
   }
 
-  const isManager = ['super_admin', 'admin'].includes(actor?.role?.key)
-    || !!actor?.role?.permissions?.['projects.manage'];
-
   const rows = await BlogTask.findAll({
     where: { id: idList, projectId },
-    attributes: ['id', 'status', 'createdBy'],
+    attributes: ['id', 'status'],
   });
   const byId = new Map(rows.map((r) => [r.id, r]));
   const deleted = [];
@@ -1972,14 +2001,49 @@ async function bulkDeleteBlogTasks(projectId, orgId, ids, actor) {
     const bt = byId.get(id);
     if (!bt) { skipped.push({ id, reason: 'not_found' }); continue; }
     if (bt.status === 'approved') { skipped.push({ id, reason: 'approved' }); continue; }
-    if (!isManager && bt.createdBy !== actor?.id) { skipped.push({ id, reason: 'not_owner' }); continue; }
     deleted.push(id);
   }
 
   if (deleted.length) {
-    await BlogTask.update({ isActive: false }, { where: { id: deleted, projectId } });
+    await BlogTask.destroy({ where: { id: deleted, projectId } });
   }
-  return { deactivated: deleted.length, skipped };
+  return { deleted: deleted.length, skipped };
+}
+
+/**
+ * Non-destructive counterpart to bulkDeleteBlogTasks (which really deletes
+ * now) — same adminOnly gate, same approved-row skip, but flips isActive
+ * instead of destroying the row.
+ */
+async function bulkDeactivateBlogTasks(projectId, orgId, ids) {
+  await assertProjectAccess(projectId, orgId);
+  const idList = Array.isArray(ids) ? [...new Set(ids.filter(Boolean))] : [];
+  if (!idList.length) {
+    throw Object.assign(new Error('No blog IDs provided.'), { status: 400 });
+  }
+  if (idList.length > 200) {
+    throw Object.assign(new Error('You can change at most 200 blogs at a time.'), { status: 400 });
+  }
+
+  const rows = await BlogTask.findAll({
+    where: { id: idList, projectId },
+    attributes: ['id', 'status'],
+  });
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const deactivated = [];
+  const skipped = [];
+
+  for (const id of idList) {
+    const bt = byId.get(id);
+    if (!bt) { skipped.push({ id, reason: 'not_found' }); continue; }
+    if (bt.status === 'approved') { skipped.push({ id, reason: 'approved' }); continue; }
+    deactivated.push(id);
+  }
+
+  if (deactivated.length) {
+    await BlogTask.update({ isActive: false }, { where: { id: deactivated, projectId } });
+  }
+  return { deactivated: deactivated.length, skipped };
 }
 
 /** Bulk reactivate blog rows — no restriction, same as bulkActivateKeywords. */
@@ -2267,6 +2331,6 @@ module.exports = {
   listContent, createContent, reviewContent, deleteContent, bulkDeleteContent, syncApprovedContentTasks,
   listBlogTasks, createBlogTask, updateBlogTask,
   listBlogSheet, createBlogSheetRow, submitBlogDeliverable, bulkImportBlogTasks,
-  reviewBlogTask, deleteBlogTask, bulkDeleteBlogTasks, bulkActivateBlogTasks, syncApprovedBlogTasks,
+  reviewBlogTask, deleteBlogTask, deactivateBlogTask, setBlogTaskActive, bulkDeleteBlogTasks, bulkDeactivateBlogTasks, bulkActivateBlogTasks, syncApprovedBlogTasks,
   generateKeywordReportBuffer, generateBacklinkReportBuffer, generateKeywordCsv, generateBlogCsv,
 };

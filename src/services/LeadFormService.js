@@ -93,12 +93,14 @@ async function create(orgId, data, actor = {}) {
     const project = await db.Project.findOne({ where: { id: data.projectId, orgId } });
     if (!project) throw badRequest('Project not found.');
   }
+  const notifyClientId = await resolveNotifyClientId(orgId, data.notifyClientId);
   return db.LeadForm.create({
     id: uuidv4(),
     orgId,
     projectId: data.projectId || null,
     campaign: data.campaign || null,
     clientId,
+    notifyClientId,
     name: String(data.name || '').trim() || 'Untitled form',
     fields,
     publicToken: crypto.randomBytes(24).toString('base64url'),
@@ -108,6 +110,15 @@ async function create(orgId, data, actor = {}) {
     createdBy: userId,
     createdByContactId: contactId,
   });
+}
+
+/** Validates an optional "link to client" selection — must be a real, active
+ *  client in this org, or null/omitted to leave the form unlinked. */
+async function resolveNotifyClientId(orgId, rawClientId) {
+  if (!rawClientId) return null;
+  const client = await db.Client.findOne({ where: { id: rawClientId, orgId } });
+  if (!client) throw badRequest('Client not found.');
+  return client.id;
 }
 
 /** @param {string|null} [scopeClientId] - forced by portal callers to their
@@ -123,6 +134,7 @@ async function list(orgId, query = {}, scopeClientId = null) {
     include: [
       { model: db.Project, as: 'project', attributes: ['id', 'name'] },
       { model: db.Client, as: 'client', attributes: ['id', 'name'] },
+      { model: db.Client, as: 'notifyClient', attributes: ['id', 'name'] },
     ],
     order: [['createdAt', 'DESC']],
   });
@@ -150,6 +162,7 @@ async function findById(id, orgId, scopeClientId = null) {
     include: [
       { model: db.Project, as: 'project', attributes: ['id', 'name'] },
       { model: db.Client, as: 'client', attributes: ['id', 'name'] },
+      { model: db.Client, as: 'notifyClient', attributes: ['id', 'name'] },
     ],
   });
   if (!form) throw notFound();
@@ -173,6 +186,7 @@ async function update(id, orgId, data, scopeClientId = null) {
   if (data.successMessage !== undefined) patch.successMessage = data.successMessage || null;
   if (data.redirectUrl !== undefined) patch.redirectUrl = data.redirectUrl || null;
   if (data.theme !== undefined) patch.theme = normalizeTheme(data.theme);
+  if (data.notifyClientId !== undefined) patch.notifyClientId = await resolveNotifyClientId(orgId, data.notifyClientId);
   await form.update(patch);
   return form;
 }

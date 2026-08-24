@@ -1,4 +1,7 @@
 const express = require('express');
+const multer = require('multer');
+const os = require('os');
+const fs = require('fs');
 const router = express.Router();
 const LeadFormService = require('../services/LeadFormService');
 const LeadService = require('../services/LeadService');
@@ -11,9 +14,33 @@ const LeadService = require('../services/LeadService');
 // via CaptchaService) — the widget is client-side only, so there's no
 // server-issued challenge to fetch first.
 
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: os.tmpdir(),
+    filename: (req, file, cb) => cb(null, `upload-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+  }),
+  limits: { fileSize: parseInt(process.env.MAX_FILE_SIZE_MB || '50', 10) * 1024 * 1024 },
+});
+
 router.get('/:token', async (req, res, next) => {
   try { res.json(await LeadFormService.getPublicByToken(req.params.token)); }
   catch (e) { next(e); }
+});
+
+// POST /:token/upload — attachment for a `file`-type question, uploaded ahead
+// of submit (the visitor picks a file, sees it attach, then submits the whole
+// form) rather than bundled into /:token/submit, which stays JSON-only.
+router.post('/:token/upload', upload.single('file'), async (req, res, next) => {
+  const tmpPath = req.file?.path;
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded. Use multipart field "file".' });
+    const result = await LeadService.uploadPublicFile(req.params.token, tmpPath, req.file.originalname, req.file.mimetype, req);
+    fs.unlink(tmpPath, () => {});
+    res.status(201).json(result);
+  } catch (e) {
+    if (tmpPath) fs.unlink(tmpPath, () => {});
+    next(e);
+  }
 });
 
 router.post('/:token/submit', async (req, res, next) => {

@@ -328,12 +328,16 @@ async function getKeywordSummary(orgId, filters = {}) {
   const limit = Math.min(100, parseInt(filters.limit, 10) || 25);
   const offset = (page - 1) * limit;
 
+  // Keyword Reports is an SEO-only screen — a project with no keyword sheet
+  // at all (every non-SEO service type) has no business showing up here as a
+  // "0 keywords" row.
   let projectIds;
   if (filters.projectId) {
-    const project = await Project.findOne({ where: { id: filters.projectId, orgId }, attributes: ['id'] });
+    const project = await Project.findOne({ where: { id: filters.projectId, orgId, serviceTypeKey: 'seo' }, attributes: ['id'] });
     projectIds = project ? [project.id] : [];
   } else {
-    projectIds = await getOrgProjectIds(orgId);
+    const seoProjects = await Project.findAll({ where: { orgId, serviceTypeKey: 'seo' }, attributes: ['id'], raw: true });
+    projectIds = seoProjects.map((p) => p.id);
   }
 
   if (filters.strategistId && projectIds.length) {
@@ -362,7 +366,12 @@ async function getKeywordSummary(orgId, filters = {}) {
     ],
     limit,
     offset,
-    order: [['createdAt', 'DESC']]
+    // `createdAt` alone isn't unique — rows sharing a timestamp (bulk
+    // import/seed) sort in undefined order between requests, which lets the
+    // same project land on two different pages (or get skipped) under
+    // LIMIT/OFFSET. `id` as a tiebreaker makes the order — and therefore the
+    // page split — deterministic, so a project appears exactly once.
+    order: [['createdAt', 'DESC'], ['id', 'ASC']],
   });
 
   const pageProjectIds = projects.rows.map(p => p.id);

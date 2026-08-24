@@ -99,7 +99,7 @@ module.exports = {
     LOST: 'lost',
   },
 
-  LEAD_FORM_FIELD_TYPES: ['text', 'email', 'phone', 'textarea', 'select', 'checkbox'],
+  LEAD_FORM_FIELD_TYPES: ['text', 'email', 'phone', 'textarea', 'select', 'checkbox', 'multiselect', 'file'],
 
   DEFAULT_BRAND_COLOR: '#0B1D5E',
 };

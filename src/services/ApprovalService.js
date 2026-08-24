@@ -635,7 +635,13 @@ class ApprovalService {
   async list(orgId, user, { status = 'pending', type = null, q = '' } = {}) {
     if (!STATUSES.includes(status)) throw badRequest('status must be pending, approved or rejected.');
     const ctx = await buildContext(orgId, user);
-    const keys = visibleSourceKeys(ctx, type);
+    // A source with no `decide` (customer_document, worker_profile — see their
+    // SOURCES comments) is never actionable from this inbox, by anyone, ever;
+    // the client or the HR page owns that decision instead. Surfacing those
+    // rows under "Pending" turned the tab into a to-do list with items nobody
+    // could ever check off, so they're excluded there — Approved/Rejected
+    // still show them as history, which is genuinely useful.
+    const keys = visibleSourceKeys(ctx, type).filter((key) => status !== 'pending' || !!SOURCES[key].decide);
 
     const batches = await Promise.all(keys.map(async (key) => {
       const source = SOURCES[key];
@@ -686,6 +692,9 @@ class ApprovalService {
     for (const key of keys) byType[key] = { pending: 0, approved: 0, rejected: 0 };
 
     await Promise.all(keys.flatMap((key) => STATUSES.map(async (status) => {
+      // Mirrors list()'s exclusion — a source with no `decide` never belongs in
+      // the "Pending" total/badge, since nothing here can ever check it off.
+      if (status === 'pending' && !SOURCES[key].decide) return;
       const built = SOURCES[key].build(ctx, status);
       if (!built) return;
       const model = MODEL_FOR[key];

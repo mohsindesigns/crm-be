@@ -34,6 +34,16 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.CHAR(36),
       references: { model: 'clients', key: 'id' },
     },
+    // Optional — a staff-built form can be linked to an existing client so
+    // every new lead it captures is also emailed to that client (see
+    // LeadService#submitPublic). Distinct from `clientId` above: that field
+    // means "this client built the form themselves" and drives portal
+    // visibility/ownership, whereas this is purely a notification target and
+    // never grants the linked client portal access to the form or its leads.
+    notifyClientId: {
+      type: DataTypes.CHAR(36),
+      references: { model: 'clients', key: 'id' },
+    },
     name: {
       type: DataTypes.STRING(255),
       allowNull: false,
@@ -105,6 +115,7 @@ module.exports = (sequelize, DataTypes) => {
     LeadForm.belongsTo(db.Org, { foreignKey: 'orgId', as: 'org' });
     LeadForm.belongsTo(db.Project, { foreignKey: 'projectId', as: 'project' });
     LeadForm.belongsTo(db.Client, { foreignKey: 'clientId', as: 'client' });
+    LeadForm.belongsTo(db.Client, { foreignKey: 'notifyClientId', as: 'notifyClient' });
     LeadForm.belongsTo(db.User, { foreignKey: 'createdBy', as: 'creator' });
     LeadForm.belongsTo(db.Contact, { foreignKey: 'createdByContactId', as: 'creatorContact' });
     LeadForm.hasMany(db.Lead, { foreignKey: 'formId', as: 'leads' });
