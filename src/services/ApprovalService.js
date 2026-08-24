@@ -143,14 +143,19 @@ const SOURCES = {
         approved: TASK_STATUS.APPROVED,
         rejected: TASK_STATUS.REJECTED,
       }[status];
-      const where = { orgId: ctx.orgId, status: statusWhere };
-      if (!ctx.canSeeAllProjects) {
-        where[Op.or] = [
+      // Always scoped to the requesting user, admins included: a review is
+      // owed to a specific reviewer (or the assignee/creator tracking their own
+      // submission), not to "whichever admin happens to open this page" — with
+      // multiple admins, each should only see reviews actually theirs to make.
+      const where = {
+        orgId: ctx.orgId,
+        status: statusWhere,
+        [Op.or]: [
           { assigneeId: ctx.user.id },
           { reviewerId: ctx.user.id },
           { createdBy: ctx.user.id },
-        ];
-      }
+        ],
+      };
       return {
         where,
         include: [
@@ -364,14 +369,16 @@ const SOURCES = {
     canView: (ctx) => ctx.can('projects.read'),
     build(ctx, status) {
       // `superseded` is history behind a re-opened revision, not an outcome, so
-      // matching on the tab's own status is exactly right here.
-      const where = { status };
-      if (!ctx.canSeeAllProjects) {
-        where[Op.or] = [
+      // matching on the tab's own status is exactly right here. Always scoped
+      // to the requesting user (admins included) — reviewed by whoever's
+      // assigned to that project, or by whoever submitted it.
+      const where = {
+        status,
+        [Op.or]: [
           { submittedBy: ctx.user.id },
           { projectId: { [Op.in]: ctx.assignedProjectIds } },
-        ];
-      }
+        ],
+      };
       return {
         where,
         include: [
@@ -415,14 +422,17 @@ const SOURCES = {
     group: 'SEO',
     canView: (ctx) => ctx.can('projects.read'),
     build(ctx, status) {
-      const where = { status, isActive: true };
-      if (!ctx.canSeeAllProjects) {
-        where[Op.or] = [
+      // Always scoped to the requesting user (admins included) — see
+      // content_submission above for why.
+      const where = {
+        status,
+        isActive: true,
+        [Op.or]: [
           { submittedBy: ctx.user.id },
           { assignedWriterId: ctx.user.id },
           { projectId: { [Op.in]: ctx.assignedProjectIds } },
-        ];
-      }
+        ],
+      };
       return {
         where,
         include: [

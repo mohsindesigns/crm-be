@@ -41,6 +41,7 @@ const { v4: uuidv4 } = require('uuid');
 const { Op } = require('sequelize');
 const db = require('../models');
 const { INVOICE_STATUS } = require('../config/constants');
+const SubscriptionService = require('./SubscriptionService');
 const PortalNotificationService = require('./PortalNotificationService');
 const NotificationService = require('./NotificationService');
 
@@ -825,6 +826,11 @@ class StripeService {
         ? `${invoice.currency || ''} ${applied.toFixed(2)} paid by card via Stripe. Invoice marked paid automatically.`.trim()
         : `${invoice.currency || ''} ${applied.toFixed(2)} paid by card via Stripe. ${invoice.currency || ''} ${remaining.toFixed(2)} still outstanding — the invoice stays open.`.trim(),
     });
+
+    // A card payment is the one path where the client is sitting in front of the
+    // portal waiting for the subscription to come back on, so resync the
+    // entitlement here rather than leaving it to the 6-hourly sweep.
+    SubscriptionService.syncForInvoice(invoice.id).catch(() => {});
 
     return { ok: true, invoiceId: invoice.id, fullySettled, remaining };
   }

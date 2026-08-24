@@ -3,6 +3,7 @@ const { v4: uuidv4 } = require('uuid');
 const { Op } = require('sequelize');
 const db = require('../models');
 const { INVOICE_STATUS } = require('../config/constants');
+const SubscriptionService = require('./SubscriptionService');
 const PortalNotificationService = require('./PortalNotificationService');
 const EmailService = require('./EmailService');
 const { buildInvoicePdf } = require('./InvoicePdf');
@@ -787,6 +788,11 @@ class InvoiceService {
 
     const lines = (data.lines || []).map((l) => ({
       id: uuidv4(),
+      // Stamped per line, not just on the header, because merging two package
+      // sales onto one bill clears the header link (see _appendLinesToInvoice) —
+      // and SubscriptionService needs to know which subscription each line paid
+      // for long after that merge happened.
+      clientPackageId: l.clientPackageId || data.clientPackageId || null,
       description: l.description,
       qty: l.qty,
       unitPrice: l.unitPrice,
@@ -913,6 +919,12 @@ class InvoiceService {
         refId: invoice.id,
       });
     }
+
+    // Any status move can change whether a subscription is paid up — issuing the
+    // renewal, confirming it, or voiding it. Fire-and-forget: the entitlement is
+    // a derived convenience, and RetainerScheduler's sweep re-derives it anyway,
+    // so it must never be able to fail the status change itself.
+    SubscriptionService.syncForInvoice(invoice.id).catch(() => {});
 
     return invoice;
   }
@@ -1154,6 +1166,11 @@ class InvoiceService {
         refId: invoice.id,
       });
     }
+
+    // Reinstates (or, on a part payment, keeps suspended) any subscription this
+    // invoice bills for, so the client portal reflects the payment immediately
+    // instead of at the next scheduler pass.
+    SubscriptionService.syncForInvoice(invoice.id).catch(() => {});
 
     return payment;
   }

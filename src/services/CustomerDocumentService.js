@@ -5,6 +5,8 @@ const db = require('../models');
 const ClientService = require('./ClientService');
 const RetainerService = require('./RetainerService');
 const InvoiceService = require('./InvoiceService');
+const SubscriptionService = require('./SubscriptionService');
+const { billingLineLabel } = SubscriptionService;
 const EmailService = require('./EmailService');
 const { buildProjectName } = require('../utils/projectName');
 const { buildMergeTokens, renderTemplate, renderHtmlTemplate, ensureHtml, defaultServiceFragment, formatFeatures } = require('../utils/documentRenderer');
@@ -1093,6 +1095,17 @@ class CustomerDocumentService {
       }
     }
 
+    // Any subscription on this deal starts gated on payment. A converted
+    // quotation raises its invoice as a DRAFT for manual-payment clients, so the
+    // hosting/domain the client just agreed to must not read as live in their
+    // portal until that invoice is actually settled — which is exactly what
+    // syncEntitlement derives from the invoices raised in the loop above.
+    // Fire-and-forget: the entitlement is re-derived on every payment and on
+    // every RetainerScheduler pass, so it must never fail the conversion.
+    for (const cp of clientPackages) {
+      if (cp?.id) SubscriptionService.syncEntitlement(cp.id).catch(() => {});
+    }
+
     // Every line merged onto one invoice, so this is normally a single row.
     // Looked up rather than returned from the billing calls because
     // RetainerService.autoCreate's return value is the retainer, and callers
@@ -1171,6 +1184,11 @@ class CustomerDocumentService {
         label: describe(pkg, [...new Set(resolved.flatMap((r) => r.coveredNames))]),
         price: baseTotal,
         isRecurring: !!pkg?.isRecurring || resolved.some(recurs),
+        // A resold subscription (hosting, domain, mailbox) rather than work the
+        // team performs — carried through so the invoice line says so, and so
+        // the sale it converts into is entitlement-gated on payment.
+        isSubscription: !!pkg?.isSubscription,
+        vendor: pkg?.vendor || null,
         billingCycle: pkg?.billingCycle,
       }];
     } else {
@@ -1180,6 +1198,8 @@ class CustomerDocumentService {
         label: describe(r.pkg, r.coveredNames),
         price: r.price != null ? r.price : (r.pkg?.price != null ? Number(r.pkg.price) : 0),
         isRecurring: recurs(r),
+        isSubscription: !!r.pkg?.isSubscription,
+        vendor: r.pkg?.vendor || null,
         billingCycle: r.pkg?.billingCycle,
       }));
     }
@@ -1204,8 +1224,11 @@ class CustomerDocumentService {
         chargedPrice: charged[i],
         // Spelled out on the invoice line itself — an invoice that lists three
         // packages has to say which of them renews and which was a one-off, or
-        // the client can't tell what next month's bill looks like.
-        lineDescription: `${item.label} (${item.isRecurring ? `Recurring · ${cycle}` : 'One-time'})`,
+        // the client can't tell what next month's bill looks like. Subscriptions
+        // (resold hosting/domains/licences) are called out separately from
+        // recurring agency work, and name their vendor, because they're the
+        // lines whose access actually switches off when the invoice isn't paid.
+        lineDescription: billingLineLabel(item, cycle),
       };
     });
   }

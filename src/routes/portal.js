@@ -12,6 +12,7 @@ const MediaService = require('../services/MediaService');
 const EmailService = require('../services/EmailService');
 const InvoiceService = require('../services/InvoiceService');
 const StripeService = require('../services/StripeService');
+const SubscriptionService = require('../services/SubscriptionService');
 
 const uploadProof = multer({
   storage: multer.memoryStorage(),
@@ -252,6 +253,40 @@ router.post('/projects/:id/reject', async (req, res, next) => {
     });
 
     res.json(result);
+  } catch (e) { next(e); }
+});
+
+// ─── Subscriptions ────────────────────────────────────────────────────────────
+
+/**
+ * What this client subscribes to — the resold, recurring things they've bought
+ * (hosting, domains, mailboxes), with the entitlement that says whether each is
+ * currently theirs to use.
+ *
+ * The entitlement is recomputed here before the list is built rather than served
+ * from whatever was last written. A subscription's invoice can go past due at any
+ * moment, and this is the one place the client actually looks — so a stale
+ * "active" here is precisely the failure worth ruling out, and the background
+ * sweep (RetainerScheduler) may not have ticked since it lapsed.
+ *
+ * A suspended row still returns its full details plus the invoice that unblocks
+ * it: the client needs to know what lapsed and how to fix it, so hiding it would
+ * make the portal less useful, not more secure. Nothing here grants access to
+ * anything — the entitlement is the gate the UI renders against.
+ */
+router.get('/subscriptions', async (req, res, next) => {
+  try {
+    const sales = await db.ClientPackage.findAll({
+      where: { clientId: req.portalClientId, orgId: req.orgId },
+      attributes: ['id'],
+      include: [{
+        model: db.Package, as: 'package', attributes: [], required: true, where: { isSubscription: true },
+      }],
+    });
+    for (const sale of sales) {
+      await SubscriptionService.syncEntitlement(sale.id).catch(() => {});
+    }
+    res.json(await SubscriptionService.listForClient(req.portalClientId, req.orgId));
   } catch (e) { next(e); }
 });
 

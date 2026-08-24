@@ -10,21 +10,52 @@ const { isTruthy } = require('../services/SoftDeleteService');
 
 router.use(auth, tenancy);
 
+/**
+ * Every recurring billing line, of both kinds, tagged so the caller can split
+ * them: `kind: 'subscription'` for resold hosting/domains/licences
+ * (Package.isSubscription), `kind: 'service'` for the agency's own retained
+ * work. They deliberately share this one endpoint and one table — a subscription
+ * IS a retainer, it just bills for something bought in rather than delivered —
+ * so the Subscriptions tab is a view over this list, not a second source of truth.
+ *
+ * `?kind=subscription|service` filters server-side for callers that only want one.
+ */
 router.get('/', rbac('billing.read'), async (req, res, next) => {
   try {
+    const packageAttrs = ['id', 'name', 'isSubscription', 'vendor', 'billingCycle'];
     const retainers = await Retainer.findAll({
       where: { orgId: req.orgId, ...(isTruthy(req.query.includeInactive) ? {} : { isActive: true }) },
       include: [
         { model: Client, as: 'client', attributes: ['id', 'name'] },
-        { model: Package, as: 'package', attributes: ['id', 'name'], required: false },
+        { model: Package, as: 'package', attributes: packageAttrs, required: false },
         {
           model: ClientPackage, as: 'clientPackage', required: false,
-          include: [{ model: Package, as: 'package', attributes: ['id', 'name'], required: false }],
+          // entitlement is what makes a suspended subscription visible on the
+          // staff-side list, not just in the client's portal.
+          attributes: ['id', 'packageId', 'entitlement', 'entitlementReason', 'status', 'startDate', 'endDate'],
+          include: [{ model: Package, as: 'package', attributes: packageAttrs, required: false }],
         },
       ],
       order: [['createdAt', 'DESC']],
     });
-    res.json(retainers);
+
+    // Prefer the direct packageId association; fall back to clientPackage->package
+    // for legacy rows created before Retainer.packageId was populated on sale.
+    const rows = retainers.map((r) => {
+      const plain = r.toJSON();
+      const pkg = plain.package || plain.clientPackage?.package || null;
+      plain.kind = pkg?.isSubscription ? 'subscription' : 'service';
+      plain.vendor = pkg?.vendor || null;
+      // Only subscriptions are payment-gated; a service retainer is always usable.
+      plain.entitlement = pkg?.isSubscription
+        ? (plain.clientPackage?.entitlement || 'active')
+        : 'active';
+      plain.entitlementReason = pkg?.isSubscription ? (plain.clientPackage?.entitlementReason || null) : null;
+      return plain;
+    });
+
+    const kind = String(req.query.kind || '').trim();
+    res.json(kind === 'subscription' || kind === 'service' ? rows.filter((r) => r.kind === kind) : rows);
   } catch (e) { next(e); }
 });
 
@@ -41,10 +72,10 @@ router.get('/summary', rbac('billing.read'), async (req, res, next) => {
     const active = await Retainer.findAll({
       where: { orgId: req.orgId, status: 'active', isActive: true },
       include: [
-        { model: Package, as: 'package', attributes: ['serviceTypeKey', 'services'], required: false },
+        { model: Package, as: 'package', attributes: ['serviceTypeKey', 'services', 'isSubscription'], required: false },
         {
           model: ClientPackage, as: 'clientPackage', required: false,
-          include: [{ model: Package, as: 'package', attributes: ['serviceTypeKey', 'services'], required: false }],
+          include: [{ model: Package, as: 'package', attributes: ['serviceTypeKey', 'services', 'isSubscription'], required: false }],
         },
         { model: Project, as: 'project', attributes: ['serviceTypeKey'], required: false },
       ],
@@ -52,6 +83,11 @@ router.get('/summary', rbac('billing.read'), async (req, res, next) => {
 
     const buckets = new Map(); // `${serviceTypeKey}|${currency}` -> total
     const grand = new Map();   // currency -> total
+    // `${kind}|${currency}` -> total. Recurring revenue split by what it's for:
+    // resold subscriptions vs. the agency's own retained work. Kept separate from
+    // byService because a subscription's service type ("hosting") says nothing
+    // about whether it's bought in — that's the split the Subscriptions tab needs.
+    const kinds = new Map();
 
     for (const r of active) {
       let serviceTypeKey = 'other';
@@ -73,6 +109,9 @@ router.get('/summary', rbac('billing.read'), async (req, res, next) => {
       const key = `${serviceTypeKey}|${currency}`;
       buckets.set(key, (buckets.get(key) || 0) + amount);
       grand.set(currency, (grand.get(currency) || 0) + amount);
+
+      const kindKey = `${pkg?.isSubscription ? 'subscription' : 'service'}|${currency}`;
+      kinds.set(kindKey, (kinds.get(kindKey) || 0) + amount);
     }
 
     const byService = Array.from(buckets.entries()).map(([key, total]) => {
@@ -81,7 +120,12 @@ router.get('/summary', rbac('billing.read'), async (req, res, next) => {
     });
     const grandTotal = Array.from(grand.entries()).map(([currency, total]) => ({ currency, total: Math.round(total * 100) / 100 }));
 
-    res.json({ byService, grandTotal });
+    const byKind = Array.from(kinds.entries()).map(([key, total]) => {
+      const [kind, currency] = key.split('|');
+      return { kind, currency, total: Math.round(total * 100) / 100 };
+    });
+
+    res.json({ byService, byKind, grandTotal });
   } catch (e) { next(e); }
 });
 

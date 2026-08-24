@@ -31,7 +31,10 @@ router.patch('/:id/billing-mode', adminOnly, rbac('clients.update'), (req, res, 
 // rule as billing-mode — it's a money decision, not a project-level one.
 router.patch('/:id/card-fee', adminOnly, rbac('clients.update'), (req, res, next) => ClientController.setChargeCardFee(req, res, next));
 
+router.get('/:id/timeline', rbac('clients.read'), (req, res, next) => ClientController.getTimeline(req, res, next));
+
 router.get('/:id/packages', rbac('clients.read'), (req, res, next) => ClientController.listSoldPackages(req, res, next));
+router.get('/:id/subscriptions', rbac('clients.read'), (req, res, next) => ClientController.listSubscriptions(req, res, next));
 router.get('/:id/sellable-packages', rbac('projects.create'), (req, res, next) => ClientController.listSellablePackages(req, res, next));
 router.post('/:id/sell-package', rbac('projects.create'), (req, res, next) => ClientController.sellPackage(req, res, next));
 router.post('/:id/sell-packages', rbac('projects.create'), (req, res, next) => ClientController.sellPackages(req, res, next));

@@ -38,6 +38,7 @@ const activityLogsRouter = require('./routes/activityLogs');
 const requirementFormsRouter = require('./routes/requirementForms');
 const clientRequestsRouter = require('./routes/clientRequests');
 const approvalsRouter = require('./routes/approvals');
+const exportsRouter = require('./routes/exports');
 const publicClientRequestsRouter = require('./routes/publicClientRequests');
 const errorHandler = require('./middleware/errorHandler');
 const activityLogger = require('./middleware/activityLogger');
@@ -150,6 +151,7 @@ app.use('/api/requirement-forms', requirementFormsRouter);
 app.use('/api/projects/:projectId/client-requests', clientRequestsRouter);
 app.use('/api/approvals', approvalsRouter);
 app.use('/api/public/client-requests', publicClientRequestsRouter);
+app.use('/api/exports', exportsRouter);
 
 // 404
 app.use((req, res) => res.status(404).json({ message: 'Not found.' }));
@@ -292,6 +294,7 @@ app.schemaReady = (async () => {
     await db.Project.ensureSchema();       // adds clientPackageId — depends on client_packages
     await db.Retainer.ensureSchema();      // adds projectId + clientPackageId
     await db.Invoice.ensureSchema();       // adds clientPackageId, retainerId — depends on client_packages/retainers
+    await db.InvoiceLine.ensureSchema();   // adds per-line clientPackageId — depends on client_packages
     // Hard backstop against duplicate retainer billing: if the invoicing scheduler
     // ever runs twice around the same cycle (a restart re-firing its immediate
     // on-boot pass, or more than one server process each running it), this stops a
@@ -361,6 +364,7 @@ app.schemaReady = (async () => {
     await db.ActivityLog.ensureSchema(); // new table; Activity Logs sidebar page — depends on orgs/users
     await db.RequirementFormTemplate.ensureSchema(); // new table; reusable client requirement forms
     await db.ClientRequest.ensureSchema();           // new table; depends on requirement_form_templates/projects/clients/contacts
+    await db.ExportTemplate.ensureSchema();          // new table; saved column sets for Admin → Export Data
   } catch (err) {
     console.error('[Schema] ensureSchema failed:', err.message);
   }

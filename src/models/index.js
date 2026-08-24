@@ -85,6 +85,7 @@ const modelFiles = [
   'ActivityLog',
   'RequirementFormTemplate',
   'ClientRequest',
+  'ExportTemplate',
 ];
 
 modelFiles.forEach((name) => {

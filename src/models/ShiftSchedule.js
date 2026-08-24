@@ -1,5 +1,5 @@
 const { v4: uuidv4 } = require('uuid');
-const { ensureColumns } = require('../utils/schemaSync');
+const { ensureColumns, ensureColumnType } = require('../utils/schemaSync');
 
 // A named set of shift timings that applies for a date range — modelled on
 // TaxYear, which solves the same shape of problem.
@@ -33,9 +33,12 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.DATEONLY,
       allowNull: false,
     },
+    // Nullable: an open-ended schedule ("effective from this date on") stays in
+    // effect indefinitely, with no auto-revert date. Only schedules that need to
+    // auto-expire (e.g. Ramadan) set this.
     endDate: {
       type: DataTypes.DATEONLY,
-      allowNull: false,
+      allowNull: true,
     },
     // Asia/Karachi wall-clock "HH:MM", 24h. End ≤ start wraps past midnight,
     // matching PayrollSettings.
@@ -77,7 +80,10 @@ module.exports = (sequelize, DataTypes) => {
     ShiftSchedule.belongsTo(db.Org, { foreignKey: 'orgId', as: 'org' });
   };
 
-  ShiftSchedule.ensureSchema = () => ensureColumns(ShiftSchedule);
+  ShiftSchedule.ensureSchema = async () => {
+    await ensureColumns(ShiftSchedule);
+    await ensureColumnType(ShiftSchedule, 'endDate');
+  };
 
   return ShiftSchedule;
 };

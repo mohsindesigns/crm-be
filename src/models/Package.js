@@ -44,6 +44,25 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.BOOLEAN,
       defaultValue: false,
     },
+    // Subscription vs. delivered service. A subscription is a recurring line the
+    // agency resells rather than work the team performs — hosting, domains, SSL,
+    // mailbox seats. It bills through exactly the same
+    // ClientPackage -> Retainer -> Invoice chain as any other recurring package;
+    // the flag only decides how it's grouped in the UI and that the client's
+    // access to it is gated on payment (see ClientPackage.entitlement).
+    // Implies isRecurring in practice, but the two are stored separately so an
+    // annual domain renewal and a monthly retainer can coexist.
+    isSubscription: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
+    // Who the subscription is actually bought FROM ("Hostinger", "Google
+    // Workspace", "Namecheap") — shown on the Subscriptions tab so renewals can
+    // be reconciled against the supplier's own bill. Free text, not a lookup;
+    // meaningless on non-subscription packages.
+    vendor: {
+      type: DataTypes.STRING(255),
+    },
     billingCycle: {
       type: DataTypes.ENUM('monthly', 'quarterly', 'annual'),
       defaultValue: 'monthly',

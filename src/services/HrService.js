@@ -664,13 +664,18 @@ async function listShiftSchedules(orgId, { includeArchived = false } = {}) {
   });
 }
 
+// `endDate` is optional — an open-ended schedule has no auto-revert date and
+// stays in effect indefinitely once its start date arrives.
 function assertScheduleRange(startDate, endDate) {
   const start = startDate ? String(startDate).slice(0, 10) : '';
-  const end = endDate ? String(endDate).slice(0, 10) : '';
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end)) {
-    throw Object.assign(new Error('Valid start and end dates (YYYY-MM-DD) are required.'), { status: 400 });
+  const end = endDate ? String(endDate).slice(0, 10) : null;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(start)) {
+    throw Object.assign(new Error('A valid start date (YYYY-MM-DD) is required.'), { status: 400 });
   }
-  if (end < start) {
+  if (end && !/^\d{4}-\d{2}-\d{2}$/.test(end)) {
+    throw Object.assign(new Error('The end date must be a valid date (YYYY-MM-DD).'), { status: 400 });
+  }
+  if (end && end < start) {
     throw Object.assign(new Error('The schedule end date cannot be before its start date.'), { status: 400 });
   }
   return { start, end };
@@ -696,10 +701,10 @@ async function updateShiftSchedule(id, orgId, updates) {
   const schedule = await ShiftSchedule.findOne({ where: { id, orgId } });
   if (!schedule) throw Object.assign(new Error('Shift schedule not found.'), { status: 404 });
   const patch = { ...updates };
-  if (patch.startDate || patch.endDate) {
+  if (patch.startDate !== undefined || patch.endDate !== undefined) {
     const { start, end } = assertScheduleRange(
-      patch.startDate || schedule.startDate,
-      patch.endDate || schedule.endDate,
+      patch.startDate !== undefined ? patch.startDate : schedule.startDate,
+      patch.endDate !== undefined ? patch.endDate : schedule.endDate,
     );
     patch.startDate = start;
     patch.endDate = end;
@@ -757,7 +762,8 @@ async function resolveShiftTimings(orgId, dateStr, settings, worker) {
       isActive: true,
       isArchived: false,
       startDate: { [Op.lte]: day },
-      endDate: { [Op.gte]: day },
+      // Open-ended (endDate null) schedules never expire.
+      [Op.or]: [{ endDate: null }, { endDate: { [Op.gte]: day } }],
     },
     // Most recently starting schedule wins if two somehow overlap.
     order: [['startDate', 'DESC']],

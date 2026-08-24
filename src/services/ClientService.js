@@ -5,6 +5,8 @@ const { v4: uuidv4 } = require('uuid');
 const { buildProjectName } = require('../utils/projectName');
 const RetainerService = require('./RetainerService');
 const InvoiceService = require('./InvoiceService');
+const SubscriptionService = require('./SubscriptionService');
+const { billingLineLabel } = SubscriptionService;
 const { billingCompanyFor } = require('./letterhead');
 const { isTruthy } = require('./SoftDeleteService');
 
@@ -370,14 +372,40 @@ class ClientService {
 
   async listSoldPackages(clientId, orgId) {
     await this.findById(clientId, orgId);
+
+    // Bring every subscription's entitlement up to date before listing. The
+    // background sweep (RetainerScheduler, 6-hourly) is the backstop; this is the
+    // screen where someone actually asks "is their hosting still live?", so it
+    // shouldn't be able to answer with a value that lapsed four hours ago.
+    // Never allowed to break the listing — a stale badge beats a 500.
+    try {
+      const subscriptions = await db.ClientPackage.findAll({
+        where: { clientId, orgId },
+        attributes: ['id'],
+        include: [{
+          model: db.Package, as: 'package', attributes: [], required: true, where: { isSubscription: true },
+        }],
+      });
+      for (const sale of subscriptions) await SubscriptionService.syncEntitlement(sale.id);
+    } catch (err) {
+      console.error('[ClientService] Subscription entitlement refresh failed:', err.message);
+    }
+
     return db.ClientPackage.findAll({
       where: { clientId, orgId },
       include: [
         // skipProjectCreation so the UI can explain an empty workflow list.
         // Billing-only packages (add-ons, hosting) legitimately spawn none, and
         // "No workflows." on its own reads as something having gone wrong.
-        { model: db.Package, as: 'package', attributes: ['id', 'name', 'tier', 'skipProjectCreation'] },
+        // isSubscription/vendor are what let the client page split this one list
+        // into "Packages" and "Subscriptions" without a second request.
+        { model: db.Package, as: 'package', attributes: ['id', 'name', 'tier', 'skipProjectCreation', 'isSubscription', 'vendor', 'billingCycle'] },
         { model: db.Project, as: 'workflowProjects', attributes: ['id', 'name', 'status', 'currentStageKey'] },
+        // The live retainer supplies the real next renewal date for a
+        // subscription; a cancelled/deactivated one keeps a stale
+        // nextInvoiceDate that would read as "renews on…" for something that
+        // will never bill again, so the caller filters on status/isActive.
+        { model: db.Retainer, as: 'retainers', attributes: ['id', 'status', 'isActive', 'nextInvoiceDate', 'cycle'], required: false },
       ],
       order: [['createdAt', 'DESC']],
     });
@@ -509,6 +537,8 @@ class ClientService {
           currentStageKey: firstStage.key,
           status: 'active',
           startDate,
+          deliveryDate: data.deliveryDate || null,
+          description: data.description || null,
           isRecurring: !!template.isRecurring,
           createdBy: userId,
         }, { transaction: t });
@@ -563,6 +593,14 @@ class ClientService {
           cycle,
           startDate,
           note: `Retainer for package: ${pkg.name}`,
+          // Subscriptions (resold hosting/domains/licences) get the explicit
+          // "Subscription · cycle · vendor" line the rest of the app labels them
+          // with, so the client can tell on the invoice which line is the thing
+          // that switches off if they don't pay it. Left undefined for ordinary
+          // recurring packages so their invoice lines read exactly as before.
+          lineDescription: pkg.isSubscription
+            ? billingLineLabel({ label: pkg.name, isSubscription: true, vendor: pkg.vendor }, cycle)
+            : undefined,
           // Multiple packages sold to one client share a single first-cycle invoice.
           mergeWithOpenInvoice: true,
         });
@@ -647,6 +685,12 @@ class ClientService {
       }
     }
 
+    // A subscription starts life gated on its first invoice: selling hosting
+    // doesn't make it usable, paying for it does. Derived from the invoice(s)
+    // just raised above — see SubscriptionService. No-ops for every other kind of
+    // package, and never allowed to fail the sale.
+    SubscriptionService.syncEntitlement(clientPackage.id).catch(() => {});
+
     // Ensure client Messages room + sync any assignees already on sibling projects.
     try {
       const ChatService = require('./ChatService');
@@ -724,8 +768,11 @@ class ClientService {
           discountCycles: entry.discountCycles,
           installmentPlan: entry.installmentPlan,
           // Shared across the sale — this is what makes the line items land on
-          // one invoice rather than several.
+          // one invoice rather than several, and every spawned project carry
+          // the same delivery target/notes from the sale.
           startDate: data.startDate,
+          deliveryDate: data.deliveryDate,
+          description: data.description,
         }, userId);
         sold.push(result);
       } catch (err) {
@@ -811,6 +858,168 @@ class ClientService {
       retainerUpdated = count > 0;
     });
     return { clientPackage, retainerUpdated };
+  }
+
+  // A single chronological feed for this client, merging two existing audit
+  // trails rather than introducing a new one: DocumentEvent (quotation/
+  // proposal/agreement sent → viewed → approved/rejected, and the moment one
+  // converts) and ProjectEvent (the project's own stage history, same trail
+  // the project Activity tab reads — see ProjectService.getTimeline). Mirrors
+  // that method's shape so the frontend can render both with similar code.
+  // One card per project/document/invoice, each shaped as a step row — the
+  // same stage-progress pill bar the project detail page itself renders (see
+  // ProjectService.getTimeline + that page's stage pills), just one such row
+  // per project this client has, plus an analogous row for each quotation/
+  // proposal/agreement (Created → Sent → Viewed → decision) and each invoice
+  // (Created → Sent → Paid) instead of workflow stages. Cards are sorted by
+  // whichever had activity most recently.
+  async getTimeline(clientId, orgId, { includeDocuments = true, includeInvoices = true } = {}) {
+    await this.findById(clientId, orgId);
+
+    const [documents, projects, invoices] = await Promise.all([
+      includeDocuments ? db.CustomerDocument.findAll({
+        where: { orgId, [Op.or]: [{ clientId }, { convertedClientId: clientId }] },
+        include: [{ model: db.DocumentEvent, as: 'events', separate: true, order: [['createdAt', 'ASC']] }],
+      }) : [],
+      db.Project.findAll({ where: { orgId, clientId } }),
+      includeInvoices ? db.Invoice.findAll({
+        where: { orgId, clientId },
+        include: [{ model: db.Payment, as: 'payments', attributes: ['id', 'paidAt', 'amount'] }],
+      }) : [],
+    ]);
+
+    const projectIds = projects.map((p) => p.id);
+    const templateIds = [...new Set(projects.map((p) => p.workflowTemplateId).filter(Boolean))];
+    const [projectEvents, stages] = await Promise.all([
+      projectIds.length ? db.ProjectEvent.findAll({
+        where: { projectId: { [Op.in]: projectIds } },
+        order: [['createdAt', 'ASC']],
+      }) : [],
+      templateIds.length ? db.Stage.findAll({
+        where: { templateId: { [Op.in]: templateIds } },
+        order: [['orderIndex', 'ASC']],
+      }) : [],
+    ]);
+
+    const eventsByProject = new Map();
+    for (const ev of projectEvents) {
+      if (!eventsByProject.has(ev.projectId)) eventsByProject.set(ev.projectId, []);
+      eventsByProject.get(ev.projectId).push(ev);
+    }
+    const stagesByTemplate = new Map();
+    for (const s of stages) {
+      if (!stagesByTemplate.has(s.templateId)) stagesByTemplate.set(s.templateId, []);
+      stagesByTemplate.get(s.templateId).push(s);
+    }
+
+    const projectItems = projects.map((project) => {
+      const projStages = stagesByTemplate.get(project.workflowTemplateId) || [];
+      const pEvents = eventsByProject.get(project.id) || [];
+      const currentStageIdx = projStages.findIndex((s) => s.key === project.currentStageKey);
+      const steps = projStages.map((stage, idx) => {
+        // A completed project's final stage is done, not "in progress" —
+        // mirrors the project page's own pill logic exactly.
+        const done = idx < currentStageIdx || (idx === currentStageIdx && project.status === 'completed');
+        const current = idx === currentStageIdx && project.status !== 'completed';
+        const entered = [...pEvents].reverse().find((ev) => ev.toStageKey === stage.key);
+        return { key: stage.key, name: stage.name, done, current, at: entered?.createdAt || null };
+      });
+      const lastActivityAt = pEvents.length ? pEvents[pEvents.length - 1].createdAt : project.createdAt;
+      return {
+        id: `proj-${project.id}`,
+        kind: 'project',
+        title: project.name,
+        subtitle: project.serviceTypeKey,
+        status: project.status,
+        href: `/projects/${project.id}`,
+        lastActivityAt,
+        steps,
+      };
+    });
+
+    const documentItems = documents.map((doc) => {
+      const byEvent = {};
+      for (const ev of (doc.events || [])) if (!byEvent[ev.event]) byEvent[ev.event] = ev;
+      const decisionDone = ['approved', 'rejected', 'expired'].includes(doc.status);
+      const decisionName = doc.status === 'rejected' ? 'Rejected' : doc.status === 'expired' ? 'Expired' : 'Approved';
+      const rawSteps = [
+        { key: 'created', name: 'Created', at: byEvent.created?.createdAt || doc.createdAt },
+        { key: 'sent', name: 'Sent', at: byEvent.sent?.createdAt || doc.sentAt || null },
+        { key: 'viewed', name: 'Viewed', at: byEvent.viewed?.createdAt || doc.viewedAt || null },
+        {
+          key: 'decision',
+          name: decisionName,
+          at: decisionDone ? (byEvent[doc.status]?.createdAt || doc.respondedAt || doc.updatedAt) : null,
+          tone: doc.status === 'rejected' ? 'negative' : doc.status === 'expired' ? 'neutral' : 'positive',
+        },
+      ];
+      let firstPending = -1;
+      const steps = rawSteps.map((s, idx) => {
+        const done = !!s.at;
+        if (!done && firstPending === -1) firstPending = idx;
+        return { key: s.key, name: s.name, done, at: s.at, tone: s.tone || null };
+      }).map((s, idx) => ({ ...s, current: idx === firstPending }));
+      const lastActivityAt = [...steps].reverse().find((s) => s.at)?.at || doc.createdAt;
+      return {
+        id: `doc-${doc.id}`,
+        kind: 'document',
+        title: `${doc.type.charAt(0).toUpperCase()}${doc.type.slice(1)} ${doc.number || ''}`.trim(),
+        subtitle: doc.businessName || doc.prospectName || null,
+        status: doc.status,
+        href: `/documents/${doc.id}`,
+        lastActivityAt,
+        steps,
+      };
+    });
+
+    // Invoices have no per-status audit trail the way documents/projects do
+    // (no InvoiceEvent), so "Sent" uses `issuedAt` — the invoice date, set once
+    // when it's raised — as the best available stand-in for when it went out,
+    // and "Paid" uses the latest payment's `paidAt`. `void` and the two
+    // not-yet-paid-but-not-fresh states (`overdue`, `payment_review`) relabel
+    // the final step instead of forcing them through a generic "Paid".
+    const invoiceItems = invoices.map((inv) => {
+      const paidTimestamps = (inv.payments || []).map((p) => p.paidAt).filter(Boolean).sort();
+      const lastPaymentAt = paidTimestamps[paidTimestamps.length - 1] || null;
+      const finalName = inv.status === 'void' ? 'Void'
+        : inv.status === 'overdue' ? 'Overdue'
+        : inv.status === 'payment_review' ? 'Payment Review'
+        : 'Paid';
+      const finalDone = inv.status === 'paid' || inv.status === 'void';
+      const finalAt = inv.status === 'paid' ? (lastPaymentAt || inv.updatedAt)
+        : inv.status === 'void' ? inv.updatedAt
+        : null;
+      const finalTone = inv.status === 'paid' ? 'positive'
+        : inv.status === 'void' ? 'neutral'
+        : inv.status === 'overdue' ? 'negative'
+        : null;
+      const rawSteps = [
+        { key: 'created', name: 'Created', at: inv.createdAt },
+        { key: 'sent', name: 'Sent', at: inv.status !== 'draft' ? (inv.issuedAt || inv.createdAt) : null },
+        { key: 'paid', name: finalName, at: finalAt, tone: finalTone },
+      ];
+      let firstPending = -1;
+      const steps = rawSteps.map((s, idx) => {
+        const done = !!s.at;
+        if (!done && firstPending === -1) firstPending = idx;
+        return { key: s.key, name: s.name, done, at: s.at, tone: s.tone || null };
+      }).map((s, idx) => ({ ...s, current: idx === firstPending }));
+      const lastActivityAt = [...steps].reverse().find((s) => s.at)?.at || inv.createdAt;
+      return {
+        id: `inv-${inv.id}`,
+        kind: 'invoice',
+        title: `Invoice ${inv.number}`,
+        subtitle: inv.total ? `${inv.currency || ''} ${Number(inv.total).toLocaleString()}`.trim() : null,
+        status: inv.status,
+        href: `/invoices/${inv.id}`,
+        lastActivityAt,
+        steps,
+      };
+    });
+
+    const items = [...projectItems, ...documentItems, ...invoiceItems]
+      .sort((a, b) => new Date(b.lastActivityAt) - new Date(a.lastActivityAt));
+    return { items };
   }
 }
 

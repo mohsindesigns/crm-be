@@ -34,6 +34,25 @@ function describe(method, resource) {
 }
 
 /**
+ * Admin → Export Data posts to `/api/exports/<dataset>/csv` (a POST precisely so
+ * that pulling everyone's bank details lands here — see routes/exports.js). The
+ * generic rules above would file that as "Created Csv", which tells a reader
+ * nothing; this names the dataset instead. Left as action 'other' rather than a
+ * new ENUM member — widening the ENUM would need an ensureColumnType pass for
+ * one cosmetic value.
+ */
+function exportEntry(apiPath) {
+  const match = apiPath.match(/^\/api\/exports\/([^/]+)\/csv$/);
+  if (!match) return null;
+  const dataset = match[1];
+  return {
+    resource: dataset,
+    action: 'other',
+    description: `Exported ${dataset.replace(/-/g, ' ')} to CSV`,
+  };
+}
+
+/**
  * Generic, best-effort audit trail: records every mutating (POST/PUT/PATCH/
  * DELETE) authenticated API call after it completes. Mounted once at the top
  * of the middleware chain (before the routers), it relies on `res.on('finish')`
@@ -59,6 +78,7 @@ function activityLogger(req, res, next) {
       const mountResource = mountMatch ? mountMatch[1] : null;
       if (!mountResource || SKIP_RESOURCES.has(mountResource)) return;
       const resource = resourceFromPath(apiPath) || mountResource;
+      const special = exportEntry(apiPath);
 
       ActivityLog.create({
         orgId: req.orgId,
@@ -66,9 +86,9 @@ function activityLogger(req, res, next) {
         actorName: req.user.name,
         method: req.method,
         path: apiPath,
-        resource,
-        action: VERB_BY_METHOD[req.method] || 'other',
-        description: describe(req.method, resource),
+        resource: special ? special.resource : resource,
+        action: special ? special.action : (VERB_BY_METHOD[req.method] || 'other'),
+        description: special ? special.description : describe(req.method, resource),
         statusCode: res.statusCode,
         ip: req.ip,
       }).catch(() => {});

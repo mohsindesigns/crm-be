@@ -70,6 +70,26 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.ENUM('active', 'pending', 'paused', 'completed', 'cancelled'),
       defaultValue: 'active',
     },
+    // Whether the client may actually USE what they bought right now — distinct
+    // from `status` above, which is where the SALE stands. Subscriptions
+    // (Package.isSubscription: hosting, domains, mailboxes) are gated on
+    // payment: an unpaid or overdue subscription invoice suspends the
+    // entitlement, and the client portal shows the subscription as suspended
+    // with a "pay now" route back rather than as a live service.
+    //
+    // Non-subscription packages are always left 'active' — agency work isn't
+    // switched off mid-cycle by this flag. Recomputed from the subscription's
+    // own invoices by SubscriptionService.syncEntitlement (on payment, on
+    // status change, and on every RetainerScheduler pass), never hand-edited.
+    entitlement: {
+      type: DataTypes.ENUM('active', 'pending_payment', 'suspended', 'cancelled'),
+      defaultValue: 'active',
+    },
+    // Human-readable "why" behind the entitlement above, shown to staff and in
+    // the client portal ("Invoice INV-0042 is overdue"). Null when active.
+    entitlementReason: {
+      type: DataTypes.STRING(255),
+    },
     startDate: {
       type: DataTypes.DATEONLY,
     },
