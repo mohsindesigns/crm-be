@@ -562,6 +562,167 @@ async function exportKeywordSummary(orgId, format, ids, filters = {}, letterhead
   }
 }
 
+// ─── Backlinks summary ──────────────────────────────────────────────────────
+//
+// One row per (project, link builder) pair: that builder's link count for the
+// selected day next to the project's overall link health (total / indexed /
+// non-indexed / duplicate), so a PM can see both "did today's quota get hit"
+// and "how healthy is this project's link profile" without opening every
+// project individually. Mirrors getKeywordSummary's project/client scoping
+// (backlinks, like keywords, is an SEO-only sheet), plus a date filter —
+// defaulting to today, same as getMembersOverview — since "links made in the
+// day" is inherently date-scoped in a way a keyword count isn't.
+async function getBacklinkSummary(orgId, filters = {}) {
+  const page = Math.max(1, parseInt(filters.page, 10) || 1);
+  const limit = Math.min(100, parseInt(filters.limit, 10) || 25);
+  const offset = (page - 1) * limit;
+
+  const { from, to } = resolveRange(filters.date, filters.date);
+
+  const projectWhere = { orgId, serviceTypeKey: 'seo' };
+  if (filters.projectId) projectWhere.id = filters.projectId;
+  if (filters.clientId) projectWhere.clientId = filters.clientId;
+
+  const projects = await Project.findAll({
+    where: projectWhere,
+    include: [{ model: Client, as: 'client', attributes: ['id', 'name'] }],
+    attributes: ['id', 'name', 'startDate', 'clientId'],
+  });
+  if (!projects.length) {
+    return { data: [], total: 0, page, totalPages: 1, limit, from: from.toISOString(), to: to.toISOString() };
+  }
+  const projectIds = projects.map((p) => p.id);
+  const projectById = new Map(projects.map((p) => [p.id, p]));
+
+  const backlinks = await Backlink.findAll({
+    where: { projectId: { [Op.in]: projectIds }, isActive: true },
+    attributes: ['id', 'projectId', 'assignedWriterId', 'sourceUrl', 'isIndexed', 'createdAt'],
+  });
+
+  // Project-wide totals — independent of link builder and of the date filter.
+  // "Duplicate" mirrors the exact rule the project's own Backlinks tab uses
+  // (projects/[id]/page.tsx): a link is a duplicate when its sourceUrl
+  // (trimmed, lowercased) appears more than once within the project.
+  const byProject = new Map();
+  for (const bl of backlinks) {
+    if (!byProject.has(bl.projectId)) byProject.set(bl.projectId, []);
+    byProject.get(bl.projectId).push(bl);
+  }
+  const statsByProject = {};
+  for (const [projectId, rows] of byProject) {
+    const urlCounts = new Map();
+    for (const bl of rows) {
+      const key = (bl.sourceUrl || '').trim().toLowerCase();
+      if (key) urlCounts.set(key, (urlCounts.get(key) || 0) + 1);
+    }
+    let indexed = 0;
+    let duplicate = 0;
+    for (const bl of rows) {
+      if (bl.isIndexed) indexed += 1;
+      const key = (bl.sourceUrl || '').trim().toLowerCase();
+      if (key && urlCounts.get(key) > 1) duplicate += 1;
+    }
+    statsByProject[projectId] = { total: rows.length, indexed, nonIndexed: rows.length - indexed, duplicate };
+  }
+
+  // Daily activity per link builder — only a builder who actually added a
+  // link within the selected day gets a row, same "activity in range" idea
+  // getMembersOverview uses for tasks/content/backlinks.
+  const countsByKey = new Map();
+  for (const bl of backlinks) {
+    if (!bl.assignedWriterId) continue;
+    if (filters.linkBuilderId && bl.assignedWriterId !== filters.linkBuilderId) continue;
+    if (bl.createdAt < from || bl.createdAt > to) continue;
+    const key = `${bl.projectId}:${bl.assignedWriterId}`;
+    countsByKey.set(key, (countsByKey.get(key) || 0) + 1);
+  }
+
+  const builderIds = [...new Set([...countsByKey.keys()].map((k) => k.split(':')[1]))];
+  const builders = builderIds.length
+    ? await User.findAll({ where: { id: { [Op.in]: builderIds } }, attributes: ['id', 'name'] })
+    : [];
+  const builderById = new Map(builders.map((u) => [u.id, u]));
+
+  const allRows = [...countsByKey.entries()].map(([key, count]) => {
+    const [projectId, builderId] = key.split(':');
+    const project = projectById.get(projectId);
+    const st = statsByProject[projectId] || { total: 0, indexed: 0, nonIndexed: 0, duplicate: 0 };
+    return {
+      linkBuilderId: builderId,
+      linkBuilderName: builderById.get(builderId)?.name || 'Unknown',
+      clientId: project?.clientId || null,
+      clientName: project?.client?.name || '—',
+      projectId,
+      projectName: project?.name || '—',
+      projectStartDate: project?.startDate || null,
+      linksMadeInDay: count,
+      projectTotalBacklinks: st.total,
+      totalIndexed: st.indexed,
+      totalNonIndexed: st.nonIndexed,
+      totalDuplicate: st.duplicate,
+    };
+  }).sort((a, b) => b.linksMadeInDay - a.linksMadeInDay || a.linkBuilderName.localeCompare(b.linkBuilderName));
+
+  const total = allRows.length;
+  const data = allRows.slice(offset, offset + limit);
+
+  return { data, total, page, totalPages: Math.ceil(total / limit) || 1, limit, from: from.toISOString(), to: to.toISOString() };
+}
+
+async function exportBacklinkSummary(orgId, format, ids, filters = {}, letterheadFields = null) {
+  const built = await getBacklinkSummary(orgId, { ...filters, limit: 10000 });
+  const data = ids && ids.length
+    ? built.data.filter((r) => ids.includes(`${r.projectId}:${r.linkBuilderId}`))
+    : built.data;
+
+  if (format === 'csv') {
+    const headers = [
+      'Link Builder', 'Client', 'Project', 'Project Start Date', 'Links Made Today',
+      'Project Total Backlinks', 'Total Indexed', 'Total Non-Indexed', 'Total Duplicate',
+    ];
+    const rows = data.map((r) => [
+      r.linkBuilderName || '', r.clientName || '', r.projectName || '', r.projectStartDate || '',
+      r.linksMadeInDay || 0, r.projectTotalBacklinks || 0, r.totalIndexed || 0, r.totalNonIndexed || 0, r.totalDuplicate || 0,
+    ]);
+    const csv = [headers, ...rows].map((row) => row.map((v) => '"' + String(v ?? '').replace(/"/g, '""') + '"').join(',')).join('\n');
+    return { buffer: Buffer.from(csv, 'utf8'), ext: 'csv', mime: 'text/csv' };
+  }
+
+  const { brandColor, letterhead, logo } = await _loadGlobalSeoReportContext(orgId, letterheadFields);
+  const buffer = await createPdfBuffer((doc) => {
+    drawPdfKitLetterhead(doc, letterhead, {
+      title: 'GLOBAL BACKLINKS SUMMARY',
+      subtitle: `Generated ${new Date().toLocaleDateString()}`,
+      color: brandColor,
+      logo,
+    });
+    doc.font('Helvetica-Bold').fontSize(13).fillColor('#111111').text('Link Builder Activity');
+    doc.moveDown(0.5);
+    if (data.length === 0) {
+      doc.font('Helvetica-Oblique').fontSize(10).fillColor('#999999').text('No activity to export.');
+    } else {
+      drawTable(doc, {
+        headerBg: brandColor,
+        headerTextColor: '#FFFFFF',
+        columns: [
+          { label: 'Link Builder', key: 'linkBuilderName', width: 14, align: 'left' },
+          { label: 'Client', key: 'clientName', width: 13, align: 'left' },
+          { label: 'Project', key: 'projectName', width: 13, align: 'left' },
+          { label: 'Made Today', key: 'linksMadeInDay', width: 8, align: 'right' },
+          { label: 'Total Links', key: 'projectTotalBacklinks', width: 8, align: 'right' },
+          { label: 'Indexed', key: 'totalIndexed', width: 8, align: 'right' },
+          { label: 'Non-Indexed', key: 'totalNonIndexed', width: 8, align: 'right' },
+          { label: 'Duplicate', key: 'totalDuplicate', width: 8, align: 'right' },
+        ],
+        rows: data,
+      });
+    }
+    drawReportFooter(doc, brandColor);
+  });
+  return { buffer, ext: 'pdf', mime: 'application/pdf' };
+}
+
 module.exports = {
-  getMembersOverview, getMemberDetail, getKeywordReport, getKeywordSummary, exportKeywords, exportKeywordSummary
+  getMembersOverview, getMemberDetail, getKeywordReport, getKeywordSummary, exportKeywords, exportKeywordSummary,
+  getBacklinkSummary, exportBacklinkSummary,
 };

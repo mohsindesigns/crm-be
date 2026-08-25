@@ -13,5 +13,7 @@ router.get('/keywords', (req, res, next) => ReportsController.keywords(req, res,
 router.get('/keyword-summary', (req, res, next) => ReportsController.keywordSummary(req, res, next));
 router.post('/keywords/export', (req, res, next) => ReportsController.exportKeywords(req, res, next));
 router.post('/keyword-summary/export', (req, res, next) => ReportsController.exportKeywordSummary(req, res, next));
+router.get('/backlink-summary', (req, res, next) => ReportsController.backlinkSummary(req, res, next));
+router.post('/backlink-summary/export', (req, res, next) => ReportsController.exportBacklinkSummary(req, res, next));
 
 module.exports = router;

@@ -72,6 +72,32 @@ class ReportsController {
       next(err);
     }
   }
+
+  async backlinkSummary(req, res, next) {
+    try {
+      const {
+        projectId, clientId, linkBuilderId, date, page, limit,
+      } = req.query;
+      res.json(await ReportsService.getBacklinkSummary(req.orgId, {
+        projectId, clientId, linkBuilderId, date, page, limit,
+      }));
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  async exportBacklinkSummary(req, res, next) {
+    try {
+      const format = req.query.format || 'csv';
+      const { ids, filters, fields } = req.body;
+      const { buffer, ext, mime } = await ReportsService.exportBacklinkSummary(req.orgId, format, ids, filters, fields);
+      res.setHeader('Content-Type', mime);
+      res.setHeader('Content-Disposition', `attachment; filename="backlink-summary.${ext}"`);
+      res.send(buffer);
+    } catch (err) {
+      next(err);
+    }
+  }
 }
 
 module.exports = new ReportsController();
