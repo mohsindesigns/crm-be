@@ -47,6 +47,20 @@ class ExportController {
     }
   }
 
+  /** Same selection/columns as exportEmployees, written as an .xlsx workbook. */
+  async exportEmployeesXlsx(req, res, next) {
+    try {
+      const { workerIds, fields } = req.body || {};
+      const { buffer, filename } = await ExportService.exportEmployeesXlsx(req.orgId, { workerIds, fields });
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition');
+      res.send(buffer);
+    } catch (err) {
+      next(err);
+    }
+  }
+
   async listTemplates(req, res, next) {
     try {
       res.json(await ExportService.listTemplates(req.orgId, req.query));

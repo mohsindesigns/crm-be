@@ -797,4 +797,69 @@ async function sendLeadNotification({
   });
 }
 
-module.exports = { sendMail, verifyTransport, sendPayrollReady, sendLeaveUpdate, sendProfileReviewUpdate, sendAppraisalUpdate, sendProjectAssigned, sendTaskAssigned, sendTaskReminder, sendPasswordReset, sendAdminPasswordReset, sendStageAdvance, sendUserInvite, sendPortalInvite, sendPortalLoginCode, sendEmailChangeCode, sendDocumentReviewLink, sendDocumentRemind, sendInvoiceEmail, sendClientRequestForm, sendClientRequestReminder, sendLeadNotification };
+// Default wording for the "thank you for your payment" email — used whenever
+// the org hasn't customized `paymentThankYouSubject`/`paymentThankYouBody`
+// under Admin → Branding. Kept as plain text with {{placeholders}} so the
+// same string doubles as what's shown (pre-filled) in the admin editor.
+const DEFAULT_PAYMENT_THANKYOU_SUBJECT = 'Thank you for your payment — invoice {{invoiceNumber}}';
+const DEFAULT_PAYMENT_THANKYOU_BODY = 'Hi {{clientName}},\n\n'
+  + 'Thank you — we\'ve received your payment of {{amount}} for invoice {{invoiceNumber}}. '
+  + 'The invoice is now marked as paid.\n\n'
+  + 'We appreciate your business!\n\n'
+  + '— {{brandName}}';
+
+/** Fills {{placeholder}} tokens in an admin-authored (or default) template string. */
+function fillTemplate(template, vars) {
+  return String(template || '').replace(/\{\{\s*(\w+)\s*\}\}/g, (m, key) => (
+    Object.prototype.hasOwnProperty.call(vars, key) ? String(vars[key] ?? '') : m
+  ));
+}
+
+/**
+ * Sent after an invoice is fully settled — by a Stripe card payment or a
+ * manually-recorded one — never on a part payment. Subject/body are
+ * admin-editable plain-text templates (Admin → Branding → Payment Thank-You
+ * Email) with `{{placeholder}}` tokens; the surrounding layout (logo,
+ * branding, footer) is the same `emailLayout` every transactional email uses,
+ * so a custom template only ever changes the wording, never the chrome.
+ */
+async function sendPaymentThankYou({
+  to, clientName, brandName, logoUrl, invoiceNumber, amount, currency, methodLabel, portalUrl,
+  subjectTemplate, bodyTemplate,
+}) {
+  const vars = {
+    clientName: clientName || 'there',
+    brandName,
+    invoiceNumber,
+    amount: amount != null ? `${currency || ''} ${Number(amount).toLocaleString(undefined, { minimumFractionDigits: 2 })}`.trim() : '',
+    currency: currency || '',
+    methodLabel: methodLabel || '',
+  };
+
+  const subject = fillTemplate(subjectTemplate || DEFAULT_PAYMENT_THANKYOU_SUBJECT, vars);
+  const bodyText = fillTemplate(bodyTemplate || DEFAULT_PAYMENT_THANKYOU_BODY, vars);
+  const bodyHtml = `
+    ${bodyText.split('\n\n').map((para) => `<p style="margin:0 0 14px;color:#374151;font-size:15px;line-height:1.6;">${escapeHtml(para).replace(/\n/g, '<br>')}</p>`).join('')}
+    ${portalUrl
+      ? `<a href="${portalUrl}" style="display:inline-block;margin-top:8px;background:${BRAND_ACCENT};color:${BRAND_PRIMARY};text-decoration:none;padding:12px 22px;border-radius:8px;font-size:14px;font-weight:700;">View Invoice</a>`
+      : ''}
+  `;
+
+  return sendMail({
+    to,
+    subject,
+    html: emailLayout({
+      brandName,
+      logoUrl,
+      title: 'Payment Received',
+      accentColor: BRAND_PRIMARY,
+      badgeLabel: 'Paid',
+      badgeBg: '#dcfce7',
+      badgeColor: '#166534',
+      bodyHtml,
+      footerHtml: `This is an automated message from ${escapeHtml(brandName)}.`,
+    }),
+  });
+}
+
+module.exports = { sendMail, verifyTransport, sendPayrollReady, sendLeaveUpdate, sendProfileReviewUpdate, sendAppraisalUpdate, sendProjectAssigned, sendTaskAssigned, sendTaskReminder, sendPasswordReset, sendAdminPasswordReset, sendStageAdvance, sendUserInvite, sendPortalInvite, sendPortalLoginCode, sendEmailChangeCode, sendDocumentReviewLink, sendDocumentRemind, sendInvoiceEmail, sendClientRequestForm, sendClientRequestReminder, sendLeadNotification, sendPaymentThankYou, DEFAULT_PAYMENT_THANKYOU_SUBJECT, DEFAULT_PAYMENT_THANKYOU_BODY };

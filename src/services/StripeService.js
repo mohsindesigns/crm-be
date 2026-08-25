@@ -791,6 +791,14 @@ class StripeService {
       if (invoice.status !== INVOICE_STATUS.PAID && invoice.status !== 'paid') {
         await invoice.update({ status: INVOICE_STATUS.PAID });
       }
+      // Lazy require — InvoiceService requires this file back (for the "Pay"
+      // button's Stripe link), so a top-level require here would deadlock on
+      // module load.
+      require('./InvoiceService').sendPaymentThankYou(invoice, invoice.orgId, {
+        amount: applied,
+        currency,
+        methodLabel: session.metadata?.cadenceMethodLabel || 'Credit / Debit Card (Stripe)',
+      }).catch(() => {});
     } else {
       // Detach the completed Checkout Session so the next attempt builds a fresh
       // page for the new, smaller balance instead of resuming a paid one.

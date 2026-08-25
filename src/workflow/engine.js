@@ -55,6 +55,15 @@ const performAction = async ({ user, project, action, reasonCategory = null, not
           projectId: project.id,
           stageKey: currentStage.key,
           status: { [Op.ne]: TASK_STATUS.APPROVED },
+          // Recurring-rule tasks (GMB posts, monthly SEO reviews, …) are tagged
+          // with whatever stageKey the project happened to be on when
+          // AutoTaskScheduler generated them — they aren't a deliverable for
+          // THIS stage, they're an independent cadence that (per that
+          // scheduler's own comment) keeps running even after the project
+          // reaches its terminal stage. Auto-closing them here would silently
+          // mark ongoing retainer work "done" just because an unrelated stage
+          // advanced.
+          ruleId: null,
         },
         transaction: t,
       });
@@ -150,8 +159,16 @@ const assertAdvanceRule = async (stage, project, t) => {
     return;
   }
 
+  // Same exclusion as the auto-close loop in performAction, and for the same
+  // reason: a task materialized from a RecurringTaskRule (GMB post, monthly
+  // SEO review, blog post, …) is bound to this stageKey only because that
+  // happened to be the project's current stage the day it was generated —
+  // it's an ongoing retainer obligation, not a condition for leaving this
+  // stage, and AutoTaskScheduler explicitly keeps generating these past
+  // project completion. Counting them here blocked advancing/completing a
+  // stage on tasks that were never meant to gate it.
   const tasks = await db.Task.findAll({
-    where: { projectId: project.id, stageKey: stage.key },
+    where: { projectId: project.id, stageKey: stage.key, ruleId: null },
     transaction: t,
   });
 

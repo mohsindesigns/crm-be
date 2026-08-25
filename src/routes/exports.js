@@ -20,6 +20,7 @@ router.get('/employees', rbac('hr.read'), (req, res, next) => ExportController.l
 // POST so the run is recorded by middleware/activityLogger — an export of
 // everyone's bank details should be visible in the Activity Log.
 router.post('/employees/csv', rbac('hr.read'), (req, res, next) => ExportController.exportEmployees(req, res, next));
+router.post('/employees/xlsx', rbac('hr.read'), (req, res, next) => ExportController.exportEmployeesXlsx(req, res, next));
 
 // ─── Saved column templates ───────────────────────────────────────────────────
 router.get('/templates', (req, res, next) => ExportController.listTemplates(req, res, next));

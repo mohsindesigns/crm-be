@@ -88,6 +88,16 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.STRING(255),
       defaultValue: 'logo',
     },
+    // Admin-editable "thank you for your payment" email — sent whenever an
+    // invoice becomes fully settled (Stripe or a manually-recorded payment).
+    // Both blank by default; EmailService.sendPaymentThankYou falls back to
+    // its own built-in wording when these are empty. See Admin → Branding.
+    paymentThankYouSubject: {
+      type: DataTypes.STRING(255),
+    },
+    paymentThankYouBody: {
+      type: DataTypes.TEXT,
+    },
   }, {
     tableName: 'white_label_configs',
     timestamps: false,

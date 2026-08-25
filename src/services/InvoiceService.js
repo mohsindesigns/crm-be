@@ -522,6 +522,54 @@ class InvoiceService {
     }
   }
 
+  // Same fallback chain generatePdfBuffer uses for where an invoice gets
+  // emailed — nominated billing contact first, then whoever has portal
+  // access, then just the first active contact — without the overhead of
+  // building a PDF. Used wherever a payment (not just an initial send) needs
+  // to reach the client.
+  async _resolveContactEmail(clientId) {
+    const contacts = await db.Contact.findAll({ where: { clientId, isActive: { [Op.ne]: false } } });
+    const contact = contacts.find((c) => c.useForInvoice)
+      || contacts.find((c) => c.portalAccess)
+      || contacts[0]
+      || null;
+    return contact?.email || null;
+  }
+
+  // Fires the "thank you for your payment" email once an invoice becomes
+  // fully settled — called from both a manually-recorded payment
+  // (recordPayment, below) and a Stripe card payment (StripeService
+  // #_markPaidFromSession). Never throws, same reasoning as
+  // _emailInvoiceToClient: a failed/unconfigured email must not undo the
+  // payment that was just recorded.
+  async sendPaymentThankYou(invoice, orgId, { amount, currency, methodLabel } = {}) {
+    try {
+      const contactEmail = await this._resolveContactEmail(invoice.clientId);
+      if (!contactEmail) return;
+      // `invoice` doesn't always come in with `client` eager-loaded (the
+      // Stripe webhook path loads it bare), so fetch the name directly rather
+      // than assuming the association is populated.
+      const clientName = invoice.client?.name
+        || (await db.Client.findByPk(invoice.clientId, { attributes: ['name'] }))?.name;
+      const org = await db.WhiteLabelConfig.findOne({ where: { orgId } });
+      await EmailService.sendPaymentThankYou({
+        to: contactEmail,
+        clientName,
+        brandName: org?.brandName || 'Mohsin Designs Project Management',
+        logoUrl: org?.logoUrl || null,
+        invoiceNumber: invoice.number,
+        amount: amount != null ? amount : invoice.total,
+        currency: currency || invoice.currency,
+        methodLabel,
+        portalUrl: this.publicInvoiceUrl(invoice),
+        subjectTemplate: org?.paymentThankYouSubject,
+        bodyTemplate: org?.paymentThankYouBody,
+      });
+    } catch (err) {
+      console.error('[InvoiceService] Failed to send payment thank-you email:', err.message);
+    }
+  }
+
   // Generates the PDF and emails it to the client's primary contact — called
   // whenever an invoice transitions into 'sent'. Never throws: a failed email
   // (no SMTP configured, no contact email on file, PDF build error) shouldn't
@@ -1151,6 +1199,10 @@ class InvoiceService {
         refTable: 'invoices',
         refId: invoice.id,
       });
+      this.sendPaymentThankYou(invoice, orgId, {
+        amount: settlement.amountPaid,
+        methodLabel: data.methodLabel || PAYMENT_PROVIDER_LABELS[data.provider] || null,
+      }).catch(() => {});
     } else {
       // Back to an open, chaseable state — 'payment_review' would hide the
       // outstanding balance from the client's own list.

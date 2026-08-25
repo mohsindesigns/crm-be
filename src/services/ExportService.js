@@ -1,4 +1,5 @@
 const { v4: uuidv4 } = require('uuid');
+const xlsx = require('xlsx');
 const db = require('../models');
 const { activeWhere, setActive } = require('./SoftDeleteService');
 
@@ -266,15 +267,15 @@ function toCsv(headers, rows) {
 }
 
 /**
- * Build the CSV for the given employees and columns.
+ * Resolve the requested columns and pull the requested employees — the part
+ * shared by every output format (CSV, XLSX, …).
  *
  * @param {string} orgId
  * @param {object} payload
  * @param {string[]} payload.workerIds  which employees — required, re-scoped to the org
  * @param {string[]} payload.fields     which columns — validated against the catalog
- * @returns {{ csv: string, filename: string, rowCount: number, fieldCount: number }}
  */
-async function exportEmployees(orgId, { workerIds, fields } = {}) {
+async function resolveExportRows(orgId, { workerIds, fields } = {}) {
   const ids = [...new Set((Array.isArray(workerIds) ? workerIds : []).map((id) => String(id || '').trim()).filter(Boolean))];
   if (!ids.length) throw badRequest('Select at least one employee to export.');
 
@@ -294,6 +295,17 @@ async function exportEmployees(orgId, { workerIds, fields } = {}) {
 
   if (!workers.length) throw badRequest('None of the selected employees could be found.');
 
+  return { resolved, workers };
+}
+
+/**
+ * Build the CSV for the given employees and columns.
+ *
+ * @returns {{ csv: string, filename: string, rowCount: number, fieldCount: number }}
+ */
+async function exportEmployees(orgId, { workerIds, fields } = {}) {
+  const { resolved, workers } = await resolveExportRows(orgId, { workerIds, fields });
+
   const csv = toCsv(
     resolved.map((f) => f.label),
     workers.map((w) => resolved.map((f) => f.value(w))),
@@ -305,6 +317,33 @@ async function exportEmployees(orgId, { workerIds, fields } = {}) {
     // non-ASCII names — same reason routes/messages.js does it for transcripts.
     csv: `﻿${csv}`,
     filename: `employees-export-${stamp}.csv`,
+    rowCount: workers.length,
+    fieldCount: resolved.length,
+  };
+}
+
+/**
+ * Same selection and columns as {@link exportEmployees}, written as a real
+ * .xlsx workbook instead of a text CSV — no BOM/quoting tricks needed since
+ * the cells are typed values in the sheet rather than escaped text.
+ *
+ * @returns {{ buffer: Buffer, filename: string, rowCount: number, fieldCount: number }}
+ */
+async function exportEmployeesXlsx(orgId, { workerIds, fields } = {}) {
+  const { resolved, workers } = await resolveExportRows(orgId, { workerIds, fields });
+
+  const sheet = xlsx.utils.aoa_to_sheet([
+    resolved.map((f) => f.label),
+    ...workers.map((w) => resolved.map((f) => f.value(w) ?? '')),
+  ]);
+  const workbook = xlsx.utils.book_new();
+  xlsx.utils.book_append_sheet(workbook, sheet, 'Employees');
+  const buffer = xlsx.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+
+  const stamp = new Date().toISOString().slice(0, 10);
+  return {
+    buffer,
+    filename: `employees-export-${stamp}.xlsx`,
     rowCount: workers.length,
     fieldCount: resolved.length,
   };
@@ -385,6 +424,7 @@ module.exports = {
   listEmployees,
   listEmployeeFilters,
   exportEmployees,
+  exportEmployeesXlsx,
   listTemplates,
   createTemplate,
   updateTemplate,
