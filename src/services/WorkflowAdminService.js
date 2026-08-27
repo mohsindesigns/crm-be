@@ -1,6 +1,7 @@
 const { v4: uuidv4 } = require('uuid');
 const db = require('../models');
 const { LETTERHEAD_DEFAULTS } = require('./letterhead');
+const { DEFAULT_PAYMENT_THANKYOU_SUBJECT, DEFAULT_PAYMENT_THANKYOU_BODY } = require('./EmailService');
 
 class WorkflowAdminService {
   async listTemplates(orgId, { includeInactive = false } = {}) {
@@ -199,6 +200,13 @@ class WorkflowAdminService {
     return {
       ...(config ? config.toJSON() : { orgId }),
       letterheadDefaults: LETTERHEAD_DEFAULTS,
+      // Shown as placeholder text in the admin editor when the org hasn't
+      // written its own subject/body yet, so the form displays exactly what
+      // will actually be sent rather than a blank box.
+      paymentThankYouDefaults: {
+        subject: DEFAULT_PAYMENT_THANKYOU_SUBJECT,
+        body: DEFAULT_PAYMENT_THANKYOU_BODY,
+      },
     };
   }
 
@@ -223,6 +231,9 @@ class WorkflowAdminService {
       einNumber: data.einNumber,
       contactEmail: data.contactEmail,
       letterheadNote: data.letterheadNote,
+      seoReportLetterheadFields: data.seoReportLetterheadFields,
+      paymentThankYouSubject: data.paymentThankYouSubject,
+      paymentThankYouBody: data.paymentThankYouBody,
     });
     return config;
   }

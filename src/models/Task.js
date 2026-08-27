@@ -1,5 +1,5 @@
 const { v4: uuidv4 } = require('uuid');
-const { ensureColumns } = require('../utils/schemaSync');
+const { ensureColumns, ensureColumnType } = require('../utils/schemaSync');
 
 module.exports = (sequelize, DataTypes) => {
   const Task = sequelize.define('Task', {
@@ -50,8 +50,23 @@ module.exports = (sequelize, DataTypes) => {
       references: { model: 'users', key: 'id' },
     },
     status: {
-      type: DataTypes.ENUM('todo', 'in_progress', 'submitted', 'in_review', 'approved', 'rejected', 'done'),
+      type: DataTypes.ENUM('todo', 'accepted', 'in_progress', 'submitted', 'in_review', 'approved', 'rejected', 'done'),
       defaultValue: 'todo',
+    },
+    // When set at creation, the task is held unassigned until an admin approves
+    // the technical audit — see TaskService.create/approveAudit/rejectAudit.
+    requiresTechnicalAudit: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
+    // The assignee the creator originally picked, parked here while
+    // requiresTechnicalAudit is pending — copied into assigneeId on approval.
+    pendingAssigneeId: {
+      type: DataTypes.CHAR(36),
+      references: { model: 'users', key: 'id' },
+    },
+    auditStatus: {
+      type: DataTypes.ENUM('pending', 'approved', 'rejected'),
     },
     reasonCategory: {
       type: DataTypes.STRING(100),
@@ -93,6 +108,12 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.CHAR(36),
       references: { model: 'users', key: 'id' },
     },
+    // Set when the assignee accepts a task handed to them by someone else — see
+    // TaskService#transition's acceptance gate. Self-assigned/unassigned tasks
+    // never need this (nobody to hand acceptance to).
+    acceptedAt: {
+      type: DataTypes.DATE,
+    },
     completedAt: {
       type: DataTypes.DATE,
     },
@@ -110,12 +131,17 @@ module.exports = (sequelize, DataTypes) => {
     Task.belongsTo(db.ProjectCycle, { foreignKey: 'cycleId', as: 'cycle' });
     Task.belongsTo(db.User, { foreignKey: 'assigneeId', as: 'assignee' });
     Task.belongsTo(db.User, { foreignKey: 'reviewerId', as: 'reviewer' });
+    Task.belongsTo(db.User, { foreignKey: 'pendingAssigneeId', as: 'pendingAssignee' });
     Task.belongsTo(db.User, { foreignKey: 'createdBy', as: 'creator' });
     Task.belongsTo(db.RecurringTaskRule, { foreignKey: 'ruleId', as: 'rule' });
     Task.hasMany(db.TaskEvent, { foreignKey: 'taskId', as: 'events' });
   };
 
-  Task.ensureSchema = () => ensureColumns(Task);
+  Task.ensureSchema = async () => {
+    await ensureColumns(Task);
+    // Widen status ENUM with `accepted` (assignee-acceptance gate).
+    await ensureColumnType(Task, 'status');
+  };
 
   return Task;
 };

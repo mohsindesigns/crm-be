@@ -49,8 +49,35 @@ class TaskController {
         req.body.status,
         req.user,
         req.body.reasonCategory,
-        req.body.note
+        req.body.note,
+        req.body.attachmentIds
       );
+      res.json(task);
+    } catch (err) { next(err); }
+  }
+
+  async approveAudit(req, res, next) {
+    try {
+      const isAdmin = req.user?.role?.key === 'super_admin' || req.user?.role?.key === 'admin';
+      if (!isAdmin) {
+        const err = new Error('Only an administrator can approve a technical audit.');
+        err.status = 403;
+        throw err;
+      }
+      const task = await TaskService.approveAudit(req.params.taskId, req.orgId, req.user);
+      res.json(task);
+    } catch (err) { next(err); }
+  }
+
+  async rejectAudit(req, res, next) {
+    try {
+      const isAdmin = req.user?.role?.key === 'super_admin' || req.user?.role?.key === 'admin';
+      if (!isAdmin) {
+        const err = new Error('Only an administrator can reject a technical audit.');
+        err.status = 403;
+        throw err;
+      }
+      const task = await TaskService.rejectAudit(req.params.taskId, req.orgId, req.user, req.body?.note);
       res.json(task);
     } catch (err) { next(err); }
   }

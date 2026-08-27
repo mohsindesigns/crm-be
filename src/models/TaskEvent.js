@@ -38,6 +38,7 @@ module.exports = (sequelize, DataTypes) => {
   TaskEvent.associate = (db) => {
     TaskEvent.belongsTo(db.Task, { foreignKey: 'taskId', as: 'task' });
     TaskEvent.belongsTo(db.User, { foreignKey: 'actorUserId', as: 'actor' });
+    TaskEvent.hasMany(db.Artifact, { foreignKey: 'taskEventId', as: 'attachments' });
   };
 
   return TaskEvent;

@@ -37,6 +37,21 @@ module.exports = (sequelize, DataTypes) => {
     discountValue: {
       type: DataTypes.DECIMAL(12, 2),
     },
+    // How many recurring billing cycles the discount above applies for — e.g. 3
+    // means "the first 3 invoices are discounted, then it goes back to full
+    // price." Null/0 means the discount never expires. Set at sale time (see
+    // ClientService.sellPackage) from the package sale form or a converted
+    // document's own discountCycles.
+    discountCycles: {
+      type: DataTypes.INTEGER,
+    },
+    // Calendar date the discount period ends, derived once at sale time from
+    // startDate + discountCycles cycles (ClientService._computeDiscountEndsAt) —
+    // stored rather than recomputed so DiscountExpiryScheduler can find expired
+    // discounts with a plain date query. Null when discountCycles is null.
+    discountEndsAt: {
+      type: DataTypes.DATEONLY,
+    },
     // Price actually charged to the client after the discount is applied.
     soldPrice: {
       type: DataTypes.DECIMAL(12, 2),
@@ -54,6 +69,26 @@ module.exports = (sequelize, DataTypes) => {
     status: {
       type: DataTypes.ENUM('active', 'pending', 'paused', 'completed', 'cancelled'),
       defaultValue: 'active',
+    },
+    // Whether the client may actually USE what they bought right now — distinct
+    // from `status` above, which is where the SALE stands. Subscriptions
+    // (Package.isSubscription: hosting, domains, mailboxes) are gated on
+    // payment: an unpaid or overdue subscription invoice suspends the
+    // entitlement, and the client portal shows the subscription as suspended
+    // with a "pay now" route back rather than as a live service.
+    //
+    // Non-subscription packages are always left 'active' — agency work isn't
+    // switched off mid-cycle by this flag. Recomputed from the subscription's
+    // own invoices by SubscriptionService.syncEntitlement (on payment, on
+    // status change, and on every RetainerScheduler pass), never hand-edited.
+    entitlement: {
+      type: DataTypes.ENUM('active', 'pending_payment', 'suspended', 'cancelled'),
+      defaultValue: 'active',
+    },
+    // Human-readable "why" behind the entitlement above, shown to staff and in
+    // the client portal ("Invoice INV-0042 is overdue"). Null when active.
+    entitlementReason: {
+      type: DataTypes.STRING(255),
     },
     startDate: {
       type: DataTypes.DATEONLY,

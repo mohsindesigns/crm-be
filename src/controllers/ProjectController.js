@@ -68,9 +68,19 @@ class ProjectController {
 
       // Re-assign any open auto-created tasks for this role slot to the new user (fire-and-forget)
       if (req.body.userId) {
+        const { Op } = require('sequelize');
+        // A different person now owns these tasks — they haven't accepted them yet,
+        // so drop status/acceptedAt back to todo (see TaskService#transition's
+        // acceptance gate). Excluding rows already on this assignee leaves anyone
+        // who was already accepted/in-progress on this exact user untouched.
+        const reassign = {
+          assigneeId: req.body.userId,
+          status: 'todo',
+          acceptedAt: null,
+        };
+
         db.Project.findByPk(req.params.id).then(async (p) => {
           if (!p) return;
-          const { Op } = require('sequelize');
           const stages = await db.Stage.findAll({
             where: { templateId: p.workflowTemplateId, ownerRoleSlot: req.body.roleSlot },
             attributes: ['key'],
@@ -78,13 +88,15 @@ class ProjectController {
           const stageKeys = stages.map((s) => s.key);
           if (stageKeys.length === 0) return;
           await db.Task.update(
-            { assigneeId: req.body.userId },
+            reassign,
             {
               where: {
                 projectId: req.params.id,
                 stageKey: { [Op.in]: stageKeys },
                 autoCreated: true,
                 status: { [Op.notIn]: ['done', 'approved'] },
+                // Skip rows already on this exact user; include unassigned rows.
+                assigneeId: { [Op.or]: [null, { [Op.ne]: req.body.userId }] },
               },
             }
           );
@@ -100,8 +112,15 @@ class ProjectController {
           const ruleIds = rules.map((r) => r.id);
           if (ruleIds.length === 0) return;
           await db.Task.update(
-            { assigneeId: req.body.userId },
-            { where: { ruleId: { [Op.in]: ruleIds }, status: { [Op.notIn]: ['done', 'approved'] } } }
+            reassign,
+            {
+              where: {
+                ruleId: { [Op.in]: ruleIds },
+                status: { [Op.notIn]: ['done', 'approved'] },
+                // Skip rows already on this exact user; include unassigned rows.
+                assigneeId: { [Op.or]: [null, { [Op.ne]: req.body.userId }] },
+              },
+            }
           );
         }).catch(() => {});
       }

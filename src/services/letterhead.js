@@ -371,6 +371,54 @@ function letterheadLines(lh) {
     .map(({ label, value }) => ({ label, value }));
 }
 
+/**
+ * Field keys a "what company details show on this export" checkbox list lets
+ * a caller toggle per document. The legal name (heading) isn't included —
+ * dropping it would leave the block with no identity at all, so it always
+ * prints.
+ */
+const LETTERHEAD_FIELD_KEYS = ['logo', 'address', 'tax', 'email', 'phone', 'website', 'note'];
+
+/**
+ * Normalizes a checkbox selection from a request into what a caller stores or
+ * forwards: an array of the enabled keys, or null meaning "not specified" —
+ * anyone who never passes the option keeps showing everything, the
+ * pre-existing default.
+ */
+function normalizeLetterheadFields(input) {
+  if (!Array.isArray(input)) return null;
+  return input.filter((k) => LETTERHEAD_FIELD_KEYS.includes(k));
+}
+
+/**
+ * Applies a stored field selection to a resolved letterhead before it's drawn
+ * — clears whichever contact/address fields weren't ticked. `fields` null (not
+ * specified) means "show everything", the pre-existing default.
+ *
+ * Logo visibility is deliberately NOT handled here — see `letterheadShowsLogo`.
+ * `loadLetterheadLogo` treats a blank URL as "fall back to the bundled default
+ * wordmark", not "draw nothing", so clearing `logoUrl` here would print a logo
+ * instead of suppressing it.
+ */
+function filterLetterheadFields(resolved, fields) {
+  if (!resolved || fields == null) return resolved;
+  const enabled = new Set(fields);
+  const entities = (resolved.entities || []).map((e) => ({
+    ...e,
+    address: enabled.has('address') ? e.address : '',
+    taxNumber: enabled.has('tax') ? e.taxNumber : '',
+    email: enabled.has('email') ? e.email : '',
+    phone: enabled.has('phone') ? e.phone : '',
+    website: enabled.has('website') ? e.website : '',
+  }));
+  return { ...resolved, entities, note: enabled.has('note') ? resolved.note : '' };
+}
+
+/** Whether the logo should be drawn at all — see `filterLetterheadFields`. */
+function letterheadShowsLogo(fields) {
+  return fields == null || fields.includes('logo');
+}
+
 // ─── Logo ─────────────────────────────────────────────────────────────────────
 
 // PNG, not the original JPEG — the source logo was a progressive JPEG, which
@@ -789,6 +837,10 @@ module.exports = {
   letterheadForClient,
   letterheadBlocks,
   letterheadLines,
+  LETTERHEAD_FIELD_KEYS,
+  normalizeLetterheadFields,
+  filterLetterheadFields,
+  letterheadShowsLogo,
   resolveLogoPath,
   readLogoBuffer,
   loadLetterheadLogo,

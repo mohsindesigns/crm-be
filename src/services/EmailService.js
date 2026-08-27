@@ -6,10 +6,16 @@ let transporter = null;
 
 function getTransporter() {
   if (!transporter) {
+    const port = parseInt(process.env.SMTP_PORT || '587', 10);
+    const secure = process.env.SMTP_SECURE === 'true';
     transporter = nodemailer.createTransport({
       host: process.env.SMTP_HOST || 'smtp.mailtrap.io',
-      port: parseInt(process.env.SMTP_PORT || '587', 10),
-      secure: process.env.SMTP_SECURE === 'true',
+      port,
+      secure,
+      // On the submission port the connection starts plaintext and upgrades via
+      // STARTTLS. Relays like Brevo always offer it, so demand it rather than
+      // letting nodemailer silently fall back to sending credentials in the clear.
+      ...(secure ? {} : { requireTLS: true }),
       auth: {
         user: process.env.SMTP_USER,
         pass: process.env.SMTP_PASS,
@@ -48,13 +54,16 @@ function titleCaseWords(value) {
     .join(' ');
 }
 
-function emailLayout({ brandName, title, accentColor, badgeLabel, badgeBg, badgeColor, bodyHtml, footerHtml }) {
+function emailLayout({ brandName, logoUrl, title, accentColor, badgeLabel, badgeBg, badgeColor, bodyHtml, footerHtml }) {
+  const brandBlock = logoUrl
+    ? `<img src="${escapeHtml(logoUrl)}" alt="${escapeHtml(brandName)}" style="height:24px;width:auto;max-width:180px;object-fit:contain;display:block;margin:0 0 14px;">`
+    : `<p style="margin:0 0 6px;color:#6b7280;font-size:12px;letter-spacing:0.08em;text-transform:uppercase;">${escapeHtml(brandName)}</p>`;
   return `
     <div style="margin:0;padding:32px 16px;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif;">
       <div style="max-width:560px;margin:0 auto;background:#ffffff;border:1px solid #e5e7eb;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.06);">
         <div style="height:4px;background:${accentColor};"></div>
         <div style="padding:28px 32px 8px;">
-          <p style="margin:0 0 6px;color:#6b7280;font-size:12px;letter-spacing:0.08em;text-transform:uppercase;">${escapeHtml(brandName)}</p>
+          ${brandBlock}
           <h1 style="margin:0;color:#111827;font-size:22px;line-height:1.3;font-weight:700;">${escapeHtml(title || badgeLabel)}</h1>
           <span style="display:inline-block;margin-top:14px;padding:6px 12px;border-radius:999px;background:${badgeBg};color:${badgeColor};font-size:12px;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;">${escapeHtml(badgeLabel)}</span>
         </div>
@@ -69,7 +78,7 @@ function emailLayout({ brandName, title, accentColor, badgeLabel, badgeBg, badge
   `;
 }
 
-async function sendMail({ to, subject, html, from, attachments }) {
+async function sendMail({ to, subject, html, from, attachments, cc }) {
   if (!process.env.SMTP_USER) {
     console.warn(`[EmailService] SMTP_USER not configured; skipping email to ${to}`);
     return null;
@@ -78,13 +87,42 @@ async function sendMail({ to, subject, html, from, attachments }) {
     return await getTransporter().sendMail({
       from: from || process.env.EMAIL_FROM || '"Mohsin Designs Project Management" <noreply@mohsindesigns.com>',
       to,
+      ...(cc?.length ? { cc } : {}),
       subject,
       html,
       ...(attachments?.length ? { attachments } : {}),
     });
   } catch (err) {
-    console.error('[EmailService] Failed to send email:', err.message);
+    // Every caller treats a null return as "not delivered" and carries on, so this
+    // log is the only trace a failed send leaves — include the SMTP-level detail
+    // (auth rejection vs. unverified sender vs. connection) or it is undiagnosable.
+    console.error(
+      `[EmailService] Failed to send email to ${to}: ${err.message}`
+      + `${err.code ? ` [code=${err.code}]` : ''}`
+      + `${err.responseCode ? ` [smtp=${err.responseCode}]` : ''}`
+      + `${err.response ? ` ${err.response}` : ''}`,
+    );
     return null;
+  }
+}
+
+// Called once at boot so a bad host/login surfaces in the startup log instead of
+// on the first invite or password reset a user happens to trigger.
+async function verifyTransport() {
+  if (!process.env.SMTP_USER) {
+    console.warn('[EmailService] SMTP_USER not configured — outbound email is disabled.');
+    return false;
+  }
+  try {
+    await getTransporter().verify();
+    console.log(`[EmailService] SMTP ready (${process.env.SMTP_HOST} as ${process.env.SMTP_USER}).`);
+    return true;
+  } catch (err) {
+    console.error(
+      `[EmailService] SMTP verification FAILED — email will not send: ${err.message}`
+      + `${err.responseCode ? ` [smtp=${err.responseCode}]` : ''}`,
+    );
+    return false;
   }
 }
 
@@ -606,4 +644,222 @@ async function sendAppraisalUpdate({
   });
 }
 
-module.exports = { sendMail, sendPayrollReady, sendLeaveUpdate, sendProfileReviewUpdate, sendAppraisalUpdate, sendProjectAssigned, sendTaskAssigned, sendTaskReminder, sendPasswordReset, sendAdminPasswordReset, sendStageAdvance, sendUserInvite, sendPortalInvite, sendPortalLoginCode, sendEmailChangeCode, sendDocumentReviewLink, sendDocumentRemind, sendInvoiceEmail };
+
+/** The requirements form a staff member composes on a project and sends to a
+ *  client contact (see services/ClientRequestService.js#send). `formUrl` is a
+ *  tokenized public link — no login, same as the document review links above. */
+async function sendClientRequestForm({
+  to, cc, recipientName, brandName, logoUrl, projectName, subject, message, formUrl, dueAt, fieldCount,
+}) {
+  const safeName = escapeHtml(recipientName || 'there');
+  const dueLabel = dueAt ? formatEmailDate(dueAt) : null;
+  const messageBlock = message
+    ? `<div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:16px 18px;margin:20px 0 0;">
+         <p style="margin:0;color:#374151;font-size:14px;line-height:1.7;white-space:pre-wrap;">${escapeHtml(message)}</p>
+       </div>`
+    : '';
+  const dueBlock = dueLabel
+    ? `<p style="margin:20px 0 0;color:#374151;font-size:14px;line-height:1.6;">Please complete it by <strong>${escapeHtml(dueLabel)}</strong> so we can keep the project moving.</p>`
+    : '';
+
+  const bodyHtml = `
+    <p style="margin:0 0 12px;color:#374151;font-size:15px;line-height:1.6;">Hi <strong>${safeName}</strong>,</p>
+    <p style="margin:0;color:#374151;font-size:15px;line-height:1.6;">
+      For <strong>${escapeHtml(projectName)}</strong>, we need a few details from you.
+      ${fieldCount ? `The form below has <strong>${fieldCount}</strong> question${fieldCount === 1 ? '' : 's'} and takes just a couple of minutes.` : ''}
+    </p>
+    ${messageBlock}
+    ${dueBlock}
+    <a href="${formUrl}" style="display:inline-block;margin-top:24px;background:${BRAND_ACCENT};color:${BRAND_PRIMARY};text-decoration:none;padding:12px 22px;border-radius:8px;font-size:14px;font-weight:700;">Fill in the form</a>
+    <p style="margin:20px 0 0;color:#9ca3af;font-size:12px;line-height:1.6;">
+      No account or password needed — just click the button. If it doesn't work, copy this link into your browser:<br>
+      <span style="color:#6b7280;word-break:break-all;">${formUrl}</span>
+    </p>
+  `;
+
+  return sendMail({
+    to,
+    cc,
+    subject,
+    html: emailLayout({
+      brandName,
+      logoUrl,
+      title: subject,
+      accentColor: BRAND_PRIMARY,
+      badgeLabel: 'Action needed',
+      badgeBg: '#fef3c7',
+      badgeColor: BRAND_PRIMARY,
+      bodyHtml,
+      footerHtml: `You're receiving this because ${escapeHtml(brandName)} is working with you on ${escapeHtml(projectName)}. Reply to this email if you have any questions.`,
+    }),
+  });
+}
+
+/** Nudge for a requirements form that's still unanswered. `automated: true`
+ *  when it comes from ClientRequestReminderScheduler rather than a staff member
+ *  clicking "Send reminder" — the wording softens accordingly. */
+async function sendClientRequestReminder({
+  to, cc, recipientName, brandName, logoUrl, projectName, subject, formUrl, dueAt, automated,
+}) {
+  const safeName = escapeHtml(recipientName || 'there');
+  const dueLabel = dueAt ? formatEmailDate(dueAt) : null;
+  const overdue = dueAt ? new Date(`${String(dueAt).slice(0, 10)}T23:59:59`) < new Date() : false;
+
+  const bodyHtml = `
+    <p style="margin:0 0 12px;color:#374151;font-size:15px;line-height:1.6;">Hi <strong>${safeName}</strong>,</p>
+    <p style="margin:0;color:#374151;font-size:15px;line-height:1.6;">
+      ${automated ? 'A quick automatic reminder' : 'Just a friendly reminder'} — the requirements form for
+      <strong>${escapeHtml(projectName)}</strong> is still waiting on you.
+    </p>
+    ${dueLabel
+      ? `<p style="margin:18px 0 0;color:#374151;font-size:14px;line-height:1.6;">${overdue
+          ? `It was due on <strong>${escapeHtml(dueLabel)}</strong>.`
+          : `It's due on <strong>${escapeHtml(dueLabel)}</strong>.`}</p>`
+      : ''}
+    <a href="${formUrl}" style="display:inline-block;margin-top:24px;background:${BRAND_ACCENT};color:${BRAND_PRIMARY};text-decoration:none;padding:12px 22px;border-radius:8px;font-size:14px;font-weight:700;">Fill in the form</a>
+    <p style="margin:20px 0 0;color:#9ca3af;font-size:12px;line-height:1.6;">
+      Already sent it over? You can ignore this message.
+    </p>
+  `;
+
+  return sendMail({
+    to,
+    cc,
+    subject: `Reminder: ${subject}`,
+    html: emailLayout({
+      brandName,
+      logoUrl,
+      title: subject,
+      accentColor: overdue ? '#dc2626' : BRAND_PRIMARY,
+      badgeLabel: overdue ? 'Overdue' : 'Reminder',
+      badgeBg: overdue ? '#fee2e2' : '#fef3c7',
+      badgeColor: overdue ? '#991b1b' : BRAND_PRIMARY,
+      bodyHtml,
+      footerHtml: `You're receiving this because ${escapeHtml(brandName)} is working with you on ${escapeHtml(projectName)}. Reply to this email if you have any questions.`,
+    }),
+  });
+}
+
+/** Forwards a newly-submitted lead to the client the capturing LeadForm is
+ *  linked to (LeadForm.notifyClientId — see LeadService#submitPublic). Only
+ *  fires when a form has been explicitly linked to a client; unlinked forms
+ *  never trigger this. `answers` is [{ label, value }], already filtered down
+ *  to whatever the form asked beyond name/email/phone. */
+async function sendLeadNotification({
+  to, clientName, brandName, logoUrl, formName, fullName, email, phone, campaign, answers,
+}) {
+  const safeClientName = escapeHtml(clientName || 'there');
+  const rows = [
+    fullName ? { label: 'Name', value: fullName } : null,
+    email ? { label: 'Email', value: email } : null,
+    phone ? { label: 'Phone', value: phone } : null,
+    campaign ? { label: 'Campaign', value: campaign } : null,
+    ...(answers || []),
+  ].filter(Boolean);
+
+  const rowsHtml = rows.map((r) => `
+    <tr>
+      <td style="padding:10px 0;color:#6b7280;font-size:13px;width:140px;vertical-align:top;">${escapeHtml(r.label)}</td>
+      <td style="padding:10px 0;color:#111827;font-size:14px;font-weight:600;">${
+        r.isLink
+          ? `<a href="${escapeHtml(r.value)}" style="color:${BRAND_PRIMARY};">View attachment</a>`
+          : escapeHtml(r.value)
+      }</td>
+    </tr>
+  `).join('');
+
+  const bodyHtml = `
+    <p style="margin:0 0 12px;color:#374151;font-size:15px;line-height:1.6;">Hi <strong>${safeClientName}</strong>,</p>
+    <p style="margin:0;color:#374151;font-size:15px;line-height:1.6;">
+      A new lead just came in through <strong>${escapeHtml(formName)}</strong>.
+    </p>
+    <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:18px 20px;margin:22px 0 0;">
+      <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;">
+        ${rowsHtml}
+      </table>
+    </div>
+  `;
+
+  return sendMail({
+    to,
+    subject: `New lead: ${fullName || email || 'Someone'} via ${formName}`,
+    html: emailLayout({
+      brandName,
+      logoUrl,
+      title: 'New Lead',
+      accentColor: BRAND_PRIMARY,
+      badgeLabel: 'New Lead',
+      badgeBg: '#fef3c7',
+      badgeColor: BRAND_PRIMARY,
+      bodyHtml,
+      footerHtml: `This is an automated message from ${escapeHtml(brandName)} — you're receiving it because this lead form is linked to your account.`,
+    }),
+  });
+}
+
+// Default wording for the "thank you for your payment" email — used whenever
+// the org hasn't customized `paymentThankYouSubject`/`paymentThankYouBody`
+// under Admin → Branding. Kept as plain text with {{placeholders}} so the
+// same string doubles as what's shown (pre-filled) in the admin editor.
+const DEFAULT_PAYMENT_THANKYOU_SUBJECT = 'Thank you for your payment — invoice {{invoiceNumber}}';
+const DEFAULT_PAYMENT_THANKYOU_BODY = 'Hi {{clientName}},\n\n'
+  + 'Thank you — we\'ve received your payment of {{amount}} for invoice {{invoiceNumber}}. '
+  + 'The invoice is now marked as paid.\n\n'
+  + 'We appreciate your business!\n\n'
+  + '— {{brandName}}';
+
+/** Fills {{placeholder}} tokens in an admin-authored (or default) template string. */
+function fillTemplate(template, vars) {
+  return String(template || '').replace(/\{\{\s*(\w+)\s*\}\}/g, (m, key) => (
+    Object.prototype.hasOwnProperty.call(vars, key) ? String(vars[key] ?? '') : m
+  ));
+}
+
+/**
+ * Sent after an invoice is fully settled — by a Stripe card payment or a
+ * manually-recorded one — never on a part payment. Subject/body are
+ * admin-editable plain-text templates (Admin → Branding → Payment Thank-You
+ * Email) with `{{placeholder}}` tokens; the surrounding layout (logo,
+ * branding, footer) is the same `emailLayout` every transactional email uses,
+ * so a custom template only ever changes the wording, never the chrome.
+ */
+async function sendPaymentThankYou({
+  to, clientName, brandName, logoUrl, invoiceNumber, amount, currency, methodLabel, portalUrl,
+  subjectTemplate, bodyTemplate,
+}) {
+  const vars = {
+    clientName: clientName || 'there',
+    brandName,
+    invoiceNumber,
+    amount: amount != null ? `${currency || ''} ${Number(amount).toLocaleString(undefined, { minimumFractionDigits: 2 })}`.trim() : '',
+    currency: currency || '',
+    methodLabel: methodLabel || '',
+  };
+
+  const subject = fillTemplate(subjectTemplate || DEFAULT_PAYMENT_THANKYOU_SUBJECT, vars);
+  const bodyText = fillTemplate(bodyTemplate || DEFAULT_PAYMENT_THANKYOU_BODY, vars);
+  const bodyHtml = `
+    ${bodyText.split('\n\n').map((para) => `<p style="margin:0 0 14px;color:#374151;font-size:15px;line-height:1.6;">${escapeHtml(para).replace(/\n/g, '<br>')}</p>`).join('')}
+    ${portalUrl
+      ? `<a href="${portalUrl}" style="display:inline-block;margin-top:8px;background:${BRAND_ACCENT};color:${BRAND_PRIMARY};text-decoration:none;padding:12px 22px;border-radius:8px;font-size:14px;font-weight:700;">View Invoice</a>`
+      : ''}
+  `;
+
+  return sendMail({
+    to,
+    subject,
+    html: emailLayout({
+      brandName,
+      logoUrl,
+      title: 'Payment Received',
+      accentColor: BRAND_PRIMARY,
+      badgeLabel: 'Paid',
+      badgeBg: '#dcfce7',
+      badgeColor: '#166534',
+      bodyHtml,
+      footerHtml: `This is an automated message from ${escapeHtml(brandName)}.`,
+    }),
+  });
+}
+
+module.exports = { sendMail, verifyTransport, sendPayrollReady, sendLeaveUpdate, sendProfileReviewUpdate, sendAppraisalUpdate, sendProjectAssigned, sendTaskAssigned, sendTaskReminder, sendPasswordReset, sendAdminPasswordReset, sendStageAdvance, sendUserInvite, sendPortalInvite, sendPortalLoginCode, sendEmailChangeCode, sendDocumentReviewLink, sendDocumentRemind, sendInvoiceEmail, sendClientRequestForm, sendClientRequestReminder, sendLeadNotification, sendPaymentThankYou, DEFAULT_PAYMENT_THANKYOU_SUBJECT, DEFAULT_PAYMENT_THANKYOU_BODY };

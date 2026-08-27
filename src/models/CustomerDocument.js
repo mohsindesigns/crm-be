@@ -73,6 +73,16 @@ module.exports = (sequelize, DataTypes) => {
     discountValue: {
       type: DataTypes.DECIMAL(12, 2),
     },
+    // How many recurring billing cycles this discount lasts once the deal is sold
+    // — e.g. 3 means "discounted for the first 3 invoices, then full price."
+    // Distinct from `validUntil`, which is how long this PROPOSAL itself stands
+    // before the client must respond, not how long the price inside it lasts
+    // once agreed. Null means the discount never expires. Carried onto the
+    // resulting ClientPackage(s) at conversion — see convert()'s
+    // discountEndsAt computation.
+    discountCycles: {
+      type: DataTypes.INTEGER,
+    },
     // [{ description, qty, unitPrice }, ...] — quotations only.
     lineItems: {
       type: DataTypes.JSON,
@@ -185,6 +195,21 @@ module.exports = (sequelize, DataTypes) => {
     },
     respondedAt: {
       type: DataTypes.DATE,
+    },
+    // Pay-before-convert: a client paying by card is sent straight to a Stripe
+    // Checkout Session (mode: "payment", not a Stripe Invoice — see
+    // StripeService.js header) for the document's own total, BEFORE any
+    // Client/Project/Invoice exists — see
+    // StripeService.startDocumentPayment/_convertAndMarkPaidFromDocument. Nothing
+    // is created if they abandon the page, which is the whole point: raising an
+    // invoice (or spinning up a project) for a sale that was never actually paid
+    // is the liability this flow exists to avoid. Column names hold the Checkout
+    // Session's id/url (kept from the pre-rewrite Invoice-based flow).
+    stripeInvoiceId: {
+      type: DataTypes.STRING(255),
+    },
+    stripeHostedUrl: {
+      type: DataTypes.TEXT,
     },
     // Soft delete — see models/softDeletable.js. Deactivated rows drop out of
     // default listings but are never destroyed.

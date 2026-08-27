@@ -12,18 +12,33 @@
  *
  * Non-admins should be given a deactivate/void/cancel path instead of delete
  * wherever one exists (invoice void, user isActive, keyword archive, …).
+ *
+ * A handful of routes want the same admins-only rule for something that isn't
+ * a deletion at all (the client-request approval gate, for one). Those use
+ * `adminOnly.withMessage('…')` so the 403 the user reads describes what they
+ * actually tried to do, instead of talking about Active/Inactive status:
+ *
+ *   router.post('/:id/approve', adminOnly.withMessage('Only an administrator can approve this.'), handler)
  */
 
 const ADMIN_ROLE_KEYS = ['super_admin', 'admin'];
 
-const adminOnly = (req, res, next) => {
-  const roleKey = req.user?.role?.key;
-  if (ADMIN_ROLE_KEYS.includes(roleKey)) return next();
-  return res.status(403).json({
-    message: 'Only an administrator can change a record’s Active/Inactive status. Ask an admin to do it — records are never deleted.',
-  });
-};
+const DEFAULT_MESSAGE =
+  'Only an administrator can change a record’s Active/Inactive status. Ask an admin to do it — records are never deleted.';
+
+/** Builds the gate with a caller-supplied 403 message. The default export is
+ *  just this bound to the deletion wording, so there is one rule, not two. */
+function withMessage(message) {
+  return (req, res, next) => {
+    const roleKey = req.user?.role?.key;
+    if (ADMIN_ROLE_KEYS.includes(roleKey)) return next();
+    return res.status(403).json({ message });
+  };
+}
+
+const adminOnly = withMessage(DEFAULT_MESSAGE);
 
 adminOnly.ADMIN_ROLE_KEYS = ADMIN_ROLE_KEYS;
+adminOnly.withMessage = withMessage;
 
 module.exports = adminOnly;

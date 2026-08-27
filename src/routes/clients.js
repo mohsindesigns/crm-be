@@ -26,8 +26,15 @@ router.post('/:id/contacts/:contactId/activate', adminOnly, rbac('clients.update
 // adminOnly on purpose: it changes how money is collected from a real client,
 // which isn't something a project-level role should be able to flip.
 router.patch('/:id/billing-mode', adminOnly, rbac('clients.update'), (req, res, next) => ClientController.setBillingMode(req, res, next));
+// Whether the org's card processing fee (Admin → Payments) is passed on to this
+// client's Stripe charges, or absorbed by the agency instead. Same adminOnly
+// rule as billing-mode — it's a money decision, not a project-level one.
+router.patch('/:id/card-fee', adminOnly, rbac('clients.update'), (req, res, next) => ClientController.setChargeCardFee(req, res, next));
+
+router.get('/:id/timeline', rbac('clients.read'), (req, res, next) => ClientController.getTimeline(req, res, next));
 
 router.get('/:id/packages', rbac('clients.read'), (req, res, next) => ClientController.listSoldPackages(req, res, next));
+router.get('/:id/subscriptions', rbac('clients.read'), (req, res, next) => ClientController.listSubscriptions(req, res, next));
 router.get('/:id/sellable-packages', rbac('projects.create'), (req, res, next) => ClientController.listSellablePackages(req, res, next));
 router.post('/:id/sell-package', rbac('projects.create'), (req, res, next) => ClientController.sellPackage(req, res, next));
 router.post('/:id/sell-packages', rbac('projects.create'), (req, res, next) => ClientController.sellPackages(req, res, next));

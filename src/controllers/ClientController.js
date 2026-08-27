@@ -1,6 +1,7 @@
 const { body } = require('express-validator');
 const ClientService = require('../services/ClientService');
 const EmailService = require('../services/EmailService');
+const SubscriptionService = require('../services/SubscriptionService');
 const validate = require('../middleware/validate');
 const { isTruthy } = require('../services/SoftDeleteService');
 
@@ -24,9 +25,11 @@ class ClientController {
 
   async getOne(req, res, next) {
     try {
-      res.json(await ClientService.findById(req.params.id, req.orgId, {
+      const client = await ClientService.findById(req.params.id, req.orgId, {
         includeInactiveContacts: isTruthy(req.query.includeInactive),
-      }));
+      });
+      const billingCompany = await ClientService.resolveBillingCompany(client, req.orgId);
+      res.json({ ...client.toJSON(), billingCompany });
     } catch (err) { next(err); }
   }
 
@@ -46,6 +49,12 @@ class ClientController {
   async setBillingMode(req, res, next) {
     try {
       res.json(await ClientService.setBillingMode(req.params.id, req.orgId, req.body?.billingMode));
+    } catch (err) { next(err); }
+  }
+
+  async setChargeCardFee(req, res, next) {
+    try {
+      res.json(await ClientService.setChargeCardFee(req.params.id, req.orgId, req.body?.chargeCardFee));
     } catch (err) { next(err); }
   }
 
@@ -99,9 +108,41 @@ class ClientController {
     } catch (err) { next(err); }
   }
 
+  async getTimeline(req, res, next) {
+    try {
+      // Quotation/proposal/agreement and invoice/payment activity are gated the
+      // same way their own tabs/routes are (admin.access, billing.read) — a
+      // caller without those permissions gets project history only, not
+      // document/billing detail leaking through a different endpoint.
+      const role = req.user?.role;
+      const isSystemAdmin = ['super_admin', 'admin'].includes(role?.key);
+      const perms = role?.permissions || {};
+      const canViewDocuments = isSystemAdmin || !!perms['admin.access'];
+      const canViewInvoices = isSystemAdmin || !!perms['billing.read'];
+      res.json(await ClientService.getTimeline(req.params.id, req.orgId, {
+        includeDocuments: canViewDocuments,
+        includeInvoices: canViewInvoices,
+      }));
+    } catch (err) { next(err); }
+  }
+
   async listSoldPackages(req, res, next) {
     try {
       res.json(await ClientService.listSoldPackages(req.params.id, req.orgId));
+    } catch (err) { next(err); }
+  }
+
+  /**
+   * The client's Subscriptions tab. Deliberately NOT a filter over
+   * listSoldPackages: this returns the renewal date, the entitlement and the
+   * invoice that unblocks a suspended one, all resolved server-side — the same
+   * payload the client sees in their own portal, so staff and client are looking
+   * at exactly the same answer to "is this live?".
+   */
+  async listSubscriptions(req, res, next) {
+    try {
+      await ClientService.findById(req.params.id, req.orgId);
+      res.json(await SubscriptionService.listForClient(req.params.id, req.orgId));
     } catch (err) { next(err); }
   }
 

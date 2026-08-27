@@ -22,7 +22,12 @@ function dateOnly(d) {
 function applyTaskFilters(where, query) {
   const { status, assigneeId, projectId, type, due, reviewerId, createdBy } = query;
 
-  if (status && status !== 'all' && status !== 'open') {
+  // "completed" is a combined alias for the two finished states — the review
+  // pipeline closes as "approved", ad-hoc/self-owned tasks close as "done", and
+  // the Completed tab wants both without making the caller know that split.
+  if (status === 'completed') {
+    where.status = { [Op.in]: ['done', 'approved'] };
+  } else if (status && status !== 'all' && status !== 'open') {
     where.status = status;
   } else if (status === 'open' || (!status && query.defaultOpen)) {
     where.status = { [Op.notIn]: ['done', 'approved'] };
@@ -40,6 +45,12 @@ function applyTaskFilters(where, query) {
   if (reviewerId) where.reviewerId = reviewerId;
   if (projectId) where.projectId = projectId;
   if (type) where.type = type;
+
+  // Approvals tab: tasks flagged for technical audit and still awaiting a
+  // decision. Sent explicitly by the org-wide /tasks route (admins); the /mine
+  // route forces both below for scope=approvals regardless of what's passed.
+  if (query.requiresTechnicalAudit === 'true') where.requiresTechnicalAudit = true;
+  if (query.auditStatus) where.auditStatus = query.auditStatus;
 
   const today = dateOnly(startOfToday());
   const weekEnd = new Date(startOfToday());
@@ -79,6 +90,7 @@ function taskIncludes() {
     { model: User, as: 'assignee', attributes: ['id', 'name', 'avatarUrl'] },
     { model: User, as: 'reviewer', attributes: ['id', 'name', 'avatarUrl'] },
     { model: User, as: 'creator', attributes: ['id', 'name'] },
+    { model: User, as: 'pendingAssignee', attributes: ['id', 'name', 'avatarUrl'] },
     {
       model: Project,
       as: 'project',
@@ -238,35 +250,50 @@ router.get('/mine', async (req, res, next) => {
       }
     }
 
+    // Approvals: tasks this employee created that are waiting on technical-audit
+    // approval, plus tasks parked on them as the pending assignee (pendingAssigneeId)
+    // — they aren't assigneeId/reviewerId yet, so the default ownership clause below
+    // would otherwise hide these from the person actually waiting on the decision.
     const ownership = scope === 'assigned_by_me'
       ? { createdBy: req.user.id }
-      : {
-        [Op.or]: [
-          { assigneeId: req.user.id },
-          { reviewerId: req.user.id },
-        ],
-      };
+      : scope === 'approvals'
+        ? { [Op.or]: [{ createdBy: req.user.id }, { pendingAssigneeId: req.user.id }] }
+        : {
+          [Op.or]: [
+            { assigneeId: req.user.id },
+            { reviewerId: req.user.id },
+          ],
+        };
 
     const where = applyTaskFilters({
       orgId: req.orgId,
       ...ownership,
     }, {
       ...req.query,
-      // The "assigned by me" scope IS a createdBy pin. Letting a client-supplied
-      // createdBy through here would overwrite that pin and widen the view to
-      // another user's created tasks.
-      createdBy: scope === 'assigned_by_me' ? undefined : req.query.createdBy,
+      // The "assigned by me" / "approvals" scopes ARE an ownership pin. Letting a
+      // client-supplied createdBy through here would overwrite that pin and widen
+      // the view to another user's created tasks.
+      createdBy: ['assigned_by_me', 'approvals'].includes(scope) ? undefined : req.query.createdBy,
       // Default "All open" when no status selected
       defaultOpen: !req.query.status,
     });
 
-    // "Assigned by me" is a tracking/proof view — always include tasks even when the
-    // project was later completed/cancelled. Same for an explicit status chip (To do,
-    // Submitted, …): matching tasks must not disappear just because the project closed.
-    // Default "All open" on My Tasks still hides completed/cancelled projects.
+    // Authoritative regardless of query params — this is what makes it an
+    // "awaiting decision" queue rather than just another task filter.
+    if (scope === 'approvals') {
+      where.requiresTechnicalAudit = true;
+      where.auditStatus = 'pending';
+    }
+
+    // "Assigned by me" / "Approvals" are tracking/proof views — always include tasks
+    // even when the project was later completed/cancelled. Same for an explicit status
+    // chip (To do, Submitted, …): matching tasks must not disappear just because the
+    // project closed. Default "All open" on My Tasks still hides completed/cancelled
+    // projects.
     const includeClosedProjects =
       scope === 'assigned_by_me'
-      || ['done', 'approved', 'all'].includes(status)
+      || scope === 'approvals'
+      || ['done', 'approved', 'all', 'completed'].includes(status)
       || !!(status && status !== 'open');
 
     const tasks = await Task.findAll({
@@ -299,6 +326,7 @@ router.get('/mine', async (req, res, next) => {
       { model: User, as: 'assignee', attributes: ['id', 'name', 'avatarUrl'] },
       { model: User, as: 'reviewer', attributes: ['id', 'name', 'avatarUrl'] },
       { model: User, as: 'creator', attributes: ['id', 'name'] },
+      { model: User, as: 'pendingAssignee', attributes: ['id', 'name', 'avatarUrl'] },
       ],
       order: taskOrder(req.query.sort || 'due_asc'),
     });

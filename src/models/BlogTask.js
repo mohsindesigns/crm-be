@@ -56,6 +56,11 @@ module.exports = (sequelize, DataTypes) => {
     fileUrl: {
       type: DataTypes.TEXT,
     },
+    // Original upload filename (or "Link" for a pasted URL) — lets the sheet
+    // show what was attached without opening it. Mirrors ContentSubmission.fileName.
+    fileName: {
+      type: DataTypes.STRING(255),
+    },
     publishedUrl: {
       type: DataTypes.TEXT,
     },
@@ -75,6 +80,14 @@ module.exports = (sequelize, DataTypes) => {
     // Who should write this blog (like Keyword.assignedWriterId for content).
     // Import/manual add can assign a blog_writer; submit creates/syncs their Task.
     assignedWriterId: {
+      type: DataTypes.CHAR(36),
+      references: { model: 'users', key: 'id' },
+    },
+    // Who designs the blog's featured/inline image — only settable once the blog
+    // itself is approved (see SeoService.updateBlogTask), since there's nothing
+    // to illustrate before then. Assigning creates a `blog_image` Task, same
+    // ensure-Task pattern as assignedWriterId/ensureBlogTask.
+    assignedDesignerId: {
       type: DataTypes.CHAR(36),
       references: { model: 'users', key: 'id' },
     },
@@ -116,6 +129,7 @@ module.exports = (sequelize, DataTypes) => {
     BlogTask.belongsTo(db.User, { foreignKey: 'createdBy', as: 'creator' });
     BlogTask.belongsTo(db.User, { foreignKey: 'submittedBy', as: 'submitter' });
     BlogTask.belongsTo(db.User, { foreignKey: 'assignedWriterId', as: 'assignedWriter' });
+    BlogTask.belongsTo(db.User, { foreignKey: 'assignedDesignerId', as: 'assignedDesigner' });
     BlogTask.belongsTo(db.User, { foreignKey: 'reviewedBy', as: 'reviewer' });
   };
 

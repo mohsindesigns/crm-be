@@ -2,6 +2,8 @@ const { Op } = require('sequelize');
 const db = require('../models');
 const InvoiceService = require('./InvoiceService');
 const { addCycle } = require('./RetainerService');
+const SubscriptionService = require('./SubscriptionService');
+const { billingLineLabel } = SubscriptionService;
 
 function todayLocal() {
   const d = new Date();
@@ -19,7 +21,13 @@ async function runRetainerInvoicing() {
       isActive: true,
       nextInvoiceDate: { [Op.lte]: today },
     },
-    include: [{ model: db.Client, as: 'client', attributes: ['id', 'name', 'orgId'] }],
+    include: [
+      { model: db.Client, as: 'client', attributes: ['id', 'name', 'orgId'] },
+      // Only needed to label the renewal line — a subscription's invoice has to
+      // name what it renews ("Business Hosting (Subscription · monthly ·
+      // Hostinger)"), since that's the line whose access lapses if it goes unpaid.
+      { model: db.Package, as: 'package', attributes: ['id', 'name', 'isSubscription', 'vendor'], required: false },
+    ],
   });
 
   let retainerCount = 0;
@@ -52,7 +60,13 @@ async function runRetainerInvoicing() {
         dueAt: today,
         notes: `Auto-generated from retainer — ${retainer.cycle} service`,
         lines: [{
-          description: `Retainer — ${retainer.cycle} service`,
+          description: retainer.package?.isSubscription
+            ? billingLineLabel({
+              label: retainer.package.name,
+              isSubscription: true,
+              vendor: retainer.package.vendor,
+            }, retainer.cycle)
+            : `Retainer — ${retainer.cycle} service`,
           qty: 1,
           unitPrice: parseFloat(retainer.amount),
         }],
@@ -108,6 +122,24 @@ async function runRetainerInvoicing() {
     );
   } catch (err) {
     console.error('[RetainerScheduler] Overdue mark failed:', err.message);
+  }
+
+  /**
+   * Re-derive every subscription's entitlement, immediately after the overdue
+   * pass above so the two always agree.
+   *
+   * Payments resync their own subscriptions inline (see
+   * SubscriptionService.syncForInvoice), so this sweep exists for the direction
+   * no event covers: nothing HAPPENS when a renewal invoice quietly goes past its
+   * due date, and that's precisely the moment a client's hosting should stop
+   * reading as live in their portal. Reuses this scheduler's existing 6-hourly
+   * tick rather than adding a scheduler of its own.
+   */
+  try {
+    const { changed } = await SubscriptionService.syncAll();
+    if (changed) console.log(`[RetainerScheduler] Subscription entitlements changed: ${changed}.`);
+  } catch (err) {
+    console.error('[RetainerScheduler] Subscription entitlement sweep failed:', err.message);
   }
 
   if (retainerCount || installmentCount) {

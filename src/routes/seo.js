@@ -29,9 +29,21 @@ router.post('/projects/:projectId/keywords', rbac('projects.act'), async (req, r
   } catch (e) { next(e); }
 });
 
+// Which company detail fields (logo, address, tax number, email, phone,
+// website, note) print on the report's letterhead. Comma-separated override
+// for API callers; the app itself no longer sends this — absent means "use
+// the org's configured default" (Admin → Branding), see SeoService.
+function letterheadFieldsFromQuery(req) {
+  return typeof req.query.fields === 'string' && req.query.fields.length
+    ? req.query.fields.split(',').map((s) => s.trim()).filter(Boolean)
+    : null;
+}
+
 router.get('/projects/:projectId/keywords/pdf', rbac('projects.read'), async (req, res, next) => {
   try {
-    const { buffer, project } = await SeoService.generateKeywordReportBuffer(req.params.projectId, req.orgId);
+    const { buffer, project } = await SeoService.generateKeywordReportBuffer(
+      req.params.projectId, req.orgId, letterheadFieldsFromQuery(req),
+    );
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="keyword-report-${project.id}.pdf"`);
     res.send(buffer);
@@ -40,10 +52,21 @@ router.get('/projects/:projectId/keywords/pdf', rbac('projects.read'), async (re
 
 router.get('/projects/:projectId/backlinks/pdf', rbac('projects.read'), async (req, res, next) => {
   try {
-    const { buffer, project } = await SeoService.generateBacklinkReportBuffer(req.params.projectId, req.orgId);
+    const { buffer, project } = await SeoService.generateBacklinkReportBuffer(
+      req.params.projectId, req.orgId, letterheadFieldsFromQuery(req),
+    );
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="backlink-report-${project.id}.pdf"`);
     res.send(buffer);
+  } catch (e) { next(e); }
+});
+
+router.get('/projects/:projectId/keywords/csv', rbac('projects.read'), async (req, res, next) => {
+  try {
+    const { csv, project } = await SeoService.generateKeywordCsv(req.params.projectId, req.orgId);
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="keywords-${project.id}.csv"`);
+    res.send(csv);
   } catch (e) { next(e); }
 });
 
@@ -61,13 +84,12 @@ router.patch('/keywords/:id', rbac('projects.act'), async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// Kept on the DELETE verb so existing clients don't break, but the effect is a
-// deactivation — nothing is destroyed. Reactivate via PATCH /keywords/:id
-// { status: 'active' }.
-router.delete('/keywords/:id', adminOnly, rbac('projects.act'), async (req, res, next) => {
+// Permanently deletes — not adminOnly: the keyword's own submitter can delete
+// it too while it's still unassigned/unapproved — see SeoService.deleteKeyword.
+router.delete('/keywords/:id', rbac('projects.act'), async (req, res, next) => {
   try {
-    const kw = await SeoService.deleteKeyword(req.params.id, req.orgId);
-    res.json({ message: 'Keyword set to Inactive', keyword: kw });
+    const kw = await SeoService.deleteKeyword(req.params.id, req.orgId, req.user);
+    res.json({ message: 'Keyword deleted', keyword: kw });
   } catch (e) { next(e); }
 });
 
@@ -80,6 +102,22 @@ router.delete('/projects/:projectId/keywords', adminOnly, rbac('projects.act'), 
 router.post('/projects/:projectId/keywords/bulk-delete', adminOnly, rbac('projects.act'), async (req, res, next) => {
   try {
     res.json(await SeoService.bulkDeleteKeywords(req.params.projectId, req.orgId, req.body?.ids));
+  } catch (e) { next(e); }
+});
+
+// Not adminOnly, same as PATCH /keywords/:id { status: 'active' } — reactivating
+// isn't destructive, so it's gated the same way the per-row status dropdown is.
+router.post('/projects/:projectId/keywords/bulk-activate', rbac('projects.act'), async (req, res, next) => {
+  try {
+    res.json(await SeoService.bulkActivateKeywords(req.params.projectId, req.orgId, req.body?.ids));
+  } catch (e) { next(e); }
+});
+
+// Non-destructive counterpart to bulk-delete (which really deletes now) —
+// same adminOnly gate as bulk-delete since it's still a bulk sheet action.
+router.post('/projects/:projectId/keywords/bulk-deactivate', adminOnly, rbac('projects.act'), async (req, res, next) => {
+  try {
+    res.json(await SeoService.bulkDeactivateKeywords(req.params.projectId, req.orgId, req.body?.ids));
   } catch (e) { next(e); }
 });
 
@@ -148,11 +186,11 @@ router.patch('/backlinks/:id', rbac('projects.act'), async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// Deactivates, never destroys. Reactivate via PATCH /backlinks/:id { isActive: true }.
+// Permanently deletes.
 router.delete('/backlinks/:id', adminOnly, rbac('projects.act'), async (req, res, next) => {
   try {
     const bl = await SeoService.deleteBacklink(req.params.id, req.orgId);
-    res.json({ message: 'Backlink set to Inactive', backlink: bl });
+    res.json({ message: 'Backlink deleted', backlink: bl });
   } catch (e) { next(e); }
 });
 
@@ -165,6 +203,13 @@ router.delete('/projects/:projectId/backlinks', adminOnly, rbac('projects.act'),
 router.post('/projects/:projectId/backlinks/bulk-delete', adminOnly, rbac('projects.act'), async (req, res, next) => {
   try {
     res.json(await SeoService.bulkDeleteBacklinks(req.params.projectId, req.orgId, req.body?.ids));
+  } catch (e) { next(e); }
+});
+
+// Non-destructive counterpart to bulk-delete (which really deletes now).
+router.post('/projects/:projectId/backlinks/bulk-deactivate', adminOnly, rbac('projects.act'), async (req, res, next) => {
+  try {
+    res.json(await SeoService.bulkDeactivateBacklinks(req.params.projectId, req.orgId, req.body?.ids));
   } catch (e) { next(e); }
 });
 
@@ -242,6 +287,12 @@ router.delete('/content/:id', rbac('projects.act'), async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+router.post('/projects/:projectId/content/bulk-delete', rbac('projects.act'), async (req, res, next) => {
+  try {
+    res.json(await SeoService.bulkDeleteContent(req.params.projectId, req.orgId, req.body?.ids, req.user));
+  } catch (e) { next(e); }
+});
+
 // ─── Blog Tasks ───────────────────────────────────────────────────────────────
 router.get('/projects/:projectId/blogs', rbac('projects.read'), async (req, res, next) => {
   try {
@@ -271,6 +322,15 @@ router.get('/projects/:projectId/blog-sheet', rbac('projects.read'), async (req,
   } catch (e) { next(e); }
 });
 
+router.get('/projects/:projectId/blog-sheet/csv', rbac('projects.read'), async (req, res, next) => {
+  try {
+    const { csv, project } = await SeoService.generateBlogCsv(req.params.projectId, req.orgId);
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="blog-sheet-${project.id}.csv"`);
+    res.send(csv);
+  } catch (e) { next(e); }
+});
+
 router.post('/projects/:projectId/blog-sheet', rbac('projects.act'), async (req, res, next) => {
   try {
     const bt = await SeoService.createBlogSheetRow(req.params.projectId, req.body, req.orgId, req.user.id);
@@ -283,9 +343,13 @@ router.post('/projects/:projectId/blog-sheet/submit', rbac('projects.act'), uplo
   try {
     // Same as content: uploaded file OR pasted link counts as the deliverable.
     let fileUrl = String(req.body.fileUrl || '').trim() || undefined;
+    let fileName = String(req.body.fileName || '').trim() || undefined;
     if (req.file) {
       const media = await MediaService.upload(req.file.buffer, req.file.originalname, req.file.mimetype);
       fileUrl = media.url;
+      fileName = req.file.originalname;
+    } else if (fileUrl && !fileName) {
+      fileName = 'Link';
     }
     const bt = await SeoService.submitBlogDeliverable(req.params.projectId, {
       blogId: req.body.blogId || null,
@@ -294,6 +358,7 @@ router.post('/projects/:projectId/blog-sheet/submit', rbac('projects.act'), uplo
       mainKeyword: req.body.mainKeyword,
       assignedWriterId: req.body.assignedWriterId || null,
       fileUrl,
+      fileName,
     }, req.orgId, req.user);
     res.status(201).json(bt);
   } catch (e) { next(e); }
@@ -317,18 +382,49 @@ router.patch('/blog-sheet/:id/review', rbac('projects.act'), async (req, res, ne
   } catch (e) { next(e); }
 });
 
-// Deactivates, never destroys.
-router.delete('/blog-sheet/:id', adminOnly, rbac('projects.act'), async (req, res, next) => {
+// Permanently deletes — not adminOnly: the blog's own submitter can delete
+// it too while it's still unapproved — see SeoService.deleteBlogTask.
+router.delete('/blog-sheet/:id', rbac('projects.act'), async (req, res, next) => {
   try {
-    const bt = await SeoService.deleteBlogTask(req.params.id, req.orgId, false);
+    const bt = await SeoService.deleteBlogTask(req.params.id, req.orgId, req.user);
+    res.json({ message: 'Blog deleted', blog: bt });
+  } catch (e) { next(e); }
+});
+
+// Non-destructive: sets a single row to Inactive — same owner/approved guard
+// as delete, split out as its own action now that delete really deletes.
+router.post('/blog-sheet/:id/deactivate', rbac('projects.act'), async (req, res, next) => {
+  try {
+    const bt = await SeoService.deactivateBlogTask(req.params.id, req.orgId, req.user);
     res.json({ message: 'Blog set to Inactive', blog: bt });
   } catch (e) { next(e); }
 });
 
 router.post('/blog-sheet/:id/activate', adminOnly, rbac('projects.act'), async (req, res, next) => {
   try {
-    const bt = await SeoService.deleteBlogTask(req.params.id, req.orgId, true);
+    const bt = await SeoService.setBlogTaskActive(req.params.id, req.orgId, true);
     res.json({ message: 'Blog set to Active', blog: bt });
+  } catch (e) { next(e); }
+});
+
+// Permanently deletes — adminOnly, same gate as bulkDeleteKeywords.
+router.post('/projects/:projectId/blog-sheet/bulk-delete', adminOnly, rbac('projects.act'), async (req, res, next) => {
+  try {
+    res.json(await SeoService.bulkDeleteBlogTasks(req.params.projectId, req.orgId, req.body?.ids));
+  } catch (e) { next(e); }
+});
+
+// Non-destructive counterpart to bulk-delete (which really deletes now) —
+// same adminOnly gate as bulk-delete since it's still a bulk sheet action.
+router.post('/projects/:projectId/blog-sheet/bulk-deactivate', adminOnly, rbac('projects.act'), async (req, res, next) => {
+  try {
+    res.json(await SeoService.bulkDeactivateBlogTasks(req.params.projectId, req.orgId, req.body?.ids));
+  } catch (e) { next(e); }
+});
+
+router.post('/projects/:projectId/blog-sheet/bulk-activate', rbac('projects.act'), async (req, res, next) => {
+  try {
+    res.json(await SeoService.bulkActivateBlogTasks(req.params.projectId, req.orgId, req.body?.ids));
   } catch (e) { next(e); }
 });
 

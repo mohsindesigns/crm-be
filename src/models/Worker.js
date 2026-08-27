@@ -102,6 +102,16 @@ module.exports = (sequelize, DataTypes) => {
     pendingAmendmentDiff: {
       type: DataTypes.TEXT,
     },
+    // Permanent per-employee override of which Shift Schedule (see
+    // ShiftSchedule.js) governs this worker's attendance timing — null means
+    // "use the org-wide default resolution" (an active date-ranged schedule,
+    // else PayrollSettings). Set/cleared from the worker's profile or from
+    // Policies → Attendance; applies every day regardless of that schedule's
+    // own date range until changed again. See HrService#resolveShiftTimings.
+    shiftScheduleId: {
+      type: DataTypes.CHAR(36),
+      references: { model: 'shift_schedules', key: 'id' },
+    },
   }, {
     tableName: 'workers',
     indexes: [{ fields: ['org_id'] }, { unique: true, fields: ['user_id'] }],
@@ -110,6 +120,10 @@ module.exports = (sequelize, DataTypes) => {
   Worker.associate = (db) => {
     Worker.belongsTo(db.Org, { foreignKey: 'orgId', as: 'org' });
     Worker.belongsTo(db.User, { foreignKey: 'userId', as: 'user' });
+    // One-directional only (no inverse hasMany on ShiftSchedule) — per
+    // schemaSync.js's own warning, the inverse is what risks Sequelize
+    // materializing a hard onDelete: CASCADE we don't want here.
+    Worker.belongsTo(db.ShiftSchedule, { foreignKey: 'shiftScheduleId', as: 'shiftSchedule' });
     Worker.hasMany(db.Attendance, { foreignKey: 'workerId', as: 'attendances' });
     Worker.hasMany(db.LeaveRequest, { foreignKey: 'workerId', as: 'leaveRequests' });
     Worker.hasMany(db.PayrollItem, { foreignKey: 'workerId', as: 'payrollItems' });

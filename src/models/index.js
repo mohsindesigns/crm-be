@@ -79,6 +79,13 @@ const modelFiles = [
   'ChatMessage',
   'ChatReaction',
   'ChatRoomEvent',
+  'LeadForm',
+  'Lead',
+  'LeadEvent',
+  'ActivityLog',
+  'RequirementFormTemplate',
+  'ClientRequest',
+  'ExportTemplate',
 ];
 
 modelFiles.forEach((name) => {

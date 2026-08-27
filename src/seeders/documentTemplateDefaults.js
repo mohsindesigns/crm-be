@@ -1,7 +1,13 @@
 /**
- * Starter document templates so admins can see the correct plain-text + {{token}}
- * shape for quotations, agreements, proposals, and the per-service fragment
- * used inside {{services_block}}.
+ * Starter document templates so admins can see the correct {{token}} shape
+ * for quotations, agreements, proposals, and the per-service fragment used
+ * inside {{services_block}}.
+ *
+ * quotation/agreement/proposal bodies (and defaultTerms) are rich-text HTML —
+ * they're authored/edited through the WYSIWYG editor (Admin → Quotes &
+ * Agreements) and rendered with real headings/bold, not a monospace dump —
+ * see utils/htmlSanitizer.js and utils/richTextPdf.js. service_fragment stays
+ * plain {{token}} text (it only ever fills {{services_block}}).
  *
  * Idempotent: ensureExampleTemplates(orgId) only inserts rows that are missing
  * (matched by type + serviceTypeKey + name).
@@ -9,158 +15,78 @@
 
 const { v4: uuidv4 } = require('uuid');
 
+const STARTER_NOTE = '<p><em>NOTE: This is a starter template. Edit the wording below, keep the {{tokens}} you need, then rename it (remove &quot;Example&quot;).</em></p>';
+
 const EXAMPLE_TEMPLATES = [
   {
     type: 'quotation',
     serviceTypeKey: 'standard',
     name: 'Example Quotation (starter)',
     defaultTerms:
-      '50% payment is due on acceptance of this quotation. The remaining 50% is due on delivery / go-live. '
-      + 'Prices are valid until the date shown above. Work outside this scope will be quoted separately.',
-    body: `NOTE: This is a starter template. Edit the wording below, keep the {{tokens}} you need, then rename it (remove "Example").
-
-Dear {{customer_name}},
-
-Thank you for considering {{agency_name}} for {{service}}.
-
-Please find our quotation below for {{business_name}}.
-
-────────────────────────────────
-SERVICES & PRICING
-────────────────────────────────
-{{services_block}}
-
-Subtotal: {{currency}} {{subtotal}}
-Discount: {{discount}}
-Total investment: {{currency}} {{total}}
-
-Quotation date: {{date}}
-Valid until: {{valid_until}}
-
-────────────────────────────────
-SCOPE / NOTES
-────────────────────────────────
-{{scope}}
-
-────────────────────────────────
-TERMS
-────────────────────────────────
-{{terms}}
-
-If you have any questions, reply to this email or call us.
-
-Warm regards,
-{{agency_name}}
-{{email}} | {{phone}}`,
+      '<p>50% payment is due on acceptance of this quotation. The remaining 50% is due on delivery / go-live. '
+      + 'Prices are valid until the date shown above. Work outside this scope will be quoted separately.</p>',
+    body: STARTER_NOTE + `
+<p>Dear {{customer_name}},</p>
+<p>Thank you for considering {{agency_name}} for {{service}}. Please find our quotation below for {{business_name}}.</p>
+<h2>Services &amp; Pricing</h2>
+<p>{{services_block}}</p>
+<p><strong>Subtotal:</strong> {{currency}} {{subtotal}}<br><strong>Discount:</strong> {{discount}}<br><strong>Total investment:</strong> {{currency}} {{total}}</p>
+<p>Quotation date: {{date}}<br>Valid until: {{valid_until}}</p>
+<h2>Terms</h2>
+<p>{{terms}}</p>
+<p>If you have any questions, reply to this email or call us.</p>
+<p>Warm regards,<br>{{agency_name}}<br>{{email}} | {{phone}}</p>`,
   },
   {
     type: 'agreement',
     serviceTypeKey: 'standard',
     name: 'Example Agreement (starter)',
     defaultTerms:
-      'This agreement becomes binding upon client acceptance. Either party may terminate with 30 days written notice. '
-      + 'Fees already paid for completed work are non-refundable. Confidential information shared during the engagement remains confidential.',
-    body: `NOTE: This is a starter template. Edit the wording below, keep the {{tokens}} you need, then rename it (remove "Example").
-
-SERVICE AGREEMENT
-
-This Service Agreement ("Agreement") is entered into on {{date}} between:
-
-Service Provider: {{agency_name}}
-Client: {{customer_name}}{{business_name}}
-Email: {{customer_email}}
-Phone: {{customer_phone}}
-
-────────────────────────────────
-1. SERVICES
-────────────────────────────────
-{{agency_name}} agrees to provide the following services:
-
-{{services_block}}
-
-────────────────────────────────
-2. FEES & PAYMENT
-────────────────────────────────
-Total contract value: {{currency}} {{total}}
-{{discount}}
-
-Payment schedule and commercial terms are set out under Terms below.
-
-────────────────────────────────
-3. TERM & VALIDITY
-────────────────────────────────
-Agreement date: {{date}}
-Valid / start reference: {{valid_until}}
-
-────────────────────────────────
-4. SCOPE
-────────────────────────────────
-{{scope}}
-
-────────────────────────────────
-5. TERMS & CONDITIONS
-────────────────────────────────
-{{terms}}
-
-By accepting this agreement electronically, the Client confirms they have read and agree to the terms above.
-
-Signed for {{agency_name}}
-Authorized Signatory`,
+      '<p>This agreement becomes binding upon client acceptance. Either party may terminate with 30 days written notice. '
+      + 'Fees already paid for completed work are non-refundable. Confidential information shared during the engagement remains confidential.</p>',
+    body: STARTER_NOTE + `
+<h2>Service Agreement</h2>
+<p>This Service Agreement (&quot;Agreement&quot;) is entered into on {{date}} between:</p>
+<p><strong>Service Provider:</strong> {{agency_name}}<br><strong>Client:</strong> {{customer_name}} {{business_name}}<br><strong>Email:</strong> {{customer_email}}<br><strong>Phone:</strong> {{customer_phone}}</p>
+<h2>1. Services</h2>
+<p>{{agency_name}} agrees to provide the following services:</p>
+<p>{{services_block}}</p>
+<h2>2. Fees &amp; Payment</h2>
+<p><strong>Total contract value:</strong> {{currency}} {{total}} {{discount}}</p>
+<p>Payment schedule and commercial terms are set out under Terms &amp; Conditions below.</p>
+<h2>3. Term &amp; Validity</h2>
+<p>Agreement date: {{date}}<br>Valid / start reference: {{valid_until}}</p>
+<h2>4. Terms &amp; Conditions</h2>
+<p>{{terms}}</p>
+<p>By accepting this agreement electronically, the Client confirms they have read and agree to the terms above.</p>
+<p><strong>Signed for {{agency_name}}</strong><br>Authorized Signatory</p>`,
   },
   {
     type: 'proposal',
     serviceTypeKey: 'standard',
     name: 'Example Proposal (starter)',
     defaultTerms:
-      'This proposal is an offer of services and is not a binding contract until a separate agreement or quotation is accepted. '
-      + 'Figures are estimates based on the information shared to date and may be refined after discovery.',
-    body: `NOTE: This is a starter template. Edit the wording below, keep the {{tokens}} you need, then rename it (remove "Example").
-
-PROPOSAL FOR {{business_name}}
-
-Prepared for: {{customer_name}}
-Prepared by: {{agency_name}}
-Date: {{date}}
-Valid until: {{valid_until}}
-
-────────────────────────────────
-WHY THIS MATTERS
-────────────────────────────────
-Thank you for the opportunity to propose how {{agency_name}} can support {{business_name}} with {{service}}.
-
-────────────────────────────────
-RECOMMENDED APPROACH
-────────────────────────────────
-{{services_block}}
-
-────────────────────────────────
-INVESTMENT SUMMARY
-────────────────────────────────
-Subtotal: {{currency}} {{subtotal}}
-Discount: {{discount}}
-Proposed investment: {{currency}} {{total}}
-
-────────────────────────────────
-SCOPE OUTLINE
-────────────────────────────────
-{{scope}}
-
-────────────────────────────────
-NEXT STEPS
-────────────────────────────────
-1. Review this proposal with your team
-2. Share any questions or adjustments
-3. Accept to proceed to a formal quotation / agreement
-
-────────────────────────────────
-TERMS
-────────────────────────────────
-{{terms}}
-
-We look forward to partnering with you.
-
-{{agency_name}}
-{{email}} | {{phone}}`,
+      '<p>This proposal is an offer of services and is not a binding contract until a separate agreement or quotation is accepted. '
+      + 'Figures are estimates based on the information shared to date and may be refined after discovery.</p>',
+    body: STARTER_NOTE + `
+<h2>Proposal for {{business_name}}</h2>
+<p><strong>Prepared for:</strong> {{customer_name}}<br><strong>Prepared by:</strong> {{agency_name}}<br><strong>Date:</strong> {{date}}<br><strong>Valid until:</strong> {{valid_until}}</p>
+<h2>Why This Matters</h2>
+<p>Thank you for the opportunity to propose how {{agency_name}} can support {{business_name}} with {{service}}.</p>
+<h2>Recommended Approach</h2>
+<p>{{services_block}}</p>
+<h2>Investment Summary</h2>
+<p><strong>Subtotal:</strong> {{currency}} {{subtotal}}<br><strong>Discount:</strong> {{discount}}<br><strong>Proposed investment:</strong> {{currency}} {{total}}</p>
+<h2>Next Steps</h2>
+<ol>
+<li>Review this proposal with your team</li>
+<li>Share any questions or adjustments</li>
+<li>Accept to proceed to a formal quotation / agreement</li>
+</ol>
+<h2>Terms</h2>
+<p>{{terms}}</p>
+<p>We look forward to partnering with you.</p>
+<p>{{agency_name}}<br>{{email}} | {{phone}}</p>`,
   },
   {
     type: 'service_fragment',
@@ -205,4 +131,4 @@ async function ensureExampleTemplates(orgId, DocumentTemplate) {
   return created;
 }
 
-module.exports = { EXAMPLE_TEMPLATES, ensureExampleTemplates };
+module.exports = { EXAMPLE_TEMPLATES, ensureExampleTemplates, STARTER_NOTE };

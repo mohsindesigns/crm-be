@@ -70,6 +70,11 @@ router.post('/:token/details', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+router.post('/:token/pay', async (req, res, next) => {
+  try { res.json(await PublicDocumentService.startPayment(req.params.token)); }
+  catch (err) { next(err); }
+});
+
 router.post('/:token/reject', async (req, res, next) => {
   try { res.json(await PublicDocumentService.reject(req.params.token, { note: req.body.note, ip: req.ip })); }
   catch (err) { next(err); }

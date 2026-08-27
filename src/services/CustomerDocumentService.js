@@ -5,12 +5,15 @@ const db = require('../models');
 const ClientService = require('./ClientService');
 const RetainerService = require('./RetainerService');
 const InvoiceService = require('./InvoiceService');
+const SubscriptionService = require('./SubscriptionService');
+const { billingLineLabel } = SubscriptionService;
 const EmailService = require('./EmailService');
 const { buildProjectName } = require('../utils/projectName');
-const { buildMergeTokens, renderTemplate, defaultServiceFragment, formatFeatures } = require('../utils/documentRenderer');
+const { buildMergeTokens, renderTemplate, renderHtmlTemplate, ensureHtml, defaultServiceFragment, formatFeatures } = require('../utils/documentRenderer');
 const { buildDocumentPdfOnLetterhead } = require('./DocumentLetterheadPdf');
-const { letterheadForOrg, letterheadForClient } = require('./letterhead');
+const { letterheadForOrg, letterheadForClient, billingCompanyFor } = require('./letterhead');
 const { isTruthy } = require('./SoftDeleteService');
+const { sanitizeDocumentHtml } = require('../utils/htmlSanitizer');
 
 const EDITABLE_STATUSES = ['draft', 'rejected', 'expired'];
 // Templates saved with this serviceTypeKey aren't tied to any service — they
@@ -33,12 +36,29 @@ class CustomerDocumentService {
     if (!isTruthy(filters.includeInactive)) where.isActive = true;
     if (filters.status) where.status = filters.status;
     if (filters.type) where.type = filters.type;
+    // Documents raised against an existing client have clientId set; older
+    // ones (raised before that flow existed) only get a client at approval
+    // time, via convertedClientId — match either so a client's document
+    // history isn't missing pre-flow rows (see the clientId column comment).
+    // Kept in Op.and (rather than assigning where[Op.or] directly) so it
+    // composes with the search Op.or below instead of one clobbering the other.
+    if (filters.clientId) {
+      where[Op.and] = [
+        ...(where[Op.and] || []),
+        { [Op.or]: [{ clientId: filters.clientId }, { convertedClientId: filters.clientId }] },
+      ];
+    }
     if (filters.search) {
-      where[Op.or] = [
-        { number: { [Op.like]: `%${filters.search}%` } },
-        { prospectName: { [Op.like]: `%${filters.search}%` } },
-        { businessName: { [Op.like]: `%${filters.search}%` } },
-        { email: { [Op.like]: `%${filters.search}%` } },
+      where[Op.and] = [
+        ...(where[Op.and] || []),
+        {
+          [Op.or]: [
+            { number: { [Op.like]: `%${filters.search}%` } },
+            { prospectName: { [Op.like]: `%${filters.search}%` } },
+            { businessName: { [Op.like]: `%${filters.search}%` } },
+            { email: { [Op.like]: `%${filters.search}%` } },
+          ],
+        },
       ];
     }
 
@@ -100,13 +120,18 @@ class CustomerDocumentService {
    * type (QT / AGR / PRO), year, sequence — so the entity, kind and vintage read
    * straight off the number.
    *
-   * Quotations and agreements are billing documents, so the prefix comes from
-   * the company ticked "Use for invoices & quotations" (the primary one, when
-   * both are ticked). Orgs with no companies configured keep the legacy
-   * `DOC-0001` scheme so nothing renumbers on upgrade.
+   * Quotations and agreements are billing documents, so the prefix follows the
+   * same hard rule as invoice numbering (see InvoiceService#_nextNumber /
+   * letterhead.billingCompanyFor): a client on "Pay via CRM" is quoted by the
+   * LLC, everyone else by the LLP. A document with no linked client (legacy, or
+   * a cold prospect) falls back to whichever company is ticked primary for
+   * billing. Orgs with no companies configured keep the legacy `DOC-0001`
+   * scheme so nothing renumbers on upgrade.
    */
-  async _nextNumber(orgId, type = null, { transaction = null } = {}) {
-    const company = await db.Company.primaryFor(orgId, 'billing').catch(() => null);
+  async _nextNumber(orgId, type = null, { transaction = null, isStripe = null } = {}) {
+    const company = isStripe === null
+      ? await db.Company.primaryFor(orgId, 'billing').catch(() => null)
+      : await billingCompanyFor(orgId, isStripe, { transaction }).catch(() => null);
 
     if (!company) {
       const last = await db.CustomerDocument.findOne({
@@ -385,10 +410,13 @@ class CustomerDocumentService {
       : services;
     const packageId = (isCompare || isMenu) ? null : (data.packageId || normalizedServices?.[0]?.packageId);
     const pkg = packageId ? await db.Package.findOne({ where: { id: packageId, orgId } }) : null;
-    const number = await this._nextNumber(orgId, data.type);
+    const number = await this._nextNumber(orgId, data.type, {
+      isStripe: client ? client.billingMode === 'stripe' : null,
+    });
     const baseAmount = (isCompare || isMenu) ? 0 : this._computeBaseAmount({ ...data, services: normalizedServices }, pkg);
     const discountType = ['percent', 'fixed'].includes(data.discountType) ? data.discountType : null;
     const discountValue = discountType ? (parseFloat(data.discountValue) || 0) : null;
+    const discountCycles = discountType ? (parseInt(data.discountCycles, 10) || null) : null;
 
     const document = await db.CustomerDocument.create({
       id: uuidv4(),
@@ -410,10 +438,11 @@ class CustomerDocumentService {
       basePrice: baseAmount,
       discountType,
       discountValue,
+      discountCycles,
       amount: this._applyDiscount(baseAmount, discountType, discountValue),
       lineItems: (isCompare || isMenu) ? null : (Array.isArray(data.lineItems) && data.lineItems.length ? data.lineItems : null),
       validUntil,
-      scopeTerms: data.scopeTerms || null,
+      scopeTerms: data.scopeTerms ? sanitizeDocumentHtml(data.scopeTerms) : null,
       status: 'draft',
       createdBy: userId,
     });
@@ -480,6 +509,9 @@ class CustomerDocumentService {
     const discountValue = data.discountType !== undefined
       ? (data.discountType ? (parseFloat(data.discountValue) || 0) : null)
       : (data.discountValue !== undefined ? (parseFloat(data.discountValue) || 0) : document.discountValue);
+    const discountCycles = data.discountType !== undefined
+      ? (data.discountType ? (parseInt(data.discountCycles, 10) || null) : null)
+      : (data.discountCycles !== undefined ? (parseInt(data.discountCycles, 10) || null) : document.discountCycles);
 
     await document.update({
       type: data.type ?? document.type,
@@ -500,12 +532,15 @@ class CustomerDocumentService {
       basePrice: baseAmount,
       discountType,
       discountValue,
+      discountCycles,
       amount: this._applyDiscount(baseAmount, discountType, discountValue),
       lineItems: (isCompare || isMenu)
         ? null
         : (data.lineItems !== undefined ? (data.lineItems.length ? data.lineItems : null) : document.lineItems),
       validUntil: data.validUntil !== undefined ? data.validUntil : document.validUntil,
-      scopeTerms: data.scopeTerms !== undefined ? data.scopeTerms : document.scopeTerms,
+      scopeTerms: data.scopeTerms !== undefined
+        ? (data.scopeTerms ? sanitizeDocumentHtml(data.scopeTerms) : null)
+        : document.scopeTerms,
     });
 
     return document;
@@ -616,7 +651,7 @@ class CustomerDocumentService {
       packageFeatures: firstPkg?.features,
       subtotal,
     });
-    if (!document.scopeTerms && template.defaultTerms) tokens.terms = template.defaultTerms;
+    if (!document.scopeTerms && template.defaultTerms) tokens.terms = ensureHtml(template.defaultTerms);
 
     // Whatever represents "the services" goes into {{services_block}} itself —
     // never appended after the whole rendered body — so it lands exactly where
@@ -669,7 +704,14 @@ class CustomerDocumentService {
       }).join('\n\n');
     }
 
-    const rendered = renderTemplate(template.body, tokens);
+    // template.body is authored HTML (the rich-text editor) — `terms`/`scope`
+    // are inserted raw since they're sanitized HTML in their own right (see
+    // htmlSanitizer.js); every other token is plain text/auto-generated, so it
+    // gets HTML-escaped + newline-to-<br> by renderHtmlTemplate. ensureHtml()
+    // upgrades a template body saved before the rich-text editor existed
+    // (plain text, no tags) the same way, so old templates keep their line
+    // breaks instead of collapsing into one paragraph.
+    const rendered = renderHtmlTemplate(ensureHtml(template.body), tokens, ['terms', 'scope']);
     return { rendered, brand };
   }
 
@@ -697,7 +739,8 @@ class CustomerDocumentService {
       amount: this._computeAmount(data, null),
       discountType: data.discountType || null,
       discountValue: data.discountValue || null,
-      scopeTerms: data.scopeTerms || '',
+      discountCycles: data.discountCycles || null,
+      scopeTerms: data.scopeTerms ? sanitizeDocumentHtml(data.scopeTerms) : '',
       validUntil: data.validUntil || '',
     };
     const { rendered } = await this._renderBody(orgId, fakeDocument, template);
@@ -893,6 +936,16 @@ class CustomerDocumentService {
       const soldPackages = [];
       for (const item of items) {
         if (!item.pkg) { soldPackages.push(null); continue; }
+        const billingCycle = ['monthly', 'quarterly', 'annual'].includes(item.pkg.billingCycle)
+          ? item.pkg.billingCycle
+          : 'monthly';
+        // The discount timeline promised on the proposal still carries through
+        // even though the discount markdown itself is already folded into
+        // chargedPrice below — only meaningful for a service that actually
+        // recurs, same as ClientService.sellPackage.
+        const discountEndsAt = item.isRecurring
+          ? ClientService._computeDiscountEndsAt(today, billingCycle, document.discountCycles)
+          : null;
         const clientPackage = await db.ClientPackage.create({
           orgId,
           clientId: client.id,
@@ -903,11 +956,11 @@ class CustomerDocumentService {
           // markdown that may not even map to this one package.
           discountType: null,
           discountValue: null,
+          discountCycles: discountEndsAt ? document.discountCycles : null,
+          discountEndsAt,
           soldPrice: item.chargedPrice,
           currency: document.currency || 'USD',
-          billingCycle: ['monthly', 'quarterly', 'annual'].includes(item.pkg.billingCycle)
-            ? item.pkg.billingCycle
-            : 'monthly',
+          billingCycle,
           status: 'active',
           startDate: today,
           createdBy: userId,
@@ -1042,6 +1095,17 @@ class CustomerDocumentService {
       }
     }
 
+    // Any subscription on this deal starts gated on payment. A converted
+    // quotation raises its invoice as a DRAFT for manual-payment clients, so the
+    // hosting/domain the client just agreed to must not read as live in their
+    // portal until that invoice is actually settled — which is exactly what
+    // syncEntitlement derives from the invoices raised in the loop above.
+    // Fire-and-forget: the entitlement is re-derived on every payment and on
+    // every RetainerScheduler pass, so it must never fail the conversion.
+    for (const cp of clientPackages) {
+      if (cp?.id) SubscriptionService.syncEntitlement(cp.id).catch(() => {});
+    }
+
     // Every line merged onto one invoice, so this is normally a single row.
     // Looked up rather than returned from the billing calls because
     // RetainerService.autoCreate's return value is the retainer, and callers
@@ -1120,6 +1184,11 @@ class CustomerDocumentService {
         label: describe(pkg, [...new Set(resolved.flatMap((r) => r.coveredNames))]),
         price: baseTotal,
         isRecurring: !!pkg?.isRecurring || resolved.some(recurs),
+        // A resold subscription (hosting, domain, mailbox) rather than work the
+        // team performs — carried through so the invoice line says so, and so
+        // the sale it converts into is entitlement-gated on payment.
+        isSubscription: !!pkg?.isSubscription,
+        vendor: pkg?.vendor || null,
         billingCycle: pkg?.billingCycle,
       }];
     } else {
@@ -1129,6 +1198,8 @@ class CustomerDocumentService {
         label: describe(r.pkg, r.coveredNames),
         price: r.price != null ? r.price : (r.pkg?.price != null ? Number(r.pkg.price) : 0),
         isRecurring: recurs(r),
+        isSubscription: !!r.pkg?.isSubscription,
+        vendor: r.pkg?.vendor || null,
         billingCycle: r.pkg?.billingCycle,
       }));
     }
@@ -1153,8 +1224,11 @@ class CustomerDocumentService {
         chargedPrice: charged[i],
         // Spelled out on the invoice line itself — an invoice that lists three
         // packages has to say which of them renews and which was a one-off, or
-        // the client can't tell what next month's bill looks like.
-        lineDescription: `${item.label} (${item.isRecurring ? `Recurring · ${cycle}` : 'One-time'})`,
+        // the client can't tell what next month's bill looks like. Subscriptions
+        // (resold hosting/domains/licences) are called out separately from
+        // recurring agency work, and name their vendor, because they're the
+        // lines whose access actually switches off when the invoice isn't paid.
+        lineDescription: billingLineLabel(item, cycle),
       };
     });
   }
@@ -1271,6 +1345,13 @@ class CustomerDocumentService {
       discountLabel = document.discountType === 'percent'
         ? `${Number(document.discountValue)}%`
         : `${document.currency || 'USD'} ${Number(document.discountValue).toFixed(2)}`;
+      // A discount on a recurring package only lasts so many billing cycles —
+      // say so on the document itself, not just internally, so the client isn't
+      // surprised when the price goes back up.
+      const cycles = parseInt(document.discountCycles, 10);
+      if (cycles > 0) {
+        discountLabel += ` (first ${cycles} billing cycle${cycles === 1 ? '' : 's'} only)`;
+      }
     }
 
     const packageMenuForPdf = isMenuPending
@@ -1311,6 +1392,13 @@ class CustomerDocumentService {
     // CRM, LLP otherwise — so the quotation matches the invoice it becomes.
     const letterhead = await this._letterheadForDocument(orgId, document);
 
+    // The template's authored narrative (rich HTML — see htmlSanitizer.js /
+    // renderHtmlTemplate) — this is the actual "This Agreement is entered into
+    // between…" content the admin wrote, not just the structured pricing
+    // tables below. Agreements/proposals lead the PDF with this; quotations
+    // keep the pricing-first layout (see DocumentLetterheadPdf.js).
+    const { rendered: narrativeHtml } = await this._renderBody(orgId, document, document.template);
+
     // Structured letterhead layout — no free-text template dump (that looked odd).
     const buffer = await buildDocumentPdfOnLetterhead({
       // Drives the coded letterhead header — see services/letterhead.js.
@@ -1339,12 +1427,11 @@ class CustomerDocumentService {
       optionMinAmount: optionMin != null ? applyDisc(optionMin) : null,
       optionMaxAmount: optionMax != null ? applyDisc(optionMax) : null,
       hideServiceAmounts: isCompare && !selectedPkg,
-      // Org invoice T&Cs (Admin → Branding), same text invoices use — not the
-      // per-document scopeTerms / template default (those stay on the review UI).
+      // Org invoice T&Cs (Admin → Branding), same text invoices use.
       terms: (letterhead.invoiceTerms && String(letterhead.invoiceTerms).trim())
         || (branding?.invoiceTerms && String(branding.invoiceTerms).trim())
         || DEFAULT_DOCUMENT_TERMS,
-      bodyText: '',
+      narrativeHtml,
     });
 
     return { buffer, document };

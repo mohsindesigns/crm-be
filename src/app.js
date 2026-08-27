@@ -19,6 +19,7 @@ const mediaRouter = require('./routes/media');
 const seoRouter = require('./routes/seo');
 const hrRouter = require('./routes/hr');
 const analyticsRouter = require('./routes/analytics');
+const reportsRouter = require('./routes/reports');
 const retainersRouter = require('./routes/retainers');
 const myTasksRouter = require('./routes/myTasks');
 const portalRouter = require('./routes/portal');
@@ -28,9 +29,21 @@ const publicInvoicesRouter = require('./routes/publicInvoices');
 const messagesRouter = require('./routes/messages');
 const portalMessagesRouter = require('./routes/portalMessages');
 const stripeWebhookRouter = require('./routes/stripeWebhook');
+const leadFormsRouter = require('./routes/leadForms');
+const publicLeadFormsRouter = require('./routes/publicLeadForms');
+const leadsRouter = require('./routes/leads');
+const portalLeadFormsRouter = require('./routes/portalLeadForms');
+const portalLeadsRouter = require('./routes/portalLeads');
+const activityLogsRouter = require('./routes/activityLogs');
+const requirementFormsRouter = require('./routes/requirementForms');
+const clientRequestsRouter = require('./routes/clientRequests');
+const approvalsRouter = require('./routes/approvals');
+const exportsRouter = require('./routes/exports');
+const publicClientRequestsRouter = require('./routes/publicClientRequests');
 const errorHandler = require('./middleware/errorHandler');
+const activityLogger = require('./middleware/activityLogger');
 
-const { WhiteLabelConfig, Org } = require('./models');
+const { WhiteLabelConfig, Org, ServiceType } = require('./models');
 
 const app = express();
 
@@ -50,11 +63,24 @@ app.use('/api/stripe', stripeWebhookRouter);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Records every mutating authenticated API call for the Activity Logs page —
+// must come after auth/tenancy run on req (it reads req.user/req.orgId via a
+// res.on('finish') listener, so it's safe to mount ahead of the routers
+// themselves; see middleware/activityLogger.js for why).
+app.use(activityLogger);
+
 // Health
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 // Public branding — used by login page before auth
 // GET /api/brand?subdomain=mohsindesigns
+//
+// UNAUTHENTICATED, so everything returned here is public by definition. That
+// is fine for what it carries: the brand name/logo/colour already appear on
+// every invoice and client-facing page, and `services` is the org's own
+// "what we do" list, which the login page shows as a shopfront. Nothing
+// tenant-private (counts, clients, staff, pricing) belongs in this response —
+// keep it to marketing-surface fields only.
 app.get('/api/brand', async (req, res) => {
   try {
     const { subdomain } = req.query;
@@ -65,17 +91,28 @@ app.get('/api/brand', async (req, res) => {
         include: [{ model: WhiteLabelConfig, as: 'brand' }],
       });
       if (org) {
+        // The org's active service lines, in a stable order (there is no
+        // sortOrder column — name keeps it from reshuffling between requests).
+        // `icon` is a kebab-case lucide name; crm-fe maps it to a component and
+        // falls back to a neutral one for anything it doesn't know, so adding a
+        // service type with a new icon never breaks the page.
+        const services = await ServiceType.findAll({
+          where: { orgId: org.id, isActive: true },
+          attributes: ['key', 'name', 'icon'],
+          order: [['name', 'ASC']],
+        });
         brand = {
           orgId: org.id,
           brandName: org.brand?.brandName || 'Mohsin Designs Project Management',
           primaryColor: org.brand?.primaryColor || DEFAULT_BRAND_COLOR,
           logoUrl: org.brand?.logoUrl || null,
+          services: services.map((s) => s.toJSON()),
         };
       }
     }
-    res.json(brand || { orgId: null, brandName: 'Mohsin Designs Project Management', primaryColor: DEFAULT_BRAND_COLOR, logoUrl: null });
+    res.json(brand || { orgId: null, brandName: 'Mohsin Designs Project Management', primaryColor: DEFAULT_BRAND_COLOR, logoUrl: null, services: [] });
   } catch {
-    res.json({ brandName: 'Mohsin Designs Project Management', primaryColor: DEFAULT_BRAND_COLOR, logoUrl: null });
+    res.json({ brandName: 'Mohsin Designs Project Management', primaryColor: DEFAULT_BRAND_COLOR, logoUrl: null, services: [] });
   }
 });
 
@@ -95,6 +132,7 @@ app.use('/api/media', mediaRouter);
 app.use('/api/seo', seoRouter);
 app.use('/api/hr', hrRouter);
 app.use('/api/analytics', analyticsRouter);
+app.use('/api/reports', reportsRouter);
 app.use('/api/retainers', retainersRouter);
 app.use('/api/tasks', myTasksRouter);
 app.use('/api/portal', portalRouter);
@@ -103,6 +141,17 @@ app.use('/api/public/documents', publicDocumentsRouter);
 app.use('/api/public/invoices', publicInvoicesRouter);
 app.use('/api/messages', messagesRouter);
 app.use('/api/portal/messages', portalMessagesRouter);
+app.use('/api/lead-forms', leadFormsRouter);
+app.use('/api/public/lead-forms', publicLeadFormsRouter);
+app.use('/api/leads', leadsRouter);
+app.use('/api/portal/lead-forms', portalLeadFormsRouter);
+app.use('/api/portal/leads', portalLeadsRouter);
+app.use('/api/activity-logs', activityLogsRouter);
+app.use('/api/requirement-forms', requirementFormsRouter);
+app.use('/api/projects/:projectId/client-requests', clientRequestsRouter);
+app.use('/api/approvals', approvalsRouter);
+app.use('/api/public/client-requests', publicClientRequestsRouter);
+app.use('/api/exports', exportsRouter);
 
 // 404
 app.use((req, res) => res.status(404).json({ message: 'Not found.' }));
@@ -129,6 +178,23 @@ db.sequelize.query(
     '$."billing.update"', CAST('true' AS JSON)),
     '$."clients.read"',  CAST('true' AS JSON))
   WHERE JSON_EXTRACT(permissions, '$."billing.read"') = true`
+).catch(() => {});
+
+// Lead management shipped after some orgs were already seeded — grant the new
+// leads.* permissions to the same role keys seed.js now gives them by default,
+// so an existing install doesn't need a full reseed to use the feature.
+db.sequelize.query(
+  `UPDATE roles SET permissions = JSON_SET(JSON_SET(JSON_SET(permissions,
+    '$."leads.read"',   CAST('true' AS JSON)),
+    '$."leads.act"',    CAST('true' AS JSON)),
+    '$."leads.manage"', CAST('true' AS JSON))
+  WHERE \`key\` IN ('project_manager', 'ads_manager') AND JSON_EXTRACT(permissions, '$."leads.manage"') IS NULL`
+).catch(() => {});
+db.sequelize.query(
+  `UPDATE roles SET permissions = JSON_SET(JSON_SET(permissions,
+    '$."leads.read"', CAST('true' AS JSON)),
+    '$."leads.act"',  CAST('true' AS JSON))
+  WHERE \`key\` = 'account_manager' AND JSON_EXTRACT(permissions, '$."leads.read"') IS NULL`
 ).catch(() => {});
 
 // Add payment proof URL column to invoices. Errors silently if column already exists.
@@ -228,6 +294,7 @@ app.schemaReady = (async () => {
     await db.Project.ensureSchema();       // adds clientPackageId — depends on client_packages
     await db.Retainer.ensureSchema();      // adds projectId + clientPackageId
     await db.Invoice.ensureSchema();       // adds clientPackageId, retainerId — depends on client_packages/retainers
+    await db.InvoiceLine.ensureSchema();   // adds per-line clientPackageId — depends on client_packages
     // Hard backstop against duplicate retainer billing: if the invoicing scheduler
     // ever runs twice around the same cycle (a restart re-firing its immediate
     // on-boot pass, or more than one server process each running it), this stops a
@@ -262,8 +329,8 @@ app.schemaReady = (async () => {
     await db.HrDocument.ensureSchema(); // widens `type` ENUM (cv, cnic_front, cnic_back, ...)
     await db.Keyword.ensureSchema();    // adds targetLocation
     await db.RecurringTaskRule.ensureSchema(); // new table; depends on projects
-    await db.Task.ensureSchema();       // adds ruleId — depends on recurring_task_rules
-    await db.Artifact.ensureSchema();   // adds taskId — depends on tasks
+    await db.Task.ensureSchema();       // adds ruleId/acceptedAt + widens status ENUM w/ `accepted` — depends on recurring_task_rules
+    await db.Artifact.ensureSchema();   // adds taskId/taskEventId — depends on tasks
     await db.Backlink.ensureSchema();   // widens `linkType` ENUM + adds date/domain/status/spamScore
     await db.ContentSubmission.ensureSchema(); // adds wordCount
     await db.BlogTask.ensureSchema();          // adds sheet columns + approval workflow fields
@@ -291,6 +358,13 @@ app.schemaReady = (async () => {
     await db.SlaPolicy.ensureSchema();
     await db.HrDepartment.ensureSchema();
     await db.HrDesignation.ensureSchema();
+    await db.LeadForm.ensureSchema();  // new table; depends on projects
+    await db.Lead.ensureSchema();      // new table; depends on lead_forms/projects/clients
+    await db.LeadEvent.ensureSchema(); // new table; depends on leads
+    await db.ActivityLog.ensureSchema(); // new table; Activity Logs sidebar page — depends on orgs/users
+    await db.RequirementFormTemplate.ensureSchema(); // new table; reusable client requirement forms
+    await db.ClientRequest.ensureSchema();           // new table; depends on requirement_form_templates/projects/clients/contacts
+    await db.ExportTemplate.ensureSchema();          // new table; saved column sets for Admin → Export Data
   } catch (err) {
     console.error('[Schema] ensureSchema failed:', err.message);
   }

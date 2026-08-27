@@ -21,6 +21,12 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.STRING(255),
       allowNull: false,
     },
+    // Free-text blurb shown alongside the package wherever it's picked for sale —
+    // scope notes, what's excluded, anything that doesn't belong in the
+    // client-facing `features` bullet list.
+    description: {
+      type: DataTypes.TEXT,
+    },
     tier: {
       type: DataTypes.STRING(50),
     },
@@ -44,6 +50,25 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.BOOLEAN,
       defaultValue: false,
     },
+    // Subscription vs. delivered service. A subscription is a recurring line the
+    // agency resells rather than work the team performs — hosting, domains, SSL,
+    // mailbox seats. It bills through exactly the same
+    // ClientPackage -> Retainer -> Invoice chain as any other recurring package;
+    // the flag only decides how it's grouped in the UI and that the client's
+    // access to it is gated on payment (see ClientPackage.entitlement).
+    // Implies isRecurring in practice, but the two are stored separately so an
+    // annual domain renewal and a monthly retainer can coexist.
+    isSubscription: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
+    // Who the subscription is actually bought FROM ("Hostinger", "Google
+    // Workspace", "Namecheap") — shown on the Subscriptions tab so renewals can
+    // be reconciled against the supplier's own bill. Free text, not a lookup;
+    // meaningless on non-subscription packages.
+    vendor: {
+      type: DataTypes.STRING(255),
+    },
     billingCycle: {
       type: DataTypes.ENUM('monthly', 'quarterly', 'annual'),
       defaultValue: 'monthly',
@@ -61,10 +86,14 @@ module.exports = (sequelize, DataTypes) => {
       defaultValue: false,
     },
     // Installment plan for one-time (non-recurring) package sales: an array of
-    // { percent, offsetDays, label } — e.g. 40% due immediately, 30% in 30 days,
-    // 30% in 60 days. Percents should sum to 100 (validated where this is set).
-    // When set, selling the package generates all N invoices upfront instead of
-    // the default "no invoice created automatically" behavior for one-time sales.
+    // { type: 'percent'|'amount', value, offsetDays, label } — e.g. 40% due
+    // immediately, 30% in 30 days, 30% in 60 days; or a mix of percentages and
+    // flat amounts. Percent-type rows should sum to 100 (validated where this is
+    // set). Older rows saved before `type`/`value` existed still store
+    // { percent, offsetDays, label } and are read as percent-type — see
+    // ClientService#sellPackage's normalization. When set, selling the package
+    // generates all N invoices upfront instead of the default "no invoice
+    // created automatically" behavior for one-time sales.
     installmentPlan: {
       type: DataTypes.JSON,
     },

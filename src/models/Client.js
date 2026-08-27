@@ -46,6 +46,16 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.ENUM('manual', 'stripe'),
       defaultValue: 'manual',
     },
+    // Only meaningful when billingMode is 'stripe'. The org's per-currency card
+    // rate (Admin → Payments → Card processing fees, PaymentFeeRule) is applied
+    // to every Stripe charge by default — true keeps that; unticking it for a
+    // specific client means the agency absorbs the card fee instead of passing
+    // it on, for every invoice AND quotation/agreement/proposal payment this
+    // client makes (see StripeService.processingFeeFor).
+    chargeCardFee: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: true,
+    },
     // Soft delete — distinct from `status` (a commercial lifecycle: active /
     // paused / churned). A churned client is still a real client you report on;
     // an inactive one has been removed from day-to-day use. See softDeletable.js.

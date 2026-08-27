@@ -22,6 +22,7 @@ module.exports = {
 
   TASK_STATUS: {
     TODO: 'todo',
+    ACCEPTED: 'accepted',
     IN_PROGRESS: 'in_progress',
     SUBMITTED: 'submitted',
     IN_REVIEW: 'in_review',
@@ -88,6 +89,17 @@ module.exports = {
     ACTIVE: 'active',
     INACTIVE: 'inactive',
   },
+
+  LEAD_STATUS: {
+    NEW: 'new',
+    CONTACTED: 'contacted',
+    QUALIFIED: 'qualified',
+    NOT_QUALIFIED: 'not_qualified',
+    CONVERTED: 'converted',
+    LOST: 'lost',
+  },
+
+  LEAD_FORM_FIELD_TYPES: ['text', 'email', 'phone', 'textarea', 'select', 'checkbox', 'multiselect', 'file'],
 
   DEFAULT_BRAND_COLOR: '#0B1D5E',
 };

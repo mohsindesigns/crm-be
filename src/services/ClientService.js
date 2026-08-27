@@ -5,6 +5,9 @@ const { v4: uuidv4 } = require('uuid');
 const { buildProjectName } = require('../utils/projectName');
 const RetainerService = require('./RetainerService');
 const InvoiceService = require('./InvoiceService');
+const SubscriptionService = require('./SubscriptionService');
+const { billingLineLabel } = SubscriptionService;
+const { billingCompanyFor } = require('./letterhead');
 const { isTruthy } = require('./SoftDeleteService');
 
 class ClientService {
@@ -158,6 +161,25 @@ class ClientService {
     return client;
   }
 
+  /**
+   * The legal entity (LLC or LLP) that will issue this client's invoices and
+   * quotations, per their "Pay via CRM" billing mode — surfaced read-only on
+   * the client page so staff can see which company applies without opening a
+   * document. Same hard rule InvoiceService/CustomerDocumentService use — see
+   * letterhead.billingCompanyFor. Null when the org has no companies configured
+   * (documents fall back to the legacy branding letterhead in that case).
+   */
+  async resolveBillingCompany(client, orgId) {
+    const company = await billingCompanyFor(orgId, client.billingMode === 'stripe').catch(() => null);
+    if (!company) return null;
+    return {
+      id: company.id,
+      legalName: company.legalName,
+      code: company.code,
+      officeLabel: company.officeLabel,
+    };
+  }
+
   async create(orgId, data, actorUserId = null) {
     const client = await Client.create({
       id: uuidv4(),
@@ -214,6 +236,24 @@ class ClientService {
     const { updated } = await InvoiceService.applyClientBillingMode(orgId, id, billingMode);
     await client.update({ billingMode });
     return { client, updatedInvoices: updated };
+  }
+
+  /**
+   * Whether the org's card processing fee rate is added on top for this
+   * client's Stripe payments, or absorbed by the agency instead. Read at
+   * charge time (StripeService.processingFeeFor) for every invoice AND
+   * quotation/agreement/proposal payment — nothing to backfill here, it just
+   * takes effect on the next payment attempt.
+   */
+  async setChargeCardFee(id, orgId, chargeCardFee) {
+    if (typeof chargeCardFee !== 'boolean') {
+      const err = new Error('chargeCardFee must be true or false.');
+      err.status = 400;
+      throw err;
+    }
+    const client = await this.findById(id, orgId);
+    await client.update({ chargeCardFee });
+    return { client };
   }
 
   // Blocks deletion if the client has any projects, invoices, retainers, or sold
@@ -332,14 +372,40 @@ class ClientService {
 
   async listSoldPackages(clientId, orgId) {
     await this.findById(clientId, orgId);
+
+    // Bring every subscription's entitlement up to date before listing. The
+    // background sweep (RetainerScheduler, 6-hourly) is the backstop; this is the
+    // screen where someone actually asks "is their hosting still live?", so it
+    // shouldn't be able to answer with a value that lapsed four hours ago.
+    // Never allowed to break the listing — a stale badge beats a 500.
+    try {
+      const subscriptions = await db.ClientPackage.findAll({
+        where: { clientId, orgId },
+        attributes: ['id'],
+        include: [{
+          model: db.Package, as: 'package', attributes: [], required: true, where: { isSubscription: true },
+        }],
+      });
+      for (const sale of subscriptions) await SubscriptionService.syncEntitlement(sale.id);
+    } catch (err) {
+      console.error('[ClientService] Subscription entitlement refresh failed:', err.message);
+    }
+
     return db.ClientPackage.findAll({
       where: { clientId, orgId },
       include: [
         // skipProjectCreation so the UI can explain an empty workflow list.
         // Billing-only packages (add-ons, hosting) legitimately spawn none, and
         // "No workflows." on its own reads as something having gone wrong.
-        { model: db.Package, as: 'package', attributes: ['id', 'name', 'tier', 'skipProjectCreation'] },
+        // isSubscription/vendor are what let the client page split this one list
+        // into "Packages" and "Subscriptions" without a second request.
+        { model: db.Package, as: 'package', attributes: ['id', 'name', 'tier', 'skipProjectCreation', 'isSubscription', 'vendor', 'billingCycle'] },
         { model: db.Project, as: 'workflowProjects', attributes: ['id', 'name', 'status', 'currentStageKey'] },
+        // The live retainer supplies the real next renewal date for a
+        // subscription; a cancelled/deactivated one keeps a stale
+        // nextInvoiceDate that would read as "renews on…" for something that
+        // will never bill again, so the caller filters on status/isActive.
+        { model: db.Retainer, as: 'retainers', attributes: ['id', 'status', 'isActive', 'nextInvoiceDate', 'cycle'], required: false },
       ],
       order: [['createdAt', 'DESC']],
     });
@@ -357,6 +423,19 @@ class ClientService {
       else if (discountType === 'fixed') soldPrice = basePrice - value;
     }
     return Math.max(0, Math.round(soldPrice * 100) / 100);
+  }
+
+  // Given a sale's startDate, billing cycle, and how many cycles the discount
+  // lasts, returns the calendar date the discount period ends — the date
+  // DiscountExpiryScheduler reverts the price back to basePrice. Walks
+  // RetainerService.addCycle the same number of times the retainer itself will,
+  // so the revert always lands on an actual renewal date rather than drifting.
+  _computeDiscountEndsAt(startDate, cycle, discountCycles) {
+    const cycles = parseInt(discountCycles, 10);
+    if (!(cycles > 0)) return null;
+    let date = startDate;
+    for (let i = 0; i < cycles; i++) date = RetainerService.addCycle(date, cycle);
+    return date;
   }
 
   // Sells a package to a client: records the sale (with optional discount) and
@@ -381,6 +460,9 @@ class ClientService {
     const soldPrice = hasCustomPrice
       ? Math.max(0, Math.round(parseFloat(data.customPrice) * 100) / 100)
       : this._computeSoldPrice(basePrice, discountType, discountValue);
+    // Only meaningful alongside an actual discount — a custom sell price or no
+    // discount at all has nothing to expire back to.
+    const discountCycles = discountType ? (parseInt(data.discountCycles, 10) || null) : null;
     const currency = pkg.currency || client.defaultCurrency;
     // An installment plan set on this specific sale overrides whatever plan is
     // baked into the package template — different clients buying the same
@@ -400,11 +482,19 @@ class ClientService {
       ? pkg.services
       : [{ serviceTypeKey: pkg.serviceTypeKey, workflowTemplateId: null }];
 
+    const billingCycle = pkg.billingCycle || 'monthly';
+    // Only a recurring sale actually bills more than once, so a discount timeline
+    // is meaningless on a one-time package even if a stray value was submitted.
+    const discountEndsAt = pkg.isRecurring
+      ? this._computeDiscountEndsAt(startDate, billingCycle, discountCycles)
+      : null;
+
     const { clientPackage, projects } = await db.sequelize.transaction(async (t) => {
       const clientPackage = await db.ClientPackage.create({
         orgId, clientId, packageId: pkg.id,
-        basePrice, discountType, discountValue, soldPrice, currency,
-        billingCycle: pkg.billingCycle || 'monthly',
+        basePrice, discountType, discountValue, discountCycles: discountEndsAt ? discountCycles : null,
+        discountEndsAt, soldPrice, currency,
+        billingCycle,
         status: 'active',
         startDate,
         createdBy: userId,
@@ -447,6 +537,8 @@ class ClientService {
           currentStageKey: firstStage.key,
           status: 'active',
           startDate,
+          deliveryDate: data.deliveryDate || null,
+          description: data.description || null,
           isRecurring: !!template.isRecurring,
           createdBy: userId,
         }, { transaction: t });
@@ -501,6 +593,14 @@ class ClientService {
           cycle,
           startDate,
           note: `Retainer for package: ${pkg.name}`,
+          // Subscriptions (resold hosting/domains/licences) get the explicit
+          // "Subscription · cycle · vendor" line the rest of the app labels them
+          // with, so the client can tell on the invoice which line is the thing
+          // that switches off if they don't pay it. Left undefined for ordinary
+          // recurring packages so their invoice lines read exactly as before.
+          lineDescription: pkg.isSubscription
+            ? billingLineLabel({ label: pkg.name, isSubscription: true, vendor: pkg.vendor }, cycle)
+            : undefined,
           // Multiple packages sold to one client share a single first-cycle invoice.
           mergeWithOpenInvoice: true,
         });
@@ -517,8 +617,15 @@ class ClientService {
         const plan = installmentPlan;
         for (let i = 0; i < plan.length; i++) {
           const installment = plan[i];
-          const percent = Number(installment.percent) || 0;
-          if (percent <= 0) continue;
+          // `type`/`value` is the current shape; older rows (and template rows
+          // saved before this existed) only have `percent` — treat those as
+          // percent-type for backward compatibility.
+          const isAmount = installment.type === 'amount';
+          const rawValue = installment.value !== undefined && installment.value !== null && installment.value !== ''
+            ? installment.value
+            : (isAmount ? installment.amount : installment.percent);
+          const value = Number(rawValue) || 0;
+          if (value <= 0) continue;
           let dueAt = null;
           if (installment.dueAt && /^\d{4}-\d{2}-\d{2}/.test(String(installment.dueAt))) {
             dueAt = String(installment.dueAt).slice(0, 10);
@@ -529,7 +636,9 @@ class ClientService {
             const pad = (n) => String(n).padStart(2, '0');
             dueAt = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
           }
-          const amount = Math.round(soldPrice * (percent / 100) * 100) / 100;
+          const amount = isAmount
+            ? Math.round(value * 100) / 100
+            : Math.round(soldPrice * (value / 100) * 100) / 100;
           // A free package produces zero-value installments — nothing to bill, so
           // skip them rather than issuing $0.00 invoices the client can't pay.
           if (!(amount > 0)) continue;
@@ -557,7 +666,7 @@ class ClientService {
         // Silence on a free package is correct, not an error — only flag a plan
         // that was actually worth something but produced nothing.
         if (installmentInvoices.length === 0 && soldPrice > 0) {
-          billingError = 'Installment plan had no valid percentages — no invoices were created.';
+          billingError = 'Installment plan had no valid amounts — no invoices were created.';
         }
       } catch (err) {
         console.error('[ClientService] Failed to generate installment invoices for package sale:', err.stack || err.message);
@@ -584,6 +693,12 @@ class ClientService {
         billingError = `The package was sold, but the invoice could not be created: ${err.message}`;
       }
     }
+
+    // A subscription starts life gated on its first invoice: selling hosting
+    // doesn't make it usable, paying for it does. Derived from the invoice(s)
+    // just raised above — see SubscriptionService. No-ops for every other kind of
+    // package, and never allowed to fail the sale.
+    SubscriptionService.syncEntitlement(clientPackage.id).catch(() => {});
 
     // Ensure client Messages room + sync any assignees already on sibling projects.
     try {
@@ -659,10 +774,16 @@ class ClientService {
           customPrice: entry.customPrice,
           discountType: entry.discountType,
           discountValue: entry.discountValue,
+          discountCycles: entry.discountCycles,
           installmentPlan: entry.installmentPlan,
           // Shared across the sale — this is what makes the line items land on
-          // one invoice rather than several.
+          // one invoice rather than several, and every spawned project carry
+          // the same delivery target/notes from the sale.
           startDate: data.startDate,
+          deliveryDate: data.deliveryDate,
+          // Each package in the order can carry its own scope note; falls back to
+          // the sale-wide description when a given entry doesn't set one.
+          description: entry.description || data.description,
         }, userId);
         sold.push(result);
       } catch (err) {
@@ -737,7 +858,10 @@ class ClientService {
 
     let retainerUpdated = false;
     await db.sequelize.transaction(async (t) => {
-      await clientPackage.update({ soldPrice: price, discountType: null, discountValue: null }, { transaction: t });
+      await clientPackage.update({
+        soldPrice: price, discountType: null, discountValue: null,
+        discountCycles: null, discountEndsAt: null,
+      }, { transaction: t });
       const [count] = await db.Retainer.update(
         { amount: price },
         { where: { clientPackageId: clientPackage.id, status: { [Op.ne]: 'cancelled' } }, transaction: t }
@@ -745,6 +869,168 @@ class ClientService {
       retainerUpdated = count > 0;
     });
     return { clientPackage, retainerUpdated };
+  }
+
+  // A single chronological feed for this client, merging two existing audit
+  // trails rather than introducing a new one: DocumentEvent (quotation/
+  // proposal/agreement sent → viewed → approved/rejected, and the moment one
+  // converts) and ProjectEvent (the project's own stage history, same trail
+  // the project Activity tab reads — see ProjectService.getTimeline). Mirrors
+  // that method's shape so the frontend can render both with similar code.
+  // One card per project/document/invoice, each shaped as a step row — the
+  // same stage-progress pill bar the project detail page itself renders (see
+  // ProjectService.getTimeline + that page's stage pills), just one such row
+  // per project this client has, plus an analogous row for each quotation/
+  // proposal/agreement (Created → Sent → Viewed → decision) and each invoice
+  // (Created → Sent → Paid) instead of workflow stages. Cards are sorted by
+  // whichever had activity most recently.
+  async getTimeline(clientId, orgId, { includeDocuments = true, includeInvoices = true } = {}) {
+    await this.findById(clientId, orgId);
+
+    const [documents, projects, invoices] = await Promise.all([
+      includeDocuments ? db.CustomerDocument.findAll({
+        where: { orgId, [Op.or]: [{ clientId }, { convertedClientId: clientId }] },
+        include: [{ model: db.DocumentEvent, as: 'events', separate: true, order: [['createdAt', 'ASC']] }],
+      }) : [],
+      db.Project.findAll({ where: { orgId, clientId } }),
+      includeInvoices ? db.Invoice.findAll({
+        where: { orgId, clientId },
+        include: [{ model: db.Payment, as: 'payments', attributes: ['id', 'paidAt', 'amount'] }],
+      }) : [],
+    ]);
+
+    const projectIds = projects.map((p) => p.id);
+    const templateIds = [...new Set(projects.map((p) => p.workflowTemplateId).filter(Boolean))];
+    const [projectEvents, stages] = await Promise.all([
+      projectIds.length ? db.ProjectEvent.findAll({
+        where: { projectId: { [Op.in]: projectIds } },
+        order: [['createdAt', 'ASC']],
+      }) : [],
+      templateIds.length ? db.Stage.findAll({
+        where: { templateId: { [Op.in]: templateIds } },
+        order: [['orderIndex', 'ASC']],
+      }) : [],
+    ]);
+
+    const eventsByProject = new Map();
+    for (const ev of projectEvents) {
+      if (!eventsByProject.has(ev.projectId)) eventsByProject.set(ev.projectId, []);
+      eventsByProject.get(ev.projectId).push(ev);
+    }
+    const stagesByTemplate = new Map();
+    for (const s of stages) {
+      if (!stagesByTemplate.has(s.templateId)) stagesByTemplate.set(s.templateId, []);
+      stagesByTemplate.get(s.templateId).push(s);
+    }
+
+    const projectItems = projects.map((project) => {
+      const projStages = stagesByTemplate.get(project.workflowTemplateId) || [];
+      const pEvents = eventsByProject.get(project.id) || [];
+      const currentStageIdx = projStages.findIndex((s) => s.key === project.currentStageKey);
+      const steps = projStages.map((stage, idx) => {
+        // A completed project's final stage is done, not "in progress" —
+        // mirrors the project page's own pill logic exactly.
+        const done = idx < currentStageIdx || (idx === currentStageIdx && project.status === 'completed');
+        const current = idx === currentStageIdx && project.status !== 'completed';
+        const entered = [...pEvents].reverse().find((ev) => ev.toStageKey === stage.key);
+        return { key: stage.key, name: stage.name, done, current, at: entered?.createdAt || null };
+      });
+      const lastActivityAt = pEvents.length ? pEvents[pEvents.length - 1].createdAt : project.createdAt;
+      return {
+        id: `proj-${project.id}`,
+        kind: 'project',
+        title: project.name,
+        subtitle: project.serviceTypeKey,
+        status: project.status,
+        href: `/projects/${project.id}`,
+        lastActivityAt,
+        steps,
+      };
+    });
+
+    const documentItems = documents.map((doc) => {
+      const byEvent = {};
+      for (const ev of (doc.events || [])) if (!byEvent[ev.event]) byEvent[ev.event] = ev;
+      const decisionDone = ['approved', 'rejected', 'expired'].includes(doc.status);
+      const decisionName = doc.status === 'rejected' ? 'Rejected' : doc.status === 'expired' ? 'Expired' : 'Approved';
+      const rawSteps = [
+        { key: 'created', name: 'Created', at: byEvent.created?.createdAt || doc.createdAt },
+        { key: 'sent', name: 'Sent', at: byEvent.sent?.createdAt || doc.sentAt || null },
+        { key: 'viewed', name: 'Viewed', at: byEvent.viewed?.createdAt || doc.viewedAt || null },
+        {
+          key: 'decision',
+          name: decisionName,
+          at: decisionDone ? (byEvent[doc.status]?.createdAt || doc.respondedAt || doc.updatedAt) : null,
+          tone: doc.status === 'rejected' ? 'negative' : doc.status === 'expired' ? 'neutral' : 'positive',
+        },
+      ];
+      let firstPending = -1;
+      const steps = rawSteps.map((s, idx) => {
+        const done = !!s.at;
+        if (!done && firstPending === -1) firstPending = idx;
+        return { key: s.key, name: s.name, done, at: s.at, tone: s.tone || null };
+      }).map((s, idx) => ({ ...s, current: idx === firstPending }));
+      const lastActivityAt = [...steps].reverse().find((s) => s.at)?.at || doc.createdAt;
+      return {
+        id: `doc-${doc.id}`,
+        kind: 'document',
+        title: `${doc.type.charAt(0).toUpperCase()}${doc.type.slice(1)} ${doc.number || ''}`.trim(),
+        subtitle: doc.businessName || doc.prospectName || null,
+        status: doc.status,
+        href: `/documents/${doc.id}`,
+        lastActivityAt,
+        steps,
+      };
+    });
+
+    // Invoices have no per-status audit trail the way documents/projects do
+    // (no InvoiceEvent), so "Sent" uses `issuedAt` — the invoice date, set once
+    // when it's raised — as the best available stand-in for when it went out,
+    // and "Paid" uses the latest payment's `paidAt`. `void` and the two
+    // not-yet-paid-but-not-fresh states (`overdue`, `payment_review`) relabel
+    // the final step instead of forcing them through a generic "Paid".
+    const invoiceItems = invoices.map((inv) => {
+      const paidTimestamps = (inv.payments || []).map((p) => p.paidAt).filter(Boolean).sort();
+      const lastPaymentAt = paidTimestamps[paidTimestamps.length - 1] || null;
+      const finalName = inv.status === 'void' ? 'Void'
+        : inv.status === 'overdue' ? 'Overdue'
+        : inv.status === 'payment_review' ? 'Payment Review'
+        : 'Paid';
+      const finalDone = inv.status === 'paid' || inv.status === 'void';
+      const finalAt = inv.status === 'paid' ? (lastPaymentAt || inv.updatedAt)
+        : inv.status === 'void' ? inv.updatedAt
+        : null;
+      const finalTone = inv.status === 'paid' ? 'positive'
+        : inv.status === 'void' ? 'neutral'
+        : inv.status === 'overdue' ? 'negative'
+        : null;
+      const rawSteps = [
+        { key: 'created', name: 'Created', at: inv.createdAt },
+        { key: 'sent', name: 'Sent', at: inv.status !== 'draft' ? (inv.issuedAt || inv.createdAt) : null },
+        { key: 'paid', name: finalName, at: finalAt, tone: finalTone },
+      ];
+      let firstPending = -1;
+      const steps = rawSteps.map((s, idx) => {
+        const done = !!s.at;
+        if (!done && firstPending === -1) firstPending = idx;
+        return { key: s.key, name: s.name, done, at: s.at, tone: s.tone || null };
+      }).map((s, idx) => ({ ...s, current: idx === firstPending }));
+      const lastActivityAt = [...steps].reverse().find((s) => s.at)?.at || inv.createdAt;
+      return {
+        id: `inv-${inv.id}`,
+        kind: 'invoice',
+        title: `Invoice ${inv.number}`,
+        subtitle: inv.total ? `${inv.currency || ''} ${Number(inv.total).toLocaleString()}`.trim() : null,
+        status: inv.status,
+        href: `/invoices/${inv.id}`,
+        lastActivityAt,
+        steps,
+      };
+    });
+
+    const items = [...projectItems, ...documentItems, ...invoiceItems]
+      .sort((a, b) => new Date(b.lastActivityAt) - new Date(a.lastActivityAt));
+    return { items };
   }
 }
 

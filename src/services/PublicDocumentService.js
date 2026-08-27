@@ -128,6 +128,17 @@ class PublicDocumentService {
       ? await this._detailPrefill(document)
       : null;
 
+    // Drives the "Pay Now" button — see StripeService.startDocumentPayment.
+    // Not yet converted (nothing to pay if it already has a real invoice —
+    // that invoice's own /invoice/[token] page is what pays it from here) and
+    // the org actually accepts cards.
+    const alreadyConverted = !!(document.convertedClientId || document.convertedProjectId);
+    const canPayByCard = document.status === 'approved'
+      && !!document.detailsSubmittedAt
+      && !alreadyConverted
+      && Number(document.amount) > 0
+      && !!(await db.PaymentMethod.findOne({ where: { orgId: document.orgId, kind: 'stripe', isActive: true } }).catch(() => null));
+
     return {
       document: {
         ...document.toJSON(),
@@ -139,6 +150,7 @@ class PublicDocumentService {
         optionMaxPrice,
         requiresDetails,
         detailPrefill,
+        canPayByCard,
       },
       branding: {
         brandName: branding?.brandName || 'Mohsin Designs Project Management',
@@ -456,9 +468,24 @@ class PublicDocumentService {
     // Conversion is deliberately NOT triggered here. It creates projects, sells
     // packages and raises an invoice — and for a document with no clientId it
     // creates a client too, which off an unauthenticated public endpoint is how
-    // duplicate client records get made with nobody watching. An admin presses
-    // "Convert to Project" once they've checked the details that just arrived.
+    // duplicate client records get made with nobody watching unless something
+    // concrete happened first. That something is either an admin pressing
+    // "Convert to Project" after checking these details, or the client paying
+    // by card via startPayment below (conversion runs from the Stripe webhook,
+    // once the money has actually cleared).
     return this.getByToken(token, ip, { markAsViewed: false });
+  }
+
+  /**
+   * "Pay Now" on the review page — sends the client straight to Stripe for the
+   * document's own total. See StripeService.startDocumentPayment for why this
+   * exists instead of converting first and asking for payment after: nothing
+   * (client, project, invoice) gets created until the payment actually clears.
+   */
+  async startPayment(token) {
+    const document = await this._findByToken(token);
+    const StripeService = require('./StripeService');
+    return StripeService.startDocumentPayment(document.id, document.orgId);
   }
 
   async reject(token, { note, ip } = {}) {

@@ -1,5 +1,6 @@
 const jwt = require('jsonwebtoken');
 const { User, Role, WhiteLabelConfig, Worker } = require('../models');
+const CaptchaService = require('./CaptchaService');
 
 const ACCESS_TTL = '15m';
 const REFRESH_TTL = '7d';
@@ -11,7 +12,9 @@ class AuthService {
     return { access, refresh };
   }
 
-  async login(email, password) {
+  async login(email, password, turnstileToken, ip) {
+    await CaptchaService.verify(turnstileToken, ip);
+
     const user = await User.findOne({
       where: { email: email.toLowerCase() },
       include: [{ model: Role, as: 'role' }],

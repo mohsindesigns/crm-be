@@ -183,11 +183,8 @@ class ChatService {
       err.status = 400;
       throw err;
     }
-    if (actorUserId === otherUserId) {
-      const err = new Error('You cannot message yourself.');
-      err.status = 400;
-      throw err;
-    }
+    // Self-DM is allowed (WhatsApp-style "Message yourself") — the frontend
+    // labels it "You" via the isSelf flag on the serialized room below.
 
     const other = await db.User.findOne({
       where: { id: otherUserId, orgId, isActive: true },
@@ -416,7 +413,13 @@ class ChatService {
     if (peerMember?.user) return peerMember.user;
 
     if (room.dmKey) {
-      const peerId = String(room.dmKey).split(':').find((id) => id && id !== viewerUserId);
+      const ids = String(room.dmKey).split(':').filter(Boolean);
+      // Self-DM ("Message yourself"): both halves of the key are the viewer,
+      // so there is no *other* party — the viewer is their own peer.
+      if (ids.length && ids.every((id) => id === viewerUserId)) {
+        return db.User.findByPk(viewerUserId, { attributes: ['id', 'name', 'avatarUrl', 'lastSeenAt'] });
+      }
+      const peerId = ids.find((id) => id && id !== viewerUserId);
       if (peerId) {
         return db.User.findByPk(peerId, { attributes: ['id', 'name', 'avatarUrl', 'lastSeenAt'] });
       }
@@ -447,6 +450,8 @@ class ChatService {
     const peer = plain.roomType === 'dm'
       ? await this._dmPeer(plain, viewerUserId)
       : null;
+    // "Message yourself" — the only DM where the peer IS the viewer.
+    const isSelf = plain.roomType === 'dm' && !!peer && !!viewerUserId && peer.id === viewerUserId;
 
     const role = mem?.role || (isOrgAdmin && plain.roomType !== 'dm' ? 'admin' : 'member');
     const isActive = plain.isActive !== false;
@@ -467,6 +472,7 @@ class ChatService {
       clientId: plain.clientId,
       client: plain.client || null,
       peer: peer ? { id: peer.id, name: peer.name, avatarUrl: peer.avatarUrl, lastSeenAt: peer.lastSeenAt } : null,
+      isSelf,
       role,
       unread,
       lastMessage: last,

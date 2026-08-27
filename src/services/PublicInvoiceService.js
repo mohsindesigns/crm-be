@@ -111,6 +111,10 @@ class PublicInvoiceService {
         // the manual instructions their method carries.
         canPayByCard: isPayable && isStripe,
         isPayable,
+        // Retainer invoices are billed for a fixed recurring cycle amount —
+        // "pay part now, rest later" doesn't make sense against a subscription-
+        // style charge, so the client only ever sees "pay in full" for these.
+        isRetainer: !!invoice.retainerId,
         paymentLinkUrl: invoice.paymentLinkUrl || null,
         paymentMethodLabel: invoice.preferredPaymentMethod?.label || null,
         paymentInstructions: invoice.preferredPaymentMethod?.kind === 'manual'
@@ -151,6 +155,17 @@ class PublicInvoiceService {
    */
   async startPayment(token, { amount = null } = {}) {
     const invoice = await this._findByToken(token);
+
+    // Mirror the UI restriction server-side — a retainer invoice is only ever
+    // payable in full, regardless of what a client sends the endpoint directly.
+    if (invoice.retainerId && amount != null) {
+      const { amountDue } = this._settlement(invoice);
+      if (Number(amount) < amountDue - 0.005) {
+        const err = new Error('This is a retainer invoice and can only be paid in full.');
+        err.status = 400;
+        throw err;
+      }
+    }
 
     if (!PAYABLE_STATUSES.includes(invoice.status)) {
       const err = new Error(
