@@ -35,6 +35,16 @@ const VALID_TRANSITIONS = {
   [TASK_STATUS.DONE]: [TASK_STATUS.APPROVED],
 };
 
+// Content-review task types where the assignee is expected to hand back an
+// actual file/link — submitting or approving one of these with an empty
+// Deliverable panel is always a mistake, not a legitimate state (unlike an
+// "issue" or ad-hoc task, which can be finished with nothing to attach).
+// Blog copy (submitBlogDeliverable) already enforces this itself before it
+// ever reaches this generic pipeline; this closes the same gap for the
+// designer's blog_image task and plain content tasks, which go through the
+// Task Detail page's own Submit/Approve buttons instead.
+const DELIVERABLE_TASK_TYPES = new Set(['blog_post', 'blog_image', 'content']);
+
 class TaskService {
   async listForProject(projectId, orgId, stageKey, type) {
     const where = { projectId };
@@ -180,6 +190,21 @@ class TaskService {
     })));
   }
 
+  // True once at least one active, non-review-note deliverable is attached —
+  // matches the frontend's own `deliverableFiles` filter on the Task Detail
+  // page (kind: 'brief' is reference material from the assigner, kind:
+  // 'review_note' is a rejection-note attachment; neither counts as the work).
+  async _hasDeliverable(taskId) {
+    const count = await db.Artifact.count({
+      where: {
+        taskId,
+        isActive: true,
+        [Op.or]: [{ kind: null }, { kind: { [Op.notIn]: ['brief', 'review_note'] } }],
+      },
+    });
+    return count > 0;
+  }
+
   async approveAudit(taskId, orgId, actor) {
     const task = await db.Task.findOne({
       where: { id: taskId, orgId },
@@ -317,6 +342,13 @@ class TaskService {
       if (!isAdmin && task.assigneeId !== actor.id) {
         const err = new Error('Only the assignee can submit this task for review.');
         err.status = 403;
+        throw err;
+      }
+    }
+    if ([TASK_STATUS.SUBMITTED, TASK_STATUS.APPROVED].includes(newStatus) && DELIVERABLE_TASK_TYPES.has(task.type)) {
+      if (!(await this._hasDeliverable(task.id))) {
+        const err = new Error('Attach a file or link in the Deliverable panel first — there is nothing uploaded yet.');
+        err.status = 400;
         throw err;
       }
     }
