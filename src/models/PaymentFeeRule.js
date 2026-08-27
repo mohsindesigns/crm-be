@@ -84,6 +84,14 @@ module.exports = (sequelize, DataTypes) => {
   /**
    * The fee to add for one charge, rounded to the currency's precision.
    *
+   * Grossed up rather than a flat surcharge on the invoice net: Stripe takes
+   * its cut off the *total* charged, including the fee line itself, so a
+   * naive `net * percent + fixed` surcharge would still leave the agency
+   * short by percent-of-the-fee. Solving for the charge amount that nets the
+   * agency exactly `InvoiceNet` after Stripe's cut:
+   *   ChargeAmount = (InvoiceNet + FixedFee) / (1 − PercentFee)
+   * and the fee passed on to the client is ChargeAmount − InvoiceNet.
+   *
    * Returns 0 when no active rule covers the currency — see the note above on
    * why that is the right default.
    */
@@ -99,7 +107,11 @@ module.exports = (sequelize, DataTypes) => {
 
     const percent = parseFloat(rule.percent) || 0;
     const fixed = parseFloat(rule.fixedFee) || 0;
-    const fee = (base * percent) / 100 + fixed;
+    const percentFee = percent / 100;
+    if (percentFee >= 1) return 0; // misconfigured rule — division below would blow up or go negative
+
+    const chargeAmount = (base + fixed) / (1 - percentFee);
+    const fee = chargeAmount - base;
     if (fee <= 0) return 0;
 
     // Zero-decimal currencies (JPY, KRW, …) have no minor unit to round to.
