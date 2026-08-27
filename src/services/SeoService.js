@@ -179,6 +179,14 @@ async function nextSortOrder(Model, projectId) {
 
 const SHEET_ORDER = [['sortOrder', 'ASC'], ['createdAt', 'ASC']];
 
+// Backlinks tab wants the opposite feel from the rest of the SEO sheets: newest
+// activity on top rather than sheet-import order. Primary sort is createdAt
+// DESC so the latest add (single or imported) always lands first; secondary
+// sortOrder ASC keeps rows from the same bulk import in their original sheet
+// order relative to each other, since a bulkCreate batch shares ~the same
+// createdAt.
+const BACKLINK_ORDER = [['createdAt', 'DESC'], ['sortOrder', 'ASC']];
+
 // ─── Keywords ─────────────────────────────────────────────────────────────────
 
 // Deactivated ("deleted") rows are hidden unless the caller opts in with
@@ -707,7 +715,7 @@ async function listBacklinks(projectId, orgId, { includeInactive = false } = {})
   return Backlink.findAll({
     where: { projectId, ...(includeInactive ? {} : { isActive: true }) },
     include: [{ association: 'assignedWriter', attributes: ['id', 'name'] }],
-    order: SHEET_ORDER,
+    order: BACKLINK_ORDER,
   });
 }
 

@@ -577,7 +577,12 @@ async function getBacklinkSummary(orgId, filters = {}) {
   const limit = Math.min(100, parseInt(filters.limit, 10) || 25);
   const offset = (page - 1) * limit;
 
-  const { from, to } = resolveRange(filters.date, filters.date);
+  // No date filter by default — every project/builder pair with any backlink
+  // activity shows up, not just today's. A day picked explicitly narrows
+  // "links made" down to that one day; leaving it blank means "all time",
+  // same as how the client/project filters read when left on "All".
+  const targetDateStr = filters.date || null;
+  const { from, to } = targetDateStr ? resolveRange(targetDateStr, targetDateStr) : { from: null, to: null };
 
   const projectWhere = { orgId, serviceTypeKey: 'seo' };
   if (filters.projectId) projectWhere.id = filters.projectId;
@@ -589,14 +594,18 @@ async function getBacklinkSummary(orgId, filters = {}) {
     attributes: ['id', 'name', 'startDate', 'clientId'],
   });
   if (!projects.length) {
-    return { data: [], total: 0, page, totalPages: 1, limit, from: from.toISOString(), to: to.toISOString() };
+    return {
+      data: [], total: 0, page, totalPages: 1, limit,
+      from: from ? from.toISOString() : null,
+      to: to ? to.toISOString() : null,
+    };
   }
   const projectIds = projects.map((p) => p.id);
   const projectById = new Map(projects.map((p) => [p.id, p]));
 
   const backlinks = await Backlink.findAll({
     where: { projectId: { [Op.in]: projectIds }, isActive: true },
-    attributes: ['id', 'projectId', 'assignedWriterId', 'sourceUrl', 'isIndexed', 'createdAt'],
+    attributes: ['id', 'projectId', 'assignedWriterId', 'sourceUrl', 'isIndexed', 'createdAt', 'date'],
   });
 
   // Project-wide totals — independent of link builder and of the date filter.
@@ -625,14 +634,24 @@ async function getBacklinkSummary(orgId, filters = {}) {
     statsByProject[projectId] = { total: rows.length, indexed, nonIndexed: rows.length - indexed, duplicate };
   }
 
-  // Daily activity per link builder — only a builder who actually added a
-  // link within the selected day gets a row, same "activity in range" idea
-  // getMembersOverview uses for tasks/content/backlinks.
+  // Activity per link builder — every builder who has ever added a link gets
+  // a row by default; picking a day narrows that down to links whose own
+  // publish date (`Backlink.date`, the "Publish date" column link builders
+  // fill in on the project's Backlinks tab) falls on that day. createdAt
+  // (when the row was typed into the CRM) is only used as a fallback for
+  // older rows that predate the publish-date field, since it routinely
+  // diverges from the real publish date — e.g. a builder backfilling a
+  // week's worth of already-published links in one sitting.
   const countsByKey = new Map();
   for (const bl of backlinks) {
     if (!bl.assignedWriterId) continue;
     if (filters.linkBuilderId && bl.assignedWriterId !== filters.linkBuilderId) continue;
-    if (bl.createdAt < from || bl.createdAt > to) continue;
+    if (targetDateStr) {
+      const activityDateStr = bl.date || (bl.createdAt
+        ? `${bl.createdAt.getFullYear()}-${String(bl.createdAt.getMonth() + 1).padStart(2, '0')}-${String(bl.createdAt.getDate()).padStart(2, '0')}`
+        : null);
+      if (activityDateStr !== targetDateStr) continue;
+    }
     const key = `${bl.projectId}:${bl.assignedWriterId}`;
     countsByKey.set(key, (countsByKey.get(key) || 0) + 1);
   }
@@ -666,7 +685,11 @@ async function getBacklinkSummary(orgId, filters = {}) {
   const total = allRows.length;
   const data = allRows.slice(offset, offset + limit);
 
-  return { data, total, page, totalPages: Math.ceil(total / limit) || 1, limit, from: from.toISOString(), to: to.toISOString() };
+  return {
+    data, total, page, totalPages: Math.ceil(total / limit) || 1, limit,
+    from: from ? from.toISOString() : null,
+    to: to ? to.toISOString() : null,
+  };
 }
 
 async function exportBacklinkSummary(orgId, format, ids, filters = {}, letterheadFields = null) {
@@ -677,7 +700,7 @@ async function exportBacklinkSummary(orgId, format, ids, filters = {}, letterhea
 
   if (format === 'csv') {
     const headers = [
-      'Link Builder', 'Client', 'Project', 'Project Start Date', 'Links Made Today',
+      'Link Builder', 'Client', 'Project', 'Project Start Date', filters.date ? 'Links Made' : 'Links Made (All Time)',
       'Project Total Backlinks', 'Total Indexed', 'Total Non-Indexed', 'Total Duplicate',
     ];
     const rows = data.map((r) => [
@@ -708,7 +731,7 @@ async function exportBacklinkSummary(orgId, format, ids, filters = {}, letterhea
           { label: 'Link Builder', key: 'linkBuilderName', width: 14, align: 'left' },
           { label: 'Client', key: 'clientName', width: 13, align: 'left' },
           { label: 'Project', key: 'projectName', width: 13, align: 'left' },
-          { label: 'Made Today', key: 'linksMadeInDay', width: 8, align: 'right' },
+          { label: filters.date ? 'Made' : 'Made (All Time)', key: 'linksMadeInDay', width: 8, align: 'right' },
           { label: 'Total Links', key: 'projectTotalBacklinks', width: 8, align: 'right' },
           { label: 'Indexed', key: 'totalIndexed', width: 8, align: 'right' },
           { label: 'Non-Indexed', key: 'totalNonIndexed', width: 8, align: 'right' },
