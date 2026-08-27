@@ -22,6 +22,18 @@ class ProjectService {
     else if (filters.excludeCancelled === 'true' || filters.excludeCancelled === true) where.status = { [Op.ne]: 'cancelled' };
     if (filters.serviceTypeKey) where.serviceTypeKey = filters.serviceTypeKey;
     if (filters.currentStageKey) where.currentStageKey = filters.currentStageKey;
+    // "Pay via CRM" — client.billingMode === 'stripe'. Resolved to a clientId
+    // constraint here (rather than an include+where) so it composes cleanly with
+    // an explicit clientId filter instead of requiring a join.
+    if (filters.payViaCrm === 'true' || filters.payViaCrm === true) {
+      const stripeClients = await db.Client.findAll({ where: { orgId, billingMode: 'stripe' }, attributes: ['id'] });
+      const stripeClientIds = stripeClients.map((c) => c.id);
+      if (filters.clientId) {
+        if (!stripeClientIds.includes(filters.clientId)) return { data: [], total: 0, page, totalPages: 0, limit };
+      } else {
+        where.clientId = { [Op.in]: stripeClientIds };
+      }
+    }
     if (filters.isRecurring !== undefined) where.isRecurring = filters.isRecurring === 'true' || filters.isRecurring === true;
     // Overdue: has a delivery date in the past. If no explicit status filter was also
     // given, default to excluding completed/cancelled (an overdue-but-finished

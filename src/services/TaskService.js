@@ -413,6 +413,49 @@ class TaskService {
         update.acceptedAt = new Date();
       }
       await task.update(update, { transaction: t });
+
+      // A blog_post Task is the writer-facing half of a BlogTask sheet row
+      // (see SeoService#ensureBlogTask, matched by projectId+title+pageName).
+      // submitBlogDeliverable() keeps both in sync when the writer submits from
+      // the Blogs tab, but this Task Detail page's own Deliverable panel/Submit
+      // button is a fully-supported second path to the same transition (it even
+      // gets its own reviewer notification below) — without this, a file attached
+      // and submitted here never reaches the sheet row, so the blog silently never
+      // shows up as pending in the Blogs section for the strategist/PM to review.
+      if (task.type === 'blog_post' && newStatus === TASK_STATUS.SUBMITTED && task.pageName) {
+        const deliverable = await db.Artifact.findOne({
+          where: {
+            taskId: task.id,
+            isActive: true,
+            [Op.or]: [{ kind: null }, { kind: { [Op.notIn]: ['brief', 'review_note'] } }],
+          },
+          order: [['createdAt', 'DESC']],
+          transaction: t,
+        });
+        if (deliverable) {
+          const bt = await db.BlogTask.findOne({
+            where: {
+              projectId: task.projectId,
+              title: task.pageName,
+              status: { [Op.in]: ['draft', 'rejected', 'pending'] },
+            },
+            order: [['createdAt', 'DESC']],
+            transaction: t,
+          });
+          if (bt) {
+            await bt.update({
+              status: 'pending',
+              fileUrl: deliverable.fileUrl,
+              fileName: deliverable.fileName,
+              submittedBy: actor.id,
+              assignedWriterId: bt.assignedWriterId || task.assigneeId,
+              rejectionReason: null,
+              reviewedBy: null,
+              reviewedAt: null,
+            }, { transaction: t });
+          }
+        }
+      }
     });
 
     // Fire-and-forget in-app notifications
