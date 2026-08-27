@@ -411,7 +411,9 @@ class InvoiceService {
       qrUrl: this.publicInvoiceUrl(invoice) || `${frontendUrl}/portal/invoices/${invoice.id}`,
     });
 
-    return { buffer, invoice, contactEmail: emailContact?.email || null };
+    return {
+      buffer, invoice, contactEmail: emailContact?.email || null, payUrl,
+    };
   }
 
   /**
@@ -577,7 +579,9 @@ class InvoiceService {
   // invoice detail page's "Download PDF" / resend action.
   async _emailInvoiceToClient(id, orgId) {
     try {
-      const { buffer, invoice, contactEmail } = await this.generatePdfBuffer(id, orgId);
+      const {
+        buffer, invoice, contactEmail, payUrl,
+      } = await this.generatePdfBuffer(id, orgId);
       if (!contactEmail) {
         console.warn(`[InvoiceService] Invoice ${invoice.number} sent but client has no contact email on file — skipping email.`);
         return;
@@ -594,6 +598,9 @@ class InvoiceService {
         // The public invoice page works without portal access; the portal link
         // is only right for a client who actually has an account there.
         portalUrl: this.publicInvoiceUrl(invoice),
+        // Same "PAY INVOICE" link the PDF header carries, so the client can pay
+        // straight from the email without opening the attachment first.
+        payUrl,
         attachmentBuffer: buffer,
         attachmentName: `${invoice.number}.pdf`,
       });
@@ -662,6 +669,7 @@ class InvoiceService {
     const paid = (invoice.payments || []).reduce((sum, p) => sum + (parseFloat(p.amount) || 0), 0);
     const amountDue = Math.max(0, (parseFloat(invoice.total) || 0) - paid);
     const isOverdue = invoice.status === INVOICE_STATUS.OVERDUE || invoice.status === 'overdue';
+    const payUrl = await this._resolveInvoicePayUrl(invoice, orgId);
 
     await EmailService.sendInvoiceEmail({
       to: contactEmail,
@@ -674,6 +682,9 @@ class InvoiceService {
       // The public invoice page works without portal access; the portal link
       // is only right for a client who actually has an account there.
       portalUrl: this.publicInvoiceUrl(invoice),
+      // Same "PAY INVOICE" link the PDF header carries, so the client can pay
+      // straight from the email without opening the attachment first.
+      payUrl,
       attachmentBuffer: buffer,
       attachmentName: `${invoice.number}.pdf`,
       isReminder: true,

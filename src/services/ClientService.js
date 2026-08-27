@@ -21,6 +21,7 @@ class ClientService {
     if (!isTruthy(query.includeInactive)) where.isActive = true;
     if (query.status) where.status = query.status;
     if (query.search) where.name = { [Op.like]: `%${query.search}%` };
+    if (query.payViaCrm === 'true' || query.payViaCrm === true) where.billingMode = 'stripe';
 
     // `balance=overdue|outstanding` narrows the list to clients who owe money.
     // Resolved to a set of client IDs and folded into the WHERE clause BEFORE

@@ -515,7 +515,7 @@ async function sendDocumentRemind(email, prospectName, brandName, type, number, 
 }
 
 async function sendInvoiceEmail({
-  to, clientName, brandName, invoiceNumber, amountDue, currency, dueAt, portalUrl, attachmentBuffer, attachmentName,
+  to, clientName, brandName, invoiceNumber, amountDue, currency, dueAt, portalUrl, payUrl, attachmentBuffer, attachmentName,
   // A reminder is the same invoice and the same attachment — only the framing
   // changes, so it shares this function rather than duplicating the layout.
   isReminder = false, isOverdue = false,
@@ -532,14 +532,23 @@ async function sendInvoiceEmail({
       ? `This is a reminder that invoice <strong>${escapeHtml(invoiceNumber)}</strong>${amountStr ? ` for <strong>${amountStr}</strong>` : ''} was due${dueLabel ? ` on <strong>${escapeHtml(dueLabel)}</strong>` : ''} and is still outstanding. If it has already been paid, please ignore this message.`
       : `This is a friendly reminder about invoice <strong>${escapeHtml(invoiceNumber)}</strong>${amountStr ? ` for <strong>${amountStr}</strong>` : ''}${dueLabel ? `, due <strong>${escapeHtml(dueLabel)}</strong>` : ''}.`;
 
+  // Pay Now takes the client straight to checkout (Stripe or the admin's
+  // manual payment link); View Invoice Online takes them to the invoice page
+  // itself. Both always render as their own button when the URL exists —
+  // no collapsing, even if they happen to point at the same place.
+  const payButtonHtml = payUrl
+    ? `<a href="${payUrl}" style="display:inline-block;margin-top:22px;margin-right:12px;background:${BRAND_ACCENT};color:${BRAND_PRIMARY};text-decoration:none;padding:12px 22px;border-radius:8px;font-size:14px;font-weight:700;">Pay Now</a>`
+    : '';
+  const viewButtonHtml = portalUrl
+    ? `<a href="${portalUrl}" style="display:inline-block;margin-top:22px;background:${BRAND_PRIMARY};color:#fff;text-decoration:none;padding:12px 22px;border-radius:8px;font-size:14px;font-weight:700;">View Invoice Online</a>`
+    : '';
+
   const bodyHtml = `
     <p style="margin:0 0 12px;color:#374151;font-size:15px;line-height:1.6;">Hi <strong>${safeName}</strong>,</p>
     <p style="margin:0;color:#374151;font-size:15px;line-height:1.6;">
       ${lead}
     </p>
-    ${portalUrl
-      ? `<a href="${portalUrl}" style="display:inline-block;margin-top:22px;background:${BRAND_ACCENT};color:${BRAND_PRIMARY};text-decoration:none;padding:12px 22px;border-radius:8px;font-size:14px;font-weight:700;">View Invoice Online</a>`
-      : ''}
+    ${payButtonHtml}${viewButtonHtml}
   `;
 
   return sendMail({
