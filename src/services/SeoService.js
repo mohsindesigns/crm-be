@@ -1,6 +1,6 @@
 const xlsx = require('xlsx');
 const { Op } = require('sequelize');
-const { Keyword, Backlink, ContentSubmission, BlogTask, RankSnapshot, Project, Client, WhiteLabelConfig, Task, User, Role, Stage, ProjectAssignment } = require('../models');
+const { Keyword, Backlink, ContentSubmission, BlogTask, RankSnapshot, Project, Client, WhiteLabelConfig, Task, Artifact, User, Role, Stage, ProjectAssignment } = require('../models');
 const {
   createPdfBuffer, drawTable, drawFooter, drawReportFooter, drawStatCards, drawPill, BRAND_COLOR,
 } = require('./PdfService');
@@ -132,6 +132,30 @@ async function ensureBlogImageTask(orgId, project, title, assigneeId, actorUserI
   }, actorUserId);
 }
 
+/**
+ * Mirrors a sheet-submitted deliverable onto the writer's Task as an Artifact, so
+ * the Task Detail page's Deliverable panel and the Blogs tab's File column always
+ * show the same thing. Idempotent — resubmitting the same URL doesn't duplicate.
+ * A pasted link is stored as kind 'link' (fileName "Link"), matching /media/link.
+ */
+async function ensureTaskDeliverableArtifact(task, fileUrl, fileName, uploadedBy) {
+  if (!task?.id || !fileUrl) return null;
+  const existing = await Artifact.findOne({ where: { taskId: task.id, fileUrl } });
+  if (existing) {
+    if (!existing.isActive) await existing.update({ isActive: true });
+    return existing;
+  }
+  return Artifact.create({
+    projectId: task.projectId,
+    taskId: task.id,
+    stageKey: task.stageKey || 'general',
+    fileUrl,
+    fileName: fileName || null,
+    kind: fileName === 'Link' ? 'link' : null,
+    uploadedBy,
+  });
+}
+
 async function markBlogTasksSubmitted(orgId, projectId, title, assigneeId, actorUserId) {
   if (!assigneeId || !title) return;
   const openTasks = await Task.findAll({
@@ -140,7 +164,10 @@ async function markBlogTasksSubmitted(orgId, projectId, title, assigneeId, actor
       type: 'blog_post',
       pageName: title,
       assigneeId,
-      status: { [Op.in]: ['todo', 'in_progress', 'rejected'] },
+      // `accepted` included too — a writer who clicked Accept on the task first
+      // and then submitted from the Blogs tab was otherwise skipped here, leaving
+      // their task stuck while the sheet row moved to In review.
+      status: { [Op.in]: ['todo', 'accepted', 'in_progress', 'rejected'] },
     },
   });
   for (const task of openTasks) {
@@ -1603,7 +1630,17 @@ async function submitBlogDeliverable(projectId, data, orgId, caller) {
     });
   }
 
-  await ensureBlogTask(orgId, project, resolvedTitle, writerId, caller.id);
+  const writerTask = await ensureBlogTask(orgId, project, resolvedTitle, writerId, caller.id);
+  // The file submitted here goes through MediaService directly, so it was never
+  // recorded as an Artifact against the writer's Task. That mattered: markBlogTasks-
+  // Submitted below drives the Task through TaskService.transition, which refuses
+  // to submit a blog_post with an empty Deliverable panel (DELIVERABLE_TASK_TYPES)
+  // — so the sheet row went to "In review" while the writer's task silently stayed
+  // in To do, and the Task Detail page showed no file at all. Recording it keeps
+  // both surfaces showing the same deliverable.
+  if (writerTask?.id) {
+    await ensureTaskDeliverableArtifact(writerTask, resolvedFileUrl, resolvedFileName, caller.id);
+  }
   await markBlogTasksSubmitted(orgId, projectId, resolvedTitle, writerId, caller.id);
 
   for (const slot of ['project_strategist', 'project_manager']) {

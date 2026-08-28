@@ -88,6 +88,66 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.DECIMAL(4, 1),
       defaultValue: 0,
     },
+    // ─── Tax withholding transparency (utils/payrollCalc.js, cumulative YTD
+    // method) — persisted so next month's calculation can read prior months'
+    // actuals back out, and so an accountant can audit any single month. ───
+    calendarDaysInMonth: {
+      type: DataTypes.INTEGER,
+      defaultValue: 0,
+    },
+    payableDaysCalendar: {
+      type: DataTypes.DECIMAL(5, 2),
+      defaultValue: 0,
+    },
+    earnedBasic: {
+      type: DataTypes.DECIMAL(12, 2),
+      defaultValue: 0,
+    },
+    earnedMedical: {
+      type: DataTypes.DECIMAL(12, 2),
+      defaultValue: 0,
+    },
+    // This month's taxable salary (earned Basic + overtime + any taxable
+    // medical excess above the exemption cap). Medical up to the cap is
+    // excluded — see Section 6 of the payroll tax spec.
+    monthlyTaxable: {
+      type: DataTypes.DECIMAL(12, 2),
+      defaultValue: 0,
+    },
+    // Cumulative taxable salary from the start of the tax year through and
+    // including this month (actuals only).
+    taxableYTD: {
+      type: DataTypes.DECIMAL(12, 2),
+      defaultValue: 0,
+    },
+    projectedAnnualTaxable: {
+      type: DataTypes.DECIMAL(12, 2),
+      defaultValue: 0,
+    },
+    annualTaxProjected: {
+      type: DataTypes.DECIMAL(12, 2),
+      defaultValue: 0,
+    },
+    // This month's tax withheld — mirrors deductions.tax, kept as a real
+    // column so YTD sums don't require parsing JSON across every prior row.
+    taxAmount: {
+      type: DataTypes.DECIMAL(12, 2),
+      defaultValue: 0,
+    },
+    // Snapshot of computedNet split across the worker's SalaryBeneficiary rows,
+    // frozen at lock time (see HrService#advancePayrollStatus, the 'locked'
+    // branch) so a later edit to the worker's split doesn't rewrite history for
+    // a run that's already been disbursed. Array of
+    // { beneficiaryId | null, name, relation, bankName, bankAccountTitle,
+    //   bankAccountNumber, iban, amount }. beneficiaryId is null for the
+    // synthetic "self" line (worker's own bank details) — see
+    // utils/payrollCalc.js#computeDisbursementSplit. Empty array = no split
+    // configured, full computedNet goes to the worker's own account (the
+    // pre-existing behavior, still the default via getDisbursementData).
+    disbursementSplit: {
+      type: DataTypes.JSON,
+      defaultValue: [],
+    },
   }, {
     tableName: 'payroll_items',
   });

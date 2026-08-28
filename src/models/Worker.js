@@ -41,14 +41,38 @@ module.exports = (sequelize, DataTypes) => {
     joiningDate: {
       type: DataTypes.DATEONLY,
     },
+    // Last day of employment (payroll uses this for leaving-month proration —
+    // see utils/payrollCalc.js). Set alongside status: 'inactive'; null means
+    // still employed.
+    leavingDate: {
+      type: DataTypes.DATEONLY,
+    },
     probationEndDate: {
       type: DataTypes.DATEONLY,
     },
     confirmationDate: {
       type: DataTypes.DATEONLY,
     },
+    // Basic salary (taxable). "Gross" for payroll = salaryBase + medicalAllowance.
     salaryBase: {
       type: DataTypes.DECIMAL(12, 2),
+    },
+    // Monthly medical allowance, exempt from tax up to PayrollSettings
+    // .medicalExemptionCapPercent of salaryBase — excess above the cap is
+    // taxable (see utils/payrollCalc.js). Null = default to exactly the cap
+    // (the standard "10% of Basic" medical allowance).
+    medicalAllowance: {
+      type: DataTypes.DECIMAL(12, 2),
+    },
+    // Extra monthly salary components beyond Basic + Medical — House Rent
+    // Allowance, Conveyance, Special Allowance, Bonus, or anything else HR
+    // adds. Each item: { id, name, amount, taxable }. Each is paid every
+    // month (calendar-day prorated like Basic), but only the ones flagged
+    // taxable: true are counted toward taxable salary — see
+    // utils/payrollCalc.js#computeSalaryComponents.
+    salaryComponents: {
+      type: DataTypes.JSON,
+      defaultValue: [],
     },
     currency: {
       type: DataTypes.STRING(10),
@@ -130,6 +154,7 @@ module.exports = (sequelize, DataTypes) => {
     Worker.hasMany(db.HrDocument, { foreignKey: 'workerId', as: 'documents' });
     Worker.hasMany(db.ContractorInvoice, { foreignKey: 'workerId', as: 'contractorInvoices' });
     Worker.hasMany(db.Appraisal, { foreignKey: 'workerId', as: 'appraisals' });
+    Worker.hasMany(db.SalaryBeneficiary, { foreignKey: 'workerId', as: 'salaryBeneficiaries' });
   };
 
   Worker.ensureSchema = async () => {

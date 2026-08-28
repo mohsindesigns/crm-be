@@ -3,7 +3,7 @@ const xlsx = require('xlsx');
 const db = require('../models');
 const { activeWhere, setActive } = require('./SoftDeleteService');
 
-const { Worker, User, Role, ShiftSchedule, ExportTemplate } = db;
+const { Worker, User, Role, ShiftSchedule, ExportTemplate, SalaryBeneficiary } = db;
 
 /**
  * Admin → Export Data.
@@ -57,6 +57,24 @@ function titleCase(v) {
   return String(v || '').replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
+// "Wife (Fixed 20,000); Father (10%)" — anyone building a manual transfer sheet
+// outside HR → Payroll's own disbursement view (which already expands one row
+// per recipient) needs this spelled out here too, or they'd silently pay a
+// split worker's full net to their own account. See SalaryBeneficiary.js /
+// utils/payrollCalc.js#computeDisbursementSplit.
+function summarizeSalarySplit(worker) {
+  const rows = (worker.salaryBeneficiaries || []).filter((b) => b.isActive !== false);
+  if (!rows.length) return '';
+  return rows
+    .map((b) => {
+      const amount = b.splitType === 'fixed'
+        ? Number(b.splitValue || 0).toLocaleString()
+        : `${Number(b.splitValue || 0)}%`;
+      return `${b.name} (${amount})`;
+    })
+    .join('; ');
+}
+
 /**
  * Every exportable employee column.
  *
@@ -96,6 +114,7 @@ const EMPLOYEE_FIELDS = [
   { key: 'bankAccountNumber', label: 'Account Number',    group: 'bank',       sensitive: true, value: (w) => w.bankAccountNumber },
   { key: 'iban',             label: 'IBAN',               group: 'bank',       sensitive: true, value: (w) => w.iban },
   { key: 'currency',         label: 'Currency',           group: 'bank',       value: (w) => w.currency },
+  { key: 'salarySplit',      label: 'Salary Split',       group: 'bank',       sensitive: true, value: (w) => summarizeSalarySplit(w) },
 ];
 
 const FIELD_BY_KEY = new Map(EMPLOYEE_FIELDS.map((f) => [f.key, f]));
@@ -192,6 +211,13 @@ const PICKER_INCLUDES = [
     attributes: ['id', 'name', 'email', 'avatarUrl', 'isActive'],
     include: [{ model: Role, as: 'role', attributes: ['id', 'key', 'name'] }],
   },
+  {
+    model: SalaryBeneficiary,
+    as: 'salaryBeneficiaries',
+    attributes: ['id', 'name', 'relation', 'splitType', 'splitValue', 'isActive'],
+    where: { isActive: true },
+    required: false,
+  },
 ];
 
 /**
@@ -235,6 +261,9 @@ async function listEmployees(orgId, { search, department, status, workerType } =
     // Lets the screen warn "3 of the selected employees have no bank details on
     // file" before producing a sheet full of blank account numbers.
     hasBankDetails: !!(w.bankAccountNumber || w.iban),
+    // Lets the screen flag employees whose pay is split across other
+    // recipients, so an admin exporting a manual transfer sheet doesn't miss it.
+    hasSalarySplit: (w.salaryBeneficiaries || []).filter((b) => b.isActive !== false).length > 0,
   }));
 }
 

@@ -29,6 +29,24 @@ router.get('/payment-methods', rbac('billing.read'), async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+/**
+ * Billing defaults the New Invoice form needs to render itself correctly.
+ *
+ * Separate from `/admin/payment-methods/stripe-status` for the same reason as
+ * the route above: that one sits behind `admin.access`, which a billing-only
+ * user doesn't have, and the form would otherwise show the part-payment box
+ * unticked even in an org that has defaulted it on.
+ *
+ * Declared before `/:id` so "billing-defaults" isn't captured as an invoice id.
+ */
+router.get('/billing-defaults', rbac('billing.read'), async (req, res, next) => {
+  try {
+    const db = require('../models');
+    const settings = await db.PaymentSetting.resolve(req.orgId).catch(() => null);
+    res.json({ allowPartialPaymentDefault: !!settings?.allowPartialPaymentDefault });
+  } catch (e) { next(e); }
+});
+
 router.get('/', rbac('billing.read'), (req, res, next) => InvoiceController.list(req, res, next));
 router.post('/', rbac('billing.create'), (req, res, next) => InvoiceController.create(req, res, next));
 router.post('/bulk-void', rbac('billing.update'), (req, res, next) => InvoiceController.bulkVoid(req, res, next));

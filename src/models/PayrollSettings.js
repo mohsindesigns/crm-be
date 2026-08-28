@@ -112,6 +112,12 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.JSON,
       defaultValue: [0, 6], // Sunday, Saturday
     },
+    // Medical allowance exempt from income tax up to this % of Basic (FBR rule,
+    // config so it can track Finance Act changes) — see utils/payrollCalc.js.
+    medicalExemptionCapPercent: {
+      type: DataTypes.DECIMAL(5, 2),
+      defaultValue: 10.0,
+    },
   }, {
     tableName: 'payroll_settings',
     timestamps: false,

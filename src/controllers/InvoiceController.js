@@ -64,6 +64,7 @@ class InvoiceController {
       res.json(await InvoiceService.configurePaymentProfile(req.params.id, req.orgId, {
         paymentMethodId: req.body.paymentMethodId,
         paymentLinkUrl: req.body.paymentLinkUrl,
+        allowPartialPayment: req.body.allowPartialPayment,
       }));
     } catch (err) { next(err); }
   }

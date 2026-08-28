@@ -4,6 +4,7 @@ const db = require('../models');
 const { TASK_STATUS } = require('../config/constants');
 const NotificationService = require('./NotificationService');
 const EmailService = require('./EmailService');
+const BlogSheetSync = require('./BlogSheetSync');
 const { computeReminderAt } = require('../utils/taskDates');
 
 /** Deep-link payload for Header → `/tasks/:projectId/:taskId` (projectId + taskId). */
@@ -148,6 +149,16 @@ class TaskService {
       // New tasks always start as todo — status advances via transitions.
       status: TASK_STATUS.TODO,
     });
+
+    // A blog task must be visible on the project's Blogs tab from the moment it is
+    // assigned, not only once a deliverable comes back — awaited (not
+    // fire-and-forget) because it also backfills `pageName`, which every later
+    // blog routine matches on. A failure here must never block creating the task.
+    try {
+      await BlogSheetSync.ensureSheetRowForTask(task, createdBy);
+    } catch (err) {
+      console.error('[TaskService] Failed to create blog sheet row for task:', err.message);
+    }
 
     if (requiresTechnicalAudit) {
       this._notifyAdminsForAudit(task, project, orgId).catch(() => {});
@@ -414,48 +425,22 @@ class TaskService {
       }
       await task.update(update, { transaction: t });
 
-      // A blog_post Task is the writer-facing half of a BlogTask sheet row
-      // (see SeoService#ensureBlogTask, matched by projectId+title+pageName).
-      // submitBlogDeliverable() keeps both in sync when the writer submits from
-      // the Blogs tab, but this Task Detail page's own Deliverable panel/Submit
-      // button is a fully-supported second path to the same transition (it even
-      // gets its own reviewer notification below) — without this, a file attached
-      // and submitted here never reaches the sheet row, so the blog silently never
-      // shows up as pending in the Blogs section for the strategist/PM to review.
-      if (task.type === 'blog_post' && newStatus === TASK_STATUS.SUBMITTED && task.pageName) {
-        const deliverable = await db.Artifact.findOne({
-          where: {
-            taskId: task.id,
-            isActive: true,
-            [Op.or]: [{ kind: null }, { kind: { [Op.notIn]: ['brief', 'review_note'] } }],
-          },
-          order: [['createdAt', 'DESC']],
-          transaction: t,
-        });
-        if (deliverable) {
-          const bt = await db.BlogTask.findOne({
-            where: {
-              projectId: task.projectId,
-              title: task.pageName,
-              status: { [Op.in]: ['draft', 'rejected', 'pending'] },
-            },
-            order: [['createdAt', 'DESC']],
-            transaction: t,
-          });
-          if (bt) {
-            await bt.update({
-              status: 'pending',
-              fileUrl: deliverable.fileUrl,
-              fileName: deliverable.fileName,
-              submittedBy: actor.id,
-              assignedWriterId: bt.assignedWriterId || task.assigneeId,
-              rejectionReason: null,
-              reviewedBy: null,
-              reviewedAt: null,
-            }, { transaction: t });
-          }
-        }
-      }
+      // A blog_post Task is the writer-facing half of a BlogTask sheet row on the
+      // project's Blogs tab. submitBlogDeliverable() keeps both in sync when the
+      // writer submits from that tab, but the Task Detail page's own Deliverable
+      // panel/Submit button is a fully-supported second path to the same
+      // transition (it even gets its own reviewer notification below) — without
+      // this, a file attached and submitted here never reaches the sheet row, so
+      // the blog silently never shows up for the strategist/PM to review.
+      // BlogSheetSync also creates the sheet row when there isn't one yet, which
+      // is the case for every blog task the recurring-task scheduler or the
+      // generic Create Task modal produced.
+      await BlogSheetSync.syncFromTask(task, {
+        actorUserId: actor.id,
+        taskStatus: newStatus,
+        note,
+        transaction: t,
+      });
     });
 
     // Fire-and-forget in-app notifications

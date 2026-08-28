@@ -117,6 +117,12 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.STRING(64),
       unique: true,
     },
+    // When enabled, the client can choose to pay less than the full remaining balance
+    // (partial payment) on the public invoice page or client portal.
+    allowPartialPayment: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
   }, {
     tableName: 'invoices',
     indexes: [

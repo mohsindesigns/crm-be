@@ -59,6 +59,7 @@ const modelFiles = [
   'LeaveRequest',
   'PayrollRun',
   'PayrollItem',
+  'SalaryBeneficiary',
   'SalarySlip',
   'HrDocument',
   'ContractorInvoice',

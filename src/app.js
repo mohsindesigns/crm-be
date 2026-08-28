@@ -316,12 +316,13 @@ app.schemaReady = (async () => {
     }
     await db.User.ensureSchema();       // adds pendingEmail + email-change OTP columns
     await db.Worker.ensureSchema();     // adds pendingAmendmentDiff + widens status ENUM
+    await db.SalaryBeneficiary.ensureSchema(); // new table; depends on workers
     await db.Appraisal.ensureSchema();  // new table; depends on workers
     await db.TaxYear.ensureSchema();    // salary tax years
     await db.TaxSlab.ensureSchema();    // depends on tax_years
     await db.PayrollRun.ensureSchema(); // per-run workingDaysPerMonth
     await db.PayrollSettings.ensureSchema(); // adds shift/late/half-day attendance policy fields
-    await db.PayrollItem.ensureSchema();     // adds lateCount/latePenaltyDays/latePenaltyUnpaidDays
+    await db.PayrollItem.ensureSchema();     // adds lateCount/latePenaltyDays/latePenaltyUnpaidDays/disbursementSplit
     await db.LeaveRequest.ensureSchema();    // adds isHalfDay
     await db.Attendance.ensureSchema();      // adds isLate/lateMinutes
     await db.Holiday.ensureSchema();         // new table; public/company holidays
@@ -331,9 +332,10 @@ app.schemaReady = (async () => {
     await db.RecurringTaskRule.ensureSchema(); // new table; depends on projects
     await db.Task.ensureSchema();       // adds ruleId/acceptedAt + widens status ENUM w/ `accepted` — depends on recurring_task_rules
     await db.Artifact.ensureSchema();   // adds taskId/taskEventId — depends on tasks
+    await db.Notification.ensureSchema(); // widens refId to fit composite task deep-link refs
     await db.Backlink.ensureSchema();   // widens `linkType` ENUM + adds date/domain/status/spamScore
     await db.ContentSubmission.ensureSchema(); // adds wordCount
-    await db.BlogTask.ensureSchema();          // adds sheet columns + approval workflow fields
+    await db.BlogTask.ensureSchema();          // adds sheet columns + approval workflow fields + taskId link — depends on tasks
     await db.DocumentTemplate.ensureSchema();  // new table; Quotes & Agreements module
     await db.CustomerDocument.ensureSchema();  // new table; depends on document_templates/packages/clients/projects
     await db.DocumentEvent.ensureSchema();     // new table; depends on customer_documents
@@ -434,6 +436,36 @@ app.schemaReady.then(async () => {
     }
   } catch (err) {
     console.error('[Schema] blog_writer role backfill failed:', err.message);
+  }
+});
+
+// One-time backfill: pair every existing `blog_post` Task with a Blogs-tab row.
+// Blog tasks created by the recurring-task scheduler or the generic Create Task
+// modal never had one (nor a `pageName`), so a deliverable attached to them had
+// nowhere to surface — the Blogs tab simply didn't know the blog existed. Going
+// forward services/BlogSheetSync.js keeps the two halves together at creation
+// time; this catches the tasks that predate it and links rows created before the
+// `taskId` column existed. Idempotent — matches on taskId, then projectId+title.
+app.schemaReady.then(async () => {
+  try {
+    const BlogSheetSync = require('./services/BlogSheetSync');
+    const tasks = await db.Task.findAll({ where: { type: 'blog_post' } });
+    let linked = 0;
+    for (const task of tasks) {
+      try {
+        // Existing tasks may already carry a deliverable that never made it to
+        // the sheet, so mirror the file across too — status is derived from the
+        // task's current status and never knocks an approved row backwards.
+        const wasUnlinked = !task.pageName;
+        const row = await BlogSheetSync.syncFromTask(task);
+        if (row && wasUnlinked) linked += 1;
+      } catch (err) {
+        console.error(`[Schema] Blog sheet backfill failed for task ${task.id}:`, err.message);
+      }
+    }
+    if (linked) console.log(`[Schema] Paired ${linked} orphaned blog task(s) with a Blogs-tab row.`);
+  } catch (err) {
+    console.error('[Schema] Blog sheet row backfill failed:', err.message);
   }
 });
 

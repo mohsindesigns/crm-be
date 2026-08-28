@@ -221,6 +221,17 @@ router.post('/workers/:id/appraisals', rbac('hr.manage'), async (req, res, next)
   try { res.status(201).json(await HrService.createAppraisal(req.params.id, req.body, req.user.id, req.orgId)); } catch (e) { next(e); }
 });
 
+// ─── Salary Beneficiaries (salary split) ───────────────────────────────────────
+router.get('/workers/:id/salary-beneficiaries', rbac('hr.read'), async (req, res, next) => {
+  try { res.json(await HrService.getSalaryBeneficiaries(req.params.id, req.orgId)); } catch (e) { next(e); }
+});
+
+router.put('/workers/:id/salary-beneficiaries', rbac('hr.manage'), async (req, res, next) => {
+  try {
+    res.json(await HrService.setSalaryBeneficiaries(req.params.id, req.orgId, req.body.beneficiaries));
+  } catch (e) { next(e); }
+});
+
 // ─── Attendance ───────────────────────────────────────────────────────────────
 router.get('/attendance', rbac('hr.read'), async (req, res, next) => {
   try {
@@ -390,9 +401,9 @@ router.get('/payroll/:id/disbursement', rbac('hr.manage'), async (req, res, next
   try {
     const data = await HrService.getDisbursementData(req.params.id, req.orgId);
     if (req.query.format === 'csv') {
-      const headers = ['Employee', 'Designation', 'Department', 'Bank', 'Account Title', 'Account #', 'IBAN', 'Currency', 'Net Amount'];
+      const headers = ['Employee', 'Recipient', 'Relation', 'Designation', 'Department', 'Bank', 'Account Title', 'Account #', 'IBAN', 'Currency', 'Amount'];
       const rows = data.map((d) => [
-        d.employee, d.designation, d.department,
+        d.employee, d.recipient, d.relation, d.designation, d.department,
         d.bankName, d.accountTitle, d.accountNumber, d.iban,
         d.currency, d.netAmount,
       ]);
@@ -585,6 +596,19 @@ router.get('/me/payroll', async (req, res, next) => {
       limit: 12,
     });
     res.json(items);
+  } catch (e) { next(e); }
+});
+
+// Read-only — an employee can see how their own pay is split (HR sets it up
+// based on info the employee themselves provided), but not edit it here;
+// changing where someone else's money goes stays an HR-only action via
+// PUT /hr/workers/:id/salary-beneficiaries.
+router.get('/me/salary-split', async (req, res, next) => {
+  try {
+    const { Worker } = require('../models');
+    const worker = await Worker.findOne({ where: { userId: req.user.id, orgId: req.orgId } });
+    if (!worker) return res.status(404).json({ message: 'No worker profile linked to your account.' });
+    res.json(await HrService.getSalaryBeneficiaries(worker.id, req.orgId));
   } catch (e) { next(e); }
 });
 

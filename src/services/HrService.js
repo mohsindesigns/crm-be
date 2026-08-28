@@ -12,7 +12,7 @@ const EMAIL_CHANGE_MAX_ATTEMPTS = 5;
 const {
   Worker, User, Role, Attendance, LeaveRequest, Holiday, ShiftSchedule,
   PayrollRun, PayrollItem, SalarySlip, HrDocument, ContractorInvoice, PayrollSettings, Appraisal,
-  TaxYear, TaxSlab,
+  TaxYear, TaxSlab, SalaryBeneficiary,
 } = db;
 
 // Roles that don't mark attendance. Owners and admins run the company rather
@@ -28,13 +28,17 @@ function isNonAttendanceRole(roleKey) {
   if (!key) return false;
   return NON_ATTENDANCE_ROLE_KEYS.includes(key) || key.includes('partner');
 }
-const { computeMonthlyTaxWithholding } = require('../utils/taxCalc');
+const {
+  daysInCalendarMonth, computePayableDays, computeSalaryStructure,
+  computeEarnedAmounts, computeMonthlyTaxable, computeCumulativeTax, activeRangeForMonth,
+  computeSalaryComponents, computeDisbursementSplit,
+} = require('../utils/payrollCalc');
 
 // Sanitize incoming worker updates so partial PATCH payloads never trip generic
 // database-format errors (e.g. empty date/number strings).
 const safeDate = (v) => (v && v !== 'Invalid date' ? v : null);
-const DATE_FIELDS = ['joiningDate', 'probationEndDate', 'confirmationDate', 'dateOfBirth'];
-const NUMERIC_FIELDS = ['salaryBase'];
+const DATE_FIELDS = ['joiningDate', 'leavingDate', 'probationEndDate', 'confirmationDate', 'dateOfBirth'];
+const NUMERIC_FIELDS = ['salaryBase', 'medicalAllowance'];
 const TEXT_FIELDS = [
   'designation', 'department', 'profilePictureUrl', 'cnic', 'address', 'emergencyContact',
   'emergencyPhone', 'bankName', 'bankBranchName', 'bankBranchCity',
@@ -63,6 +67,20 @@ function normalizeWorkerUpdates(updates) {
   // '' means "Default" in the Timing Policy picker — coerce to null rather
   // than writing an empty string into the CHAR(36) column.
   if ('shiftScheduleId' in clean && !clean.shiftScheduleId) clean.shiftScheduleId = null;
+  // Drop incomplete/garbage rows (blank name, non-numeric or zero amount)
+  // before they ever reach the DB — calculatePayrollItems would silently
+  // skip them anyway (see payrollCalc#computeSalaryComponents), so this just
+  // keeps what's actually saved in sync with what the Salary tab shows.
+  if (Array.isArray(clean.salaryComponents)) {
+    clean.salaryComponents = clean.salaryComponents
+      .map((c) => ({
+        id: c?.id || uuidv4(),
+        name: String(c?.name || '').trim(),
+        amount: Number(c?.amount) || 0,
+        taxable: !!c?.taxable,
+      }))
+      .filter((c) => c.name && c.amount > 0);
+  }
   return clean;
 }
 
@@ -1834,6 +1852,61 @@ async function getActiveTaxSlabs(orgId) {
   return slabs;
 }
 
+// Resolves the TaxYear that actually COVERS a given payroll period ('YYYY-MM'),
+// not just whichever one is flagged isActive — a run for a past/back-dated
+// period must be taxed against the slabs that were in force then, and the
+// cumulative-YTD method (Section 7) needs that year's July-start/June-end
+// boundary to compute remaining months. Falls back to the isActive year if no
+// dated year covers the period (e.g. before any TaxYear rows were dated in).
+async function getTaxYearForPeriod(orgId, period) {
+  const periodStart = `${period}-01`;
+  let year = await TaxYear.findOne({
+    where: {
+      orgId,
+      startDate: { [Op.lte]: periodStart },
+      endDate: { [Op.gte]: periodStart },
+    },
+    include: [{ model: TaxSlab, as: 'slabs', where: { isActive: true }, required: false }],
+  });
+  if (!year) {
+    year = await TaxYear.findOne({
+      where: { orgId, isActive: true },
+      include: [{ model: TaxSlab, as: 'slabs', where: { isActive: true }, required: false }],
+    });
+  }
+  if (!year) return null;
+  const slabs = [...(year.slabs || [])].sort(
+    (a, b) => (a.sortOrder - b.sortOrder) || (Number(a.minAmount) - Number(b.minAmount)),
+  );
+  return { id: year.id, startDate: year.startDate, endDate: year.endDate, slabs };
+}
+
+// Sums this worker's ACTUAL monthly-taxable and tax-withheld from every prior
+// month of the given tax year (July..m-1) — read back from PayrollItem rows
+// already calculated, across whichever PayrollRuns those months belong to.
+// This is what makes computeCumulativeTax self-correct for overtime, absence,
+// and mid-year raises: it re-sums real history every time rather than trusting
+// a running total that could drift out of sync with edits/rectifications.
+async function getWorkerYtdPriorTax(workerId, orgId, taxYearStartDate, beforePeriod) {
+  const items = await PayrollItem.findAll({
+    where: { workerId },
+    include: [{
+      model: PayrollRun,
+      as: 'run',
+      where: {
+        orgId,
+        period: { [Op.gte]: taxYearStartDate.slice(0, 7), [Op.lt]: beforePeriod },
+      },
+      attributes: ['period'],
+      required: true,
+    }],
+    attributes: ['monthlyTaxable', 'taxAmount'],
+  });
+  const taxableYTDPrior = items.reduce((sum, i) => sum + (Number(i.monthlyTaxable) || 0), 0);
+  const taxDeductedYTDPrior = items.reduce((sum, i) => sum + (Number(i.taxAmount) || 0), 0);
+  return { taxableYTDPrior, taxDeductedYTDPrior };
+}
+
 async function listTaxYears(orgId, { includeInactive = false } = {}) {
   return TaxYear.findAll({
     where: { orgId, ...(includeInactive ? {} : { isArchived: false }) },
@@ -1967,6 +2040,93 @@ async function updatePayrollSettings(orgId, updates) {
   return settings.update(patch);
 }
 
+// ─── Salary Beneficiaries (salary split) ───────────────────────────────────────
+
+async function getSalaryBeneficiaries(workerId, orgId) {
+  const worker = await Worker.findOne({ where: { id: workerId, orgId } });
+  if (!worker) throw Object.assign(new Error('Worker not found'), { status: 404 });
+  return SalaryBeneficiary.findAll({
+    where: { workerId, orgId, isActive: true },
+    order: [['sortOrder', 'ASC'], ['createdAt', 'ASC']],
+  });
+}
+
+// Full-list replace: soft-deletes rows no longer present (per this app's
+// no-hard-delete convention — see softDeletable.js), upserts the rest. The
+// worker's own net pay isn't validated to the last cent here (computedNet
+// isn't known until a payroll run actually calculates it) — over-allocation
+// is instead caught per-run by computeDisbursementSplit when the split is
+// frozen at lock time. This only rejects shapes that can never be valid.
+async function setSalaryBeneficiaries(workerId, orgId, beneficiaries = []) {
+  const worker = await Worker.findOne({ where: { id: workerId, orgId } });
+  if (!worker) throw Object.assign(new Error('Worker not found'), { status: 404 });
+
+  const list = Array.isArray(beneficiaries) ? beneficiaries : [];
+  for (const b of list) {
+    if (!b.name || !String(b.name).trim()) {
+      throw Object.assign(new Error('Every beneficiary needs a name'), { status: 400 });
+    }
+    if (!['percentage', 'fixed'].includes(b.splitType)) {
+      throw Object.assign(new Error('splitType must be "percentage" or "fixed"'), { status: 400 });
+    }
+    const value = parseFloat(b.splitValue);
+    if (!Number.isFinite(value) || value < 0) {
+      throw Object.assign(new Error('splitValue must be a non-negative number'), { status: 400 });
+    }
+    if (b.splitType === 'percentage' && value > 100) {
+      throw Object.assign(new Error('A single beneficiary cannot exceed 100%'), { status: 400 });
+    }
+  }
+  const percentTotal = list
+    .filter((b) => b.splitType === 'percentage')
+    .reduce((sum, b) => sum + (parseFloat(b.splitValue) || 0), 0);
+  if (percentTotal > 100) {
+    throw Object.assign(new Error(`Beneficiary percentages sum to ${percentTotal}%, over 100%`), { status: 400 });
+  }
+
+  return db.sequelize.transaction(async (t) => {
+    const existing = await SalaryBeneficiary.findAll({ where: { workerId, orgId }, transaction: t });
+    const keepIds = new Set(list.filter((b) => b.id).map((b) => b.id));
+    const toRetire = existing.filter((row) => !keepIds.has(row.id));
+    if (toRetire.length) {
+      await SalaryBeneficiary.update(
+        { isActive: false },
+        { where: { id: toRetire.map((r) => r.id) }, transaction: t },
+      );
+    }
+
+    const results = [];
+    for (let i = 0; i < list.length; i += 1) {
+      const b = list[i];
+      const payload = {
+        orgId,
+        workerId,
+        name: String(b.name).trim(),
+        relation: b.relation || null,
+        splitType: b.splitType,
+        splitValue: parseFloat(b.splitValue) || 0,
+        bankName: b.bankName || null,
+        bankBranchName: b.bankBranchName || null,
+        bankAccountTitle: b.bankAccountTitle || null,
+        bankAccountNumber: b.bankAccountNumber || null,
+        iban: b.iban || null,
+        sortOrder: i,
+        isActive: true,
+      };
+      if (b.id) {
+        const row = existing.find((r) => r.id === b.id);
+        if (row) {
+          await row.update(payload, { transaction: t });
+          results.push(row);
+          continue;
+        }
+      }
+      results.push(await SalaryBeneficiary.create(payload, { transaction: t }));
+    }
+    return results;
+  });
+}
+
 // ─── Payroll Runs ─────────────────────────────────────────────────────────────
 
 async function listPayrollRuns(orgId) {
@@ -2080,7 +2240,7 @@ async function applyLatePenalty(orgId, worker, period, lateCount, penaltyDays, s
 //   net = gross − tax
 const PAYROLL_ADDITION_META_KEYS = new Set([
   'payableDays', 'workingDays', 'perDayRate', 'monthlySalary',
-  'halfDayCredit', 'holidayDays', 'formula',
+  'halfDayCredit', 'holidayDays', 'formula', 'daysInMonth', 'nonTaxableComponents',
 ]);
 
 function sumPayrollMoneyAdditions(additions = {}) {
@@ -2115,35 +2275,56 @@ async function calculatePayrollItems(runId, orgId, { workingDaysPerMonth } = {})
   }
 
   const settings = await getOrCreatePayrollSettings(orgId);
+  // workingDaysPerMonth is still recorded on the run (kept for backward
+  // compatibility / any non-salaried pay models), but salaried earned-amount
+  // proration below always uses full calendar days (D) per the payroll tax
+  // spec — never wdpm. See utils/payrollCalc.js.
   if (workingDaysPerMonth != null && workingDaysPerMonth !== '') {
     const wd = normalizeWorkingDays(workingDaysPerMonth);
     await run.update({ workingDaysPerMonth: wd });
   }
-  const wdpm = parseInt(run.workingDaysPerMonth, 10)
-    || parseInt(settings.workingDaysPerMonth, 10)
-    || 26;
   const hoursPerDay = parseFloat(settings.workingHoursPerDay) || 8;
   const otMultiplier = parseFloat(settings.otMultiplier) || 1.5;
   const halfDayFactor = parseFloat(settings.halfDayDeductionFactor) || 0.5;
-  const taxSlabs = await getActiveTaxSlabs(orgId);
-
-  const workers = await Worker.findAll({
-    where: { orgId, status: 'active', workerType: 'employee' },
-  });
+  const medicalExemptionCapPercent = settings.medicalExemptionCapPercent != null
+    ? parseFloat(settings.medicalExemptionCapPercent) : 10;
+  const taxYear = await getTaxYearForPeriod(orgId, run.period);
+  const taxSlabs = taxYear?.slabs || [];
 
   const [year, month] = run.period.split('-');
   const monthStart = `${year}-${month}-01`;
-  const daysInMonth = new Date(parseInt(year), parseInt(month), 0).getDate();
+  const daysInMonth = daysInCalendarMonth(parseInt(year, 10), parseInt(month, 10));
   const monthEnd = `${year}-${month}-${String(daysInMonth).padStart(2, '0')}`;
   const weekendDays = normalizeWeekendDays(settings.weekendDays);
   await ensureWeekendMarks(orgId, monthStart, monthEnd);
+
+  // Active this month, or inactive but employed for at least part of it — a
+  // mid-month leaver's final prorated payroll is still owed even after HR
+  // has already flipped their status to inactive.
+  const workers = await Worker.findAll({
+    where: {
+      orgId,
+      workerType: 'employee',
+      [Op.or]: [
+        { status: 'active' },
+        { status: 'inactive', leavingDate: { [Op.gte]: monthStart, [Op.lte]: monthEnd } },
+      ],
+    },
+  });
 
   const results = [];
   for (const worker of workers) {
     if (!worker.salaryBase) continue;
 
+    const joinDate = worker.joiningDate ? String(worker.joiningDate).slice(0, 10) : null;
+    const leaveDate = worker.leavingDate ? String(worker.leavingDate).slice(0, 10) : null;
+    const range = activeRangeForMonth({
+      periodStart: monthStart, periodEnd: monthEnd, joinDate, leaveDate,
+    });
+    if (!range) continue; // not employed at all during this period
+
     const attendances = await Attendance.findAll({
-      where: { workerId: worker.id, date: { [Op.between]: [monthStart, monthEnd] } },
+      where: { workerId: worker.id, date: { [Op.between]: [range.start, range.end] } },
     });
 
     const presentDays = attendances.filter((a) => a.status === 'present').length;
@@ -2151,20 +2332,24 @@ async function calculatePayrollItems(runId, orgId, { workingDaysPerMonth } = {})
     const leaveDays = attendances.filter((a) => a.status === 'leave').length;
     const halfDays = attendances.filter((a) => a.status === 'half_day').length;
     const holidayDays = attendances.filter((a) => a.status === 'holiday').length;
-    const markedWeekend = attendances.filter((a) => a.status === 'weekend').length;
-    const markedNonWorking = holidayDays + markedWeekend;
     const markedDates = new Set(attendances.map((a) => String(a.date).slice(0, 10)));
-    let unmarkedWeekendDays = 0;
-    for (let d = 1; d <= daysInMonth; d += 1) {
-      const dateStr = `${year}-${month}-${String(d).padStart(2, '0')}`;
+
+    // Any day in this worker's active range with no attendance row at all,
+    // that isn't a weekend/holiday, is inferred unpaid-absent — nobody marked
+    // it worked. Weekends/holidays are simply part of D and never deducted.
+    let unmarkedAbsentDays = 0;
+    for (
+      let t = new Date(`${range.start}T00:00:00Z`).getTime();
+      t <= new Date(`${range.end}T00:00:00Z`).getTime();
+      t += 86400000
+    ) {
+      const dateStr = new Date(t).toISOString().slice(0, 10);
       if (markedDates.has(dateStr)) continue;
-      if (isWeekendDate(dateStr, weekendDays)) unmarkedWeekendDays += 1;
+      if (isWeekendDate(dateStr, weekendDays)) continue;
+      unmarkedAbsentDays += 1;
     }
-    const nonWorkingDays = markedNonWorking + unmarkedWeekendDays;
-    // Absent column (display): marked absents + working days with no attendance row.
-    const accountedDays = presentDays + markedAbsent + leaveDays + halfDays + nonWorkingDays;
-    const unmarkedDays = Math.max(0, wdpm - accountedDays);
-    const absentDays = markedAbsent + unmarkedDays;
+    const absentDays = markedAbsent + unmarkedAbsentDays;
+
     const overtimeHours = attendances.reduce((sum, a) => {
       const hrs = parseFloat(a.hours) || 0;
       if (!hrs || !a.checkIn) return sum;
@@ -2184,61 +2369,158 @@ async function calculatePayrollItems(runId, orgId, { workingDaysPerMonth } = {})
     const latePenaltyDays = Math.floor(lateCount / latePenaltyPerN);
     const { unpaidDays: latePenaltyUnpaidDays } = await applyLatePenalty(orgId, worker, run.period, lateCount, latePenaltyDays, settings);
 
+    // Section 3-4: paid leave = present (no deduction); unpaid absence and the
+    // unworked half of a half-day reduce pay.
+    const unpaidAbsentDays = Math.round(
+      (absentDays + halfDays * halfDayFactor + Number(latePenaltyUnpaidDays || 0)) * 1000,
+    ) / 1000;
+
+    const { payableDays } = computePayableDays({
+      daysInMonth,
+      periodStart: monthStart,
+      periodEnd: monthEnd,
+      joinDate,
+      leaveDate,
+      unpaidAbsentDays,
+    });
+
+    // Section 2: Basic (worker.salaryBase) + Medical (exempt up to the
+    // config cap — never hard-coded, tracks the Finance Act via PayrollSettings).
     const monthlySalary = parseFloat(worker.salaryBase);
-    const perDayRate = monthlySalary / wdpm;
-    // Half-day policy: deduction factor 0.5 → employee earns 0.5 day for that date.
-    const halfDayCredit = Math.round(halfDays * (1 - halfDayFactor) * 1000) / 1000;
-    // Payable days for (salary / workingDays) × payableDays
-    const payableDays = Math.max(
-      0,
-      Math.round((presentDays + leaveDays + holidayDays + halfDayCredit - latePenaltyUnpaidDays) * 1000) / 1000,
-    );
-    const attendancePay = Math.round(perDayRate * payableDays * 100) / 100;
+    const structure = computeSalaryStructure({
+      basic: monthlySalary,
+      medicalAllowance: worker.medicalAllowance,
+      medicalExemptionCapPercent,
+    });
+
+    const perDayRate = monthlySalary / daysInMonth;
     const overtimePay = overtimeHours > 0
       ? Math.round((perDayRate / hoursPerDay) * overtimeHours * otMultiplier * 100) / 100
       : 0;
 
-    const additions = {
-      attendancePay,
+    // Section 5: earned amounts this month (calendar-day proration).
+    const earned = computeEarnedAmounts({
+      basic: structure.basic,
+      medical: structure.medical,
+      taxableMedicalExcess: structure.taxableMedicalExcess,
       payableDays,
-      workingDays: wdpm,
+      daysInMonth,
+      overtimeAmount: overtimePay,
+    });
+
+    // Extra components beyond Basic/Medical (HRA, Conveyance, etc.) — each
+    // independently flagged taxable or non-taxable by HR on the Salary tab.
+    const components = computeSalaryComponents({
+      components: worker.salaryComponents,
+      payableDays,
+      daysInMonth,
+    });
+
+    // Section 6: taxable salary this month (Medical up to the cap excluded;
+    // overtime, any medical excess above the cap, and taxable components included).
+    const monthlyTaxable = computeMonthlyTaxable({
+      earnedBasic: earned.earnedBasic,
+      overtime: earned.overtime,
+      earnedTaxableMedicalExcess: earned.earnedTaxableMedicalExcess,
+      otherTaxableAllowance: components.earnedTaxableTotal,
+    });
+
+    // Section 7: cumulative YTD tax — annualize off the ACTUAL YTD taxable sum
+    // plus the projected remaining full months at the worker's CURRENT Basic.
+    // Never a flat ×12 (that's the over-taxed-mid-year-joiner bug, Section 8).
+    let taxThisMonth = 0;
+    let taxCalc = null;
+    if (taxYear && taxSlabs.length) {
+      const { taxableYTDPrior, taxDeductedYTDPrior } = await getWorkerYtdPriorTax(
+        worker.id, orgId, String(taxYear.startDate), run.period,
+      );
+      taxCalc = computeCumulativeTax({
+        taxYearStartDate: String(taxYear.startDate),
+        taxYearEndDate: String(taxYear.endDate),
+        period: run.period,
+        monthlyTaxable,
+        taxableYTDPrior,
+        taxDeductedYTDPrior,
+        remainingFullMonthBasic: structure.basic + components.fullMonthTaxableTotal,
+        slabs: taxSlabs,
+      });
+      taxThisMonth = taxCalc.taxThisMonth;
+    }
+
+    const additions = {
+      attendancePay: earned.earnedBasic,
+      medical: earned.earnedMedical,
+      payableDays,
+      daysInMonth,
       perDayRate: Math.round(perDayRate * 100) / 100,
       monthlySalary,
-      halfDayCredit,
+      halfDayCredit: Math.round(halfDays * (1 - halfDayFactor) * 1000) / 1000,
       holidayDays,
-      formula: `(${monthlySalary} / ${wdpm}) × ${payableDays}`,
+      formula: `(${monthlySalary} / ${daysInMonth}) × ${payableDays}`,
     };
-    if (overtimePay > 0) additions.overtime = overtimePay;
+    if (earned.overtime > 0) additions.overtime = earned.overtime;
+    const nonTaxableComponentNames = [];
+    for (const row of components.rows) {
+      additions[row.name] = row.earned;
+      if (!row.taxable) nonTaxableComponentNames.push(row.name);
+    }
+    if (nonTaxableComponentNames.length) additions.nonTaxableComponents = nonTaxableComponentNames;
 
-    const base = monthlySalary;
-    const computedGross = computePayrollGross(base, additions);
-    const tax = computeMonthlyTaxWithholding(computedGross, taxSlabs);
+    const computedGross = computePayrollGross(earned.earnedBasic, additions);
     const deductions = {};
-    if (tax > 0) deductions.tax = tax;
-
+    if (taxThisMonth > 0) deductions.tax = taxThisMonth;
     const computedNet = Math.round((computedGross - sumPayrollDeductions(deductions)) * 100) / 100;
+
+    const itemData = {
+      presentDays, absentDays, leaveDays, halfDays,
+      overtimeHours: Math.round(overtimeHours * 100) / 100,
+      lateCount, latePenaltyDays, latePenaltyUnpaidDays,
+      base: monthlySalary, additions, deductions, computedGross, computedNet,
+      calendarDaysInMonth: daysInMonth,
+      payableDaysCalendar: payableDays,
+      earnedBasic: earned.earnedBasic,
+      earnedMedical: earned.earnedMedical,
+      monthlyTaxable,
+      taxableYTD: taxCalc ? taxCalc.taxableYTD : monthlyTaxable,
+      projectedAnnualTaxable: taxCalc ? taxCalc.projectedAnnualTaxable : 0,
+      annualTaxProjected: taxCalc ? taxCalc.annualTax : 0,
+      taxAmount: taxThisMonth,
+    };
 
     const [item, created] = await PayrollItem.findOrCreate({
       where: { payrollRunId: runId, workerId: worker.id },
-      defaults: {
-        presentDays, absentDays, leaveDays, halfDays,
-        overtimeHours: Math.round(overtimeHours * 100) / 100,
-        lateCount, latePenaltyDays, latePenaltyUnpaidDays,
-        base, additions, deductions, computedGross, computedNet,
-        employeeStatus: 'pending_review',
-      },
+      defaults: { ...itemData, employeeStatus: 'pending_review' },
     });
     if (!created) {
-      await item.update({
-        presentDays, absentDays, leaveDays, halfDays,
-        overtimeHours: Math.round(overtimeHours * 100) / 100,
-        lateCount, latePenaltyDays, latePenaltyUnpaidDays,
-        base, additions, deductions, computedGross, computedNet,
-      });
+      await item.update(itemData);
     }
     results.push(item);
   }
   return results;
+}
+
+// Snapshots each newly-locked item's disbursementSplit from the worker's
+// current SalaryBeneficiary rows. Called once per lock, not per calculate, so
+// a later edit to the split doesn't retroactively rewrite an already-locked
+// (or paid) run's history — see PayrollItem.disbursementSplit's comment.
+async function freezeDisbursementSplits(runId, orgId) {
+  const items = await PayrollItem.findAll({
+    where: { payrollRunId: runId, isLocked: true },
+    include: [{
+      model: Worker,
+      as: 'worker',
+      include: [{ model: User, as: 'user', attributes: ['id', 'name'] }],
+    }],
+  });
+  for (const item of items) {
+    if (!item.worker) continue;
+    const beneficiaries = await SalaryBeneficiary.findAll({
+      where: { workerId: item.worker.id, orgId, isActive: true },
+      order: [['sortOrder', 'ASC'], ['createdAt', 'ASC']],
+    });
+    const split = computeDisbursementSplit(item.worker, item.computedNet, beneficiaries);
+    await item.update({ disbursementSplit: split });
+  }
 }
 
 async function advancePayrollStatus(id, status, orgId) {
@@ -2260,6 +2542,7 @@ async function advancePayrollStatus(id, status, orgId) {
       { isLocked: true },
       { where: { payrollRunId: id, employeeStatus: 'confirmed' } }
     );
+    await freezeDisbursementSplits(id, orgId);
   }
 
   await run.update({ status });
@@ -2386,6 +2669,9 @@ async function upsertPayrollItem(payrollRunId, workerId, data, orgId) {
     deductions,
     computedGross,
     computedNet,
+    // Mirror deductions.tax into the dedicated column — later months' YTD
+    // cumulative tax (getWorkerYtdPriorTax) reads this back, not the JSON.
+    taxAmount: Number(deductions.tax) || 0,
   };
   if (data.adminNote !== undefined) patch.adminNote = data.adminNote;
   if (data.presentDays !== undefined) patch.presentDays = data.presentDays;
@@ -2479,12 +2765,19 @@ async function rectifyPayrollItem(itemId, updates, orgId) {
   const computedGross = computePayrollGross(newBase, newAdditions);
   const computedNet = Math.round((computedGross - totalDed) * 100) / 100;
 
+  // Keep the dedicated taxAmount column in sync with deductions.tax — the
+  // cumulative YTD tax method (Section 7, getWorkerYtdPriorTax) reads this
+  // column back for every later month in the tax year, so an un-mirrored
+  // manual rectification here would silently desync future withholding.
+  const taxAmount = Number(newDeductions.tax) || 0;
+
   return item.update({
     base: newBase,
     additions: newAdditions,
     deductions: newDeductions,
     computedGross,
     computedNet,
+    taxAmount,
     adminNote: updates.adminNote || null,
     employeeStatus: 'pending_review',
     isLocked: false,
@@ -2506,19 +2799,42 @@ async function getDisbursementData(runId, orgId) {
     order: [['createdAt', 'ASC']],
   });
 
-  return items.map((item) => ({
-    employee: item.worker?.user?.name || '',
-    email: item.worker?.user?.email || '',
-    designation: item.worker?.designation || '',
-    department: item.worker?.department || '',
-    bankName: item.worker?.bankName || '',
-    accountTitle: item.worker?.bankAccountTitle || '',
-    accountNumber: item.worker?.bankAccountNumber || '',
-    iban: item.worker?.iban || '',
-    currency: item.worker?.currency || 'PKR',
-    netAmount: parseFloat(item.computedNet || 0),
-    payrollItemId: item.id,
-  }));
+  return items.flatMap((item) => {
+    const base = {
+      employee: item.worker?.user?.name || '',
+      email: item.worker?.user?.email || '',
+      designation: item.worker?.designation || '',
+      department: item.worker?.department || '',
+      currency: item.worker?.currency || 'PKR',
+      payrollItemId: item.id,
+    };
+    const split = Array.isArray(item.disbursementSplit) ? item.disbursementSplit : [];
+
+    // No split configured — same single row as before this feature existed.
+    if (!split.length) {
+      return [{
+        ...base,
+        recipient: item.worker?.user?.name || '',
+        relation: 'Self',
+        bankName: item.worker?.bankName || '',
+        accountTitle: item.worker?.bankAccountTitle || '',
+        accountNumber: item.worker?.bankAccountNumber || '',
+        iban: item.worker?.iban || '',
+        netAmount: parseFloat(item.computedNet || 0),
+      }];
+    }
+
+    return split.map((line) => ({
+      ...base,
+      recipient: line.name || '',
+      relation: line.relation || '',
+      bankName: line.bankName || '',
+      accountTitle: line.bankAccountTitle || '',
+      accountNumber: line.bankAccountNumber || '',
+      iban: line.iban || '',
+      netAmount: parseFloat(line.amount || 0),
+    }));
+  });
 }
 
 // ─── HR Documents ─────────────────────────────────────────────────────────────
@@ -2857,6 +3173,7 @@ module.exports = {
   isNonAttendanceRole,
   listLeaveRequests, createLeaveRequest, createEmployeeLeaveRequest, getEmployeeLeaveBalance, reviewLeave,
   getOrCreatePayrollSettings, updatePayrollSettings,
+  getSalaryBeneficiaries, setSalaryBeneficiaries,
   listTaxYears, createTaxYear, updateTaxYear, activateTaxYear, deleteTaxYear,
   createTaxSlab, updateTaxSlab, deleteTaxSlab, getActiveTaxSlabs,
   listPayrollRuns, createPayrollRun, updatePayrollRun, advancePayrollStatus,

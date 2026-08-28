@@ -3,6 +3,7 @@ const { v4: uuidv4 } = require('uuid');
 const db = require('../models');
 const NotificationService = require('./NotificationService');
 const EmailService = require('./EmailService');
+const BlogSheetSync = require('./BlogSheetSync');
 const { computeReminderAt } = require('../utils/taskDates');
 
 // Materializes RecurringTaskRule rows into real Task rows on schedule — the
@@ -156,6 +157,15 @@ async function runAutoTaskGeneration(now = new Date()) {
       });
       await rule.update({ lastGeneratedPeriod: periodKey });
       created += 1;
+
+      // A generated blog task carries no pageName and no Blogs-tab row of its own
+      // (it never went through the blog sheet), so without this the writer's
+      // deliverable would have nothing to attach to — see services/BlogSheetSync.js.
+      try {
+        await BlogSheetSync.ensureSheetRowForTask(task, rule.createdBy || null);
+      } catch (err) {
+        console.error(`[AutoTaskScheduler] Failed to create blog sheet row for rule ${rule.id}:`, err.message);
+      }
 
       if (assigneeId) {
         db.User.findByPk(assigneeId).then((assignee) => {

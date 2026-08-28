@@ -11,7 +11,7 @@ const { PayrollItem, Worker, PayrollRun, User, WhiteLabelConfig, Company } = req
  */
 const META_KEYS = new Set([
   'payableDays', 'workingDays', 'perDayRate', 'monthlySalary',
-  'halfDayCredit', 'holidayDays', 'formula', 'daysInMonth',
+  'halfDayCredit', 'holidayDays', 'formula', 'daysInMonth', 'nonTaxableComponents',
 ]);
 
 /**
@@ -51,6 +51,9 @@ const EARNING_ORDER = ['Basic Salary', 'House Rent Allowance', 'Medical Allowanc
 const DEDUCTION_ORDER = ['Income Tax', 'Leave Deduction', 'Late Deduction', 'Other Deduction'];
 
 function humanise(key) {
+  // Free-form component names (e.g. "House Rent Allowance") are already
+  // human-readable — only camelCase keys (e.g. "attendancePay") need splitting.
+  if (key.includes(' ')) return key;
   return key.replace(/([A-Z])/g, ' $1').replace(/^./, (c) => c.toUpperCase()).trim();
 }
 
@@ -169,7 +172,18 @@ async function generateSlipBuffer(payrollItemId, orgId) {
     // was produced. Printing the run's creation date would be worse: it would
     // read as a payment date that never happened.
     paymentDate: fmtDate(new Date()),
-    paymentMethod: worker.bankName ? `Bank Transfer · ${worker.bankName}` : 'Bank Transfer',
+    // Full per-recipient amounts belong on the internal disbursement sheet, not
+    // a document the employee might forward on (e.g. for a visa/loan
+    // application) — this just tells them their pay didn't go entirely to the
+    // account listed above. See PayrollItem.disbursementSplit.
+    paymentMethod: (() => {
+      const split = Array.isArray(item.disbursementSplit) ? item.disbursementSplit : [];
+      const otherRecipients = split.filter((l) => l.beneficiaryId).length;
+      if (otherRecipients > 0) {
+        return `Bank Transfer · split across ${otherRecipients + 1} recipients`;
+      }
+      return worker.bankName ? `Bank Transfer · ${worker.bankName}` : 'Bank Transfer';
+    })(),
 
     earnings,
     deductions: deductionRows,

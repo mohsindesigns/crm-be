@@ -424,11 +424,18 @@ router.post('/invoices/:id/pay/stripe', async (req, res, next) => {
 
     const invoice = await db.Invoice.findOne({
       where: { id: req.params.id, clientId: req.portalClientId, orgId: req.orgId },
-      attributes: ['id', 'status'],
+      attributes: ['id', 'status', 'allowPartialPayment', 'total'],
     });
     if (!invoice) return res.status(404).json({ message: 'Invoice not found.' });
     if (!['sent', 'overdue', 'payment_review'].includes(invoice.status)) {
       return res.status(400).json({ message: 'This invoice is not awaiting payment.' });
+    }
+
+    if (req.body?.amount && !invoice.allowPartialPayment) {
+      const settlement = await InvoiceService.settlementFor(invoice.id, { total: invoice.total });
+      if (Number(req.body.amount) < settlement.amountDue - 0.005) {
+        return res.status(400).json({ message: 'Partial payment is not enabled for this invoice.' });
+      }
     }
 
     let method = await db.PaymentMethod.findOne({

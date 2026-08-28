@@ -1,4 +1,5 @@
 const { v4: uuidv4 } = require('uuid');
+const { Op } = require('sequelize');
 const db = require('../models');
 
 // Payment.provider is an ENUM; a PaymentMethod row writes straight into it, so
@@ -135,6 +136,46 @@ class BillingSettingsService {
 
   async saveStripeSettings(orgId, patch) {
     return db.PaymentSetting.save(orgId, patch);
+  }
+
+  /**
+   * Apply a part-payment decision to every invoice that is still open.
+   *
+   * The org default only seeds invoices raised from that point on, which leaves
+   * the ones already sitting in a client's inbox on whatever they were created
+   * with. For a retainer that renews monthly the default catches up on its own
+   * next cycle, but the invoice the client is looking at *today* doesn't — so
+   * this is the one-shot catch-up for the existing book.
+   *
+   * "Open" is everything not yet settled or cancelled, drafts included: a draft
+   * is about to be sent and should go out matching the org's policy. `paid` and
+   * `void` are deliberately excluded — a settled invoice has no balance to part
+   * pay, and rewriting a closed record to say otherwise is a lie about history.
+   *
+   * Deliberately NOT wired into the settings toggle. Flipping a default is a
+   * statement about future invoices; rewriting live invoices a client already
+   * holds a link to is a separate, louder decision, and it should take a second
+   * click that says so.
+   */
+  async applyPartialPaymentToOpenInvoices(orgId, allow) {
+    const OPEN_STATUSES = ['draft', 'sent', 'overdue', 'payment_review'];
+    const value = !!allow;
+
+    // Only touch rows that would actually change, so the count reported back is
+    // "invoices changed" and not "invoices looked at". NULL has to be matched
+    // explicitly when switching part payment ON: `allowPartialPayment = false`
+    // never matches a NULL, and any row predating the column's backfill would
+    // silently be skipped — exactly the old invoices this exists to catch up.
+    const notYet = value
+      ? { [Op.or]: [{ allowPartialPayment: false }, { allowPartialPayment: null }] }
+      : { allowPartialPayment: true };
+
+    const [updated] = await db.Invoice.update(
+      { allowPartialPayment: value },
+      { where: { orgId, status: OPEN_STATUSES, ...notYet } },
+    );
+
+    return { updated: updated || 0, allowPartialPayment: value };
   }
 
   // ─── Per-currency processing fees ─────────────────────────────────────────

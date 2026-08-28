@@ -246,6 +246,15 @@ class AdminController {
     catch (err) { next(err); }
   }
 
+  async applyPartialPaymentToOpenInvoices(req, res, next) {
+    try {
+      res.json(await BillingSettingsService.applyPartialPaymentToOpenInvoices(
+        req.orgId,
+        req.body?.allowPartialPayment,
+      ));
+    } catch (err) { next(err); }
+  }
+
   async createFeeRule(req, res, next) {
     try { res.status(201).json(await BillingSettingsService.createFeeRule(req.orgId, req.body)); }
     catch (err) { next(err); }

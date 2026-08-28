@@ -13,6 +13,7 @@
     "db:seed:client-requests": "node src/seeders/seedClientRequestsDemo.js",
     "db:seed:subscriptions": "node src/seeders/seedSubscriptionsDemo.js",
     "email:test": "node src/scripts/testEmail.js",
+    "payroll:test-tax": "node src/scripts/testPayrollTaxCalc.js",
     "db:reset": "sequelize-cli db:migrate:undo:all && sequelize-cli db:migrate && node src/seeders/seed.js"
   },
   "dependencies": {

@@ -10,6 +10,20 @@ const { isTruthy } = require('../services/SoftDeleteService');
 const db = require('../models');
 const { Artifact } = db;
 const MediaService = require('../services/MediaService');
+const BlogSheetSync = require('../services/BlogSheetSync');
+
+// A deliverable dropped on a blog task should surface in the project's Blogs tab
+// straight away — the writer attaching the file and the strategist looking for it
+// on the sheet are usually not the same person, and waiting for the submit
+// transition made the file look lost in between. Fire-and-forget: a sync failure
+// must never fail the upload itself, which has already succeeded by this point.
+// See services/BlogSheetSync.js — status is left alone here, only the file moves.
+function mirrorToBlogSheet(taskId, kind, actorUserId) {
+  if (!taskId || kind === 'brief' || kind === 'review_note') return;
+  db.Task.findByPk(taskId)
+    .then((task) => (task ? BlogSheetSync.syncFromTask(task, { actorUserId }) : null))
+    .catch((err) => console.error('[media] Failed to mirror deliverable to blog sheet:', err.message));
+}
 
 const upload = multer({
   storage: multer.diskStorage({
@@ -51,6 +65,7 @@ router.post('/upload', upload.single('file'), async (req, res, next) => {
         kind: kind || null,
         uploadedBy: req.user.id,
       });
+      mirrorToBlogSheet(taskId, kind, req.user.id);
     }
 
     res.status(201).json({ ...result, artifact });
@@ -100,6 +115,7 @@ router.post('/upload-multi', upload.array('file', 20), async (req, res, next) =>
       }
       return { ...result, artifact };
     }));
+    mirrorToBlogSheet(taskId, kind, req.user.id);
 
     res.status(201).json({ results });
   } catch (err) {
@@ -143,6 +159,7 @@ router.post('/link', async (req, res, next) => {
       kind: kind || 'link',
       uploadedBy: req.user.id,
     });
+    mirrorToBlogSheet(taskId, kind || 'link', req.user.id);
     res.status(201).json({ artifact });
   } catch (err) { next(err); }
 });

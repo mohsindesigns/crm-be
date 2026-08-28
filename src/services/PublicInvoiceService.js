@@ -107,13 +107,19 @@ class PublicInvoiceService {
         total,
         amountPaid,
         amountDue,
-        // Drives the UI: card clients get the amount picker, everyone else gets
-        // the manual instructions their method carries.
+        allowPartialPayment: !!invoice.allowPartialPayment,
+        // Drives the UI: card clients get the amount picker when partial payments are enabled,
+        // everyone else gets the manual instructions their method carries.
         canPayByCard: isPayable && isStripe,
+        // Retainer and installment invoices are included deliberately. A recurring
+        // cycle charge is still a balance a client can chip away at, and carving
+        // them out meant the clients most likely to ask for part payment — the
+        // ones on a monthly retainer — were the only ones who could never get it.
+        // The flag on the invoice is the single gate now, for every invoice type.
+        canPayPartial: isPayable && !!invoice.allowPartialPayment,
         isPayable,
-        // Retainer invoices are billed for a fixed recurring cycle amount —
-        // "pay part now, rest later" doesn't make sense against a subscription-
-        // style charge, so the client only ever sees "pay in full" for these.
+        // Still reported so the page can label a recurring charge as such; it no
+        // longer restricts what the client is allowed to pay.
         isRetainer: !!invoice.retainerId,
         paymentLinkUrl: invoice.paymentLinkUrl || null,
         paymentMethodLabel: invoice.preferredPaymentMethod?.label || null,
@@ -156,12 +162,13 @@ class PublicInvoiceService {
   async startPayment(token, { amount = null } = {}) {
     const invoice = await this._findByToken(token);
 
-    // Mirror the UI restriction server-side — a retainer invoice is only ever
-    // payable in full, regardless of what a client sends the endpoint directly.
-    if (invoice.retainerId && amount != null) {
+    // The invoice's own flag is the only gate — no invoice type is excluded.
+    // Mirrored server-side because the UI check is advisory: this endpoint is
+    // public, so anything only enforced in the browser is not enforced at all.
+    if (!invoice.allowPartialPayment && amount != null) {
       const { amountDue } = this._settlement(invoice);
       if (Number(amount) < amountDue - 0.005) {
-        const err = new Error('This is a retainer invoice and can only be paid in full.');
+        const err = new Error('Partial payment is not enabled for this invoice.');
         err.status = 400;
         throw err;
       }

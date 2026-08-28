@@ -53,6 +53,10 @@ router.delete('/companies/:id', adminOnly, (req, res, next) => AdminController.d
 router.get('/payment-methods', (req, res, next) => AdminController.listPaymentMethods(req, res, next));
 router.get('/payment-methods/stripe-status', (req, res, next) => AdminController.stripeStatus(req, res, next));
 router.put('/payment-settings', adminOnly, (req, res, next) => AdminController.saveStripeSettings(req, res, next));
+// One-shot catch-up that rewrites every open invoice, so it's adminOnly like the
+// setting it backfills — a custom role with billing rights shouldn't be able to
+// change the payment terms on invoices clients are already holding links to.
+router.post('/payment-settings/apply-partial-payment', adminOnly, (req, res, next) => AdminController.applyPartialPaymentToOpenInvoices(req, res, next));
 
 // Per-currency card processing fees, charged to the client
 router.post('/payment-fees', adminOnly, (req, res, next) => AdminController.createFeeRule(req, res, next));

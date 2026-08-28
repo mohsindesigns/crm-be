@@ -823,6 +823,27 @@ class InvoiceService {
     return invoice;
   }
 
+  /**
+   * Whether a new invoice should allow part payment.
+   *
+   * An explicit value on the request always wins — that's the admin ticking (or
+   * deliberately clearing) the box on the New Invoice form. When nothing is
+   * supplied the org-level default decides, which is the only way the option
+   * reaches invoices no human raises: retainer renewals, package installments
+   * and quotation conversions are all issued by schedulers and services, and
+   * before this they were hard-coded to false forever.
+   *
+   * Never throws — a missing/unreadable settings row just means "off", which is
+   * the pre-existing behaviour, rather than failing the invoice.
+   */
+  async resolveAllowPartialPayment(orgId, requested) {
+    if (requested !== undefined && requested !== null && requested !== '') {
+      return requested === true || requested === 'true' || requested === 1 || requested === '1';
+    }
+    const settings = await db.PaymentSetting.resolve(orgId).catch(() => null);
+    return !!settings?.allowPartialPaymentDefault;
+  }
+
   // `data.status` lets system callers (RetainerService.autoCreate, RetainerScheduler,
   // installment-plan generation) issue an already-`sent` invoice — they're
   // system-generated recurring/installment bills going straight to the client, not
@@ -861,6 +882,7 @@ class InvoiceService {
     const status = data.status || INVOICE_STATUS.DRAFT;
     const issuedAt = toDateOnly(data.issuedAt) || toDateOnly(new Date());
     const dueAt = toDateOnly(data.dueAt) || issuedAt;
+    const allowPartialPayment = await this.resolveAllowPartialPayment(orgId, data.allowPartialPayment);
 
     if (data.mergeWithOpenInvoice && !data.retainerId) {
       // `status` (already defaulted) rather than `data.status`, so an omitted
@@ -898,6 +920,7 @@ class InvoiceService {
         companyId: issuingCompany?.id || null,
         preferredPaymentMethodId: preferredMethod?.id || null,
         paymentLinkUrl: toAbsoluteHttpUrl(data.paymentLinkUrl) || null,
+        allowPartialPayment,
         clientId: data.clientId,
         clientPackageId: data.clientPackageId || null,
         retainerId: data.retainerId || null,
@@ -1047,6 +1070,7 @@ class InvoiceService {
   async configurePaymentProfile(id, orgId, {
     paymentMethodId = null,
     paymentLinkUrl,
+    allowPartialPayment,
     renumber = true,
   } = {}) {
     const invoice = await db.Invoice.findOne({
@@ -1067,9 +1091,8 @@ class InvoiceService {
 
     const hasSettlements = (invoice.payments || []).length > 0;
     if (hasSettlements) {
-      const err = new Error('This invoice already has payments and cannot be renumbered.');
-      err.status = 400;
-      throw err;
+      // Invoices with payments keep their number so existing receipts/references stay valid
+      renumber = false;
     }
 
     await db.sequelize.transaction(async (t) => {
@@ -1107,6 +1130,10 @@ class InvoiceService {
       if (paymentLinkUrl !== undefined) {
         const link = toAbsoluteHttpUrl(paymentLinkUrl);
         updates.paymentLinkUrl = link || null;
+      }
+
+      if (allowPartialPayment !== undefined) {
+        updates.allowPartialPayment = allowPartialPayment === true || allowPartialPayment === 'true' || allowPartialPayment === 1;
       }
 
       // No method is the manual case, so it gets a series and an entity like any
