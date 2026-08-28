@@ -868,11 +868,25 @@ function normalizeIndexed(raw) {
   return ['yes', 'y', 'true', '1', 'indexed'].includes(v);
 }
 
-/** Convert Excel serials / Date objects / common strings into YYYY-MM-DD, or an error string. */
+function localDateParts(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+/**
+ * Convert Excel serials / Date objects / common strings into YYYY-MM-DD, or an error string.
+ *
+ * The result lands in a DATEONLY column, so it must be the calendar date that
+ * was written in the sheet — never that date pushed through a timezone.
+ * `toISOString()` is exactly that push and must not be used here: xlsx (with
+ * cellDates) hands back a Date sitting at *local* midnight, so on any UTC+n
+ * server `new Date(2026, 7, 28).toISOString()` is "2026-08-27" and every
+ * imported link silently lands a day early. Read the local Y/M/D components off
+ * the Date instead — that's what localDateParts is for.
+ */
 function parseSheetDate(raw) {
   if (raw == null || raw === '') return { value: null };
   if (raw instanceof Date && !Number.isNaN(raw.getTime())) {
-    return { value: raw.toISOString().slice(0, 10) };
+    return { value: localDateParts(raw) };
   }
   if (typeof raw === 'number' && Number.isFinite(raw)) {
     const parsed = xlsx.SSF?.parse_date_code?.(raw);
@@ -896,7 +910,7 @@ function parseSheetDate(raw) {
     }
   }
   const d = new Date(s);
-  if (!Number.isNaN(d.getTime())) return { value: d.toISOString().slice(0, 10) };
+  if (!Number.isNaN(d.getTime())) return { value: localDateParts(d) };
   return { error: `invalid date "${s}" — use YYYY-MM-DD or DD/MM/YYYY` };
 }
 

@@ -76,10 +76,10 @@ class ReportsController {
   async backlinkSummary(req, res, next) {
     try {
       const {
-        projectId, clientId, linkBuilderId, date, page, limit,
+        projectId, clientId, linkBuilderId, date, from, to, page, limit,
       } = req.query;
       res.json(await ReportsService.getBacklinkSummary(req.orgId, {
-        projectId, clientId, linkBuilderId, date, page, limit,
+        projectId, clientId, linkBuilderId, date, from, to, page, limit,
       }));
     } catch (err) {
       next(err);

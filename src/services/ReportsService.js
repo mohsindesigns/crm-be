@@ -565,24 +565,56 @@ async function exportKeywordSummary(orgId, format, ids, filters = {}, letterhead
 // ─── Backlinks summary ──────────────────────────────────────────────────────
 //
 // One row per (project, link builder) pair: that builder's link count for the
-// selected day next to the project's overall link health (total / indexed /
-// non-indexed / duplicate), so a PM can see both "did today's quota get hit"
-// and "how healthy is this project's link profile" without opening every
+// selected date range next to the project's overall link health (total /
+// indexed / non-indexed / duplicate), so a PM can see both "did the quota get
+// hit" and "how healthy is this project's link profile" without opening every
 // project individually. Mirrors getKeywordSummary's project/client scoping
-// (backlinks, like keywords, is an SEO-only sheet), plus a date filter —
-// defaulting to today, same as getMembersOverview — since "links made in the
-// day" is inherently date-scoped in a way a keyword count isn't.
+// (backlinks, like keywords, is an SEO-only sheet), plus a date filter — since
+// "links made" is inherently date-scoped in a way a keyword count isn't.
+
+// Links carry their builder in `Backlink.assignedWriterId`, but that only gets
+// filled in when the imported sheet has a "Writer" column that resolves to a
+// user, or when someone picks a builder on the project's Backlinks tab. Links
+// with nobody on them used to be skipped outright, which silently dropped whole
+// projects out of this report even though their Backlinks tab was full — and
+// made a day with real activity look empty. They're grouped under a synthetic
+// "Unassigned" builder instead, so the work still shows up and the gap in
+// attribution is visible rather than invisible.
+const UNASSIGNED_BUILDER_ID = 'unassigned';
+const UNASSIGNED_BUILDER_NAME = 'Unassigned';
+
+// The date a link counts against: its own publish date (`Backlink.date`, the
+// "Publish date" column link builders fill in), falling back to the calendar
+// day the row was typed into the CRM only for older rows that predate the
+// publish-date field. createdAt routinely diverges from the real publish date —
+// e.g. a builder backfilling a week of already-published links in one sitting —
+// so it is a last resort, never the primary basis.
+function backlinkActivityDate(bl) {
+  if (bl.date) return String(bl.date).slice(0, 10);
+  if (!bl.createdAt) return null;
+  const d = bl.createdAt;
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
 async function getBacklinkSummary(orgId, filters = {}) {
   const page = Math.max(1, parseInt(filters.page, 10) || 1);
   const limit = Math.min(100, parseInt(filters.limit, 10) || 25);
   const offset = (page - 1) * limit;
 
   // No date filter by default — every project/builder pair with any backlink
-  // activity shows up, not just today's. A day picked explicitly narrows
-  // "links made" down to that one day; leaving it blank means "all time",
-  // same as how the client/project filters read when left on "All".
-  const targetDateStr = filters.date || null;
-  const { from, to } = targetDateStr ? resolveRange(targetDateStr, targetDateStr) : { from: null, to: null };
+  // activity shows up, not just today's. `from`/`to` narrow "links made" to a
+  // range (either end may be left open); the older single-day `date` param is
+  // still honoured as shorthand for from === to. Leaving all three blank means
+  // "all time", same as how the client/project filters read on "All".
+  const fromStr = filters.from || filters.date || null;
+  const toStr = filters.to || filters.date || null;
+  const hasDateFilter = !!(fromStr || toStr);
+  // Built directly rather than via resolveRange(), which defaults a missing
+  // `from` to *today* — here a half-open range has to stay half-open, or
+  // "everything up to the 14th" would silently mean "today through the 14th"
+  // and come back empty.
+  const from = fromStr ? new Date(`${fromStr}T00:00:00`) : null;
+  const to = toStr ? new Date(`${toStr}T23:59:59.999`) : null;
 
   const projectWhere = { orgId, serviceTypeKey: 'seo' };
   if (filters.projectId) projectWhere.id = filters.projectId;
@@ -634,29 +666,28 @@ async function getBacklinkSummary(orgId, filters = {}) {
     statsByProject[projectId] = { total: rows.length, indexed, nonIndexed: rows.length - indexed, duplicate };
   }
 
-  // Activity per link builder — every builder who has ever added a link gets
-  // a row by default; picking a day narrows that down to links whose own
-  // publish date (`Backlink.date`, the "Publish date" column link builders
-  // fill in on the project's Backlinks tab) falls on that day. createdAt
-  // (when the row was typed into the CRM) is only used as a fallback for
-  // older rows that predate the publish-date field, since it routinely
-  // diverges from the real publish date — e.g. a builder backfilling a
-  // week's worth of already-published links in one sitting.
+  // Activity per link builder — every builder who has ever added a link gets a
+  // row by default; a date range narrows that to links whose activity date (see
+  // backlinkActivityDate) falls inside it. ISO `YYYY-MM-DD` strings compare
+  // correctly with < / >, so the range check stays on the string form and never
+  // round-trips through a Date — which is what would reintroduce a timezone
+  // shift on a calendar-only value.
   const countsByKey = new Map();
   for (const bl of backlinks) {
-    if (!bl.assignedWriterId) continue;
-    if (filters.linkBuilderId && bl.assignedWriterId !== filters.linkBuilderId) continue;
-    if (targetDateStr) {
-      const activityDateStr = bl.date || (bl.createdAt
-        ? `${bl.createdAt.getFullYear()}-${String(bl.createdAt.getMonth() + 1).padStart(2, '0')}-${String(bl.createdAt.getDate()).padStart(2, '0')}`
-        : null);
-      if (activityDateStr !== targetDateStr) continue;
+    const builderId = bl.assignedWriterId || UNASSIGNED_BUILDER_ID;
+    if (filters.linkBuilderId && builderId !== filters.linkBuilderId) continue;
+    if (hasDateFilter) {
+      const activityDateStr = backlinkActivityDate(bl);
+      if (!activityDateStr) continue;
+      if (fromStr && activityDateStr < fromStr) continue;
+      if (toStr && activityDateStr > toStr) continue;
     }
-    const key = `${bl.projectId}:${bl.assignedWriterId}`;
+    const key = `${bl.projectId}:${builderId}`;
     countsByKey.set(key, (countsByKey.get(key) || 0) + 1);
   }
 
-  const builderIds = [...new Set([...countsByKey.keys()].map((k) => k.split(':')[1]))];
+  const builderIds = [...new Set([...countsByKey.keys()].map((k) => k.split(':')[1]))]
+    .filter((bid) => bid !== UNASSIGNED_BUILDER_ID);
   const builders = builderIds.length
     ? await User.findAll({ where: { id: { [Op.in]: builderIds } }, attributes: ['id', 'name'] })
     : [];
@@ -668,7 +699,9 @@ async function getBacklinkSummary(orgId, filters = {}) {
     const st = statsByProject[projectId] || { total: 0, indexed: 0, nonIndexed: 0, duplicate: 0 };
     return {
       linkBuilderId: builderId,
-      linkBuilderName: builderById.get(builderId)?.name || 'Unknown',
+      linkBuilderName: builderId === UNASSIGNED_BUILDER_ID
+        ? UNASSIGNED_BUILDER_NAME
+        : (builderById.get(builderId)?.name || 'Unknown'),
       clientId: project?.clientId || null,
       clientName: project?.client?.name || '—',
       projectId,
@@ -698,9 +731,11 @@ async function exportBacklinkSummary(orgId, format, ids, filters = {}, letterhea
     ? built.data.filter((r) => ids.includes(`${r.projectId}:${r.linkBuilderId}`))
     : built.data;
 
+  const dateScoped = !!(filters.from || filters.to || filters.date);
+
   if (format === 'csv') {
     const headers = [
-      'Link Builder', 'Client', 'Project', 'Project Start Date', filters.date ? 'Links Made' : 'Links Made (All Time)',
+      'Link Builder', 'Client', 'Project', 'Project Start Date', dateScoped ? 'Links Made' : 'Links Made (All Time)',
       'Project Total Backlinks', 'Total Indexed', 'Total Non-Indexed', 'Total Duplicate',
     ];
     const rows = data.map((r) => [
@@ -731,7 +766,7 @@ async function exportBacklinkSummary(orgId, format, ids, filters = {}, letterhea
           { label: 'Link Builder', key: 'linkBuilderName', width: 14, align: 'left' },
           { label: 'Client', key: 'clientName', width: 13, align: 'left' },
           { label: 'Project', key: 'projectName', width: 13, align: 'left' },
-          { label: filters.date ? 'Made' : 'Made (All Time)', key: 'linksMadeInDay', width: 8, align: 'right' },
+          { label: dateScoped ? 'Made' : 'Made (All Time)', key: 'linksMadeInDay', width: 8, align: 'right' },
           { label: 'Total Links', key: 'projectTotalBacklinks', width: 8, align: 'right' },
           { label: 'Indexed', key: 'totalIndexed', width: 8, align: 'right' },
           { label: 'Non-Indexed', key: 'totalNonIndexed', width: 8, align: 'right' },
