@@ -7,10 +7,17 @@ const auth = require('../middleware/auth');
 const tenancy = require('../middleware/tenancy');
 const adminOnly = require('../middleware/adminOnly');
 const { isTruthy } = require('../services/SoftDeleteService');
+const { TASK_STATUS } = require('../config/constants');
 const db = require('../models');
 const { Artifact } = db;
 const MediaService = require('../services/MediaService');
 const BlogSheetSync = require('../services/BlogSheetSync');
+
+// Once a task has moved past this point, the reviewer is looking at exactly the
+// files that were submitted — an uploader can no longer quietly pull one back.
+const LOCKED_TASK_STATUSES = new Set([
+  TASK_STATUS.SUBMITTED, TASK_STATUS.IN_REVIEW, TASK_STATUS.APPROVED, TASK_STATUS.DONE,
+]);
 
 // A deliverable dropped on a blog task should surface in the project's Blogs tab
 // straight away — the writer attaching the file and the strategist looking for it
@@ -168,10 +175,37 @@ router.post('/link', async (req, res, next) => {
 // Deactivates, never destroys — see services/SoftDeleteService.js. The stored blob
 // is left in place too: an artifact link that a client or a past task references
 // must not turn into a dead URL because someone tidied up the deliverables list.
-router.delete('/:filename', adminOnly, async (req, res, next) => {
+//
+// Admins may deactivate any file. A non-admin may additionally remove a file they
+// uploaded themselves, but only while its task hasn't been submitted for review
+// yet (see LOCKED_TASK_STATUSES) — this covers the "attached the wrong file by
+// accident" case without opening up delete for files a reviewer is already
+// looking at.
+router.delete('/:filename', async (req, res, next) => {
   try {
     const { filename } = req.params;
     const { Op } = require('sequelize');
+    const isAdmin = adminOnly.ADMIN_ROLE_KEYS.includes(req.user?.role?.key);
+
+    if (!isAdmin) {
+      const artifact = await Artifact.findOne({
+        where: { fileUrl: { [Op.like]: `%${filename}` } },
+        include: [{ model: db.Task, as: 'task' }],
+      });
+      if (!artifact) return res.status(404).json({ error: 'File not found.' });
+
+      const task = artifact.task;
+      const isOwnUpload = artifact.uploadedBy === req.user.id && task && task.orgId === req.orgId;
+      if (!isOwnUpload) {
+        return res.status(403).json({
+          message: 'Only an administrator can change a record’s Active/Inactive status. Ask an admin to do it — records are never deleted.',
+        });
+      }
+      if (LOCKED_TASK_STATUSES.has(task.status)) {
+        return res.status(403).json({ message: 'This task has already been submitted — ask an administrator to remove the file.' });
+      }
+    }
+
     const [count] = await Artifact.update(
       { isActive: false },
       { where: { fileUrl: { [Op.like]: `%${filename}` } } },

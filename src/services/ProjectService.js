@@ -300,6 +300,42 @@ class ProjectService {
     return project;
   }
 
+  // Toggles a project between active / on_hold / blocked — the "pause work
+  // without cancelling" states. Cancelling and completing go through their own
+  // dedicated flows (cancel() above, and the workflow engine reaching a
+  // terminal stage) because both have side effects beyond the status column,
+  // so this intentionally refuses to set/leave either of those here.
+  async setStatus(id, orgId, userId, status, note) {
+    const settable = [PROJECT_STATUS.ACTIVE, PROJECT_STATUS.ON_HOLD, PROJECT_STATUS.BLOCKED];
+    if (!settable.includes(status)) {
+      const err = new Error(`status must be one of: ${settable.join(', ')}`);
+      err.status = 400;
+      throw err;
+    }
+    const project = await db.Project.findOne({ where: { id, orgId } });
+    if (!project) {
+      const err = new Error('Project not found.');
+      err.status = 404;
+      throw err;
+    }
+    if ([PROJECT_STATUS.CANCELLED, PROJECT_STATUS.COMPLETED].includes(project.status)) {
+      const err = new Error(`Project is already ${project.status}.`);
+      err.status = 409;
+      throw err;
+    }
+    if (project.status === status) return project;
+    await project.update({ status });
+    await db.ProjectEvent.create({
+      projectId: project.id,
+      fromStageKey: project.currentStageKey,
+      toStageKey: project.currentStageKey,
+      action: 'status_changed',
+      actorUserId: userId,
+      note: note || `Status set to ${status}`,
+    });
+    return project;
+  }
+
   async setAssignment(projectId, orgId, roleSlot, userId) {
     const project = await db.Project.findOne({ where: { id: projectId, orgId } });
     if (!project) {

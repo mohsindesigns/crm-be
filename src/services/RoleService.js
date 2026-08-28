@@ -9,6 +9,9 @@ const PERMISSION_DEPS = [
   // billing.read implies create+update — a billing role can always create and update invoices
   { triggers: ['billing.read'],                                      requires: ['billing.create', 'billing.update', 'clients.read'] },
   { triggers: ['billing.create', 'billing.update'],                  requires: ['clients.read'] },
+  // personalInvoices is deliberately its own permission, unrelated to billing.*
+  // or clients.read — Personal invoices bill separate contacts, not Clients.
+  { triggers: ['personalInvoices.read'],                              requires: ['personalInvoices.create', 'personalInvoices.update'] },
   { triggers: ['projects.create'],                                   requires: ['clients.read'] },
   { triggers: ['projects.manage'],                                   requires: ['clients.read', 'users.read'] },
 ];

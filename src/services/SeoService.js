@@ -23,6 +23,25 @@ function normName(value) {
   return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
 }
 
+/**
+ * The calendar day a Date falls on *where the server lives*, as "YYYY-MM-DD".
+ *
+ * Every date this file writes — a backlink's publish date, a rank snapshot's
+ * report date — lands in a Sequelize DATEONLY column. Those hold a calendar
+ * date with no time and no timezone, so the value written must be the day a
+ * person would have written down, never that day pushed through UTC.
+ *
+ * `toISOString().slice(0, 10)` is exactly that push and must not be used on
+ * these: it reads the *UTC* day, which on a UTC+n server (this one runs
+ * Asia/Karachi) is the previous day for anything before 05:00 local — and for
+ * a Date at local midnight, which is what `xlsx` hands back for a date cell,
+ * it is *always* the previous day. That is how sheet imports silently landed
+ * a day early. Read the local Y/M/D components instead.
+ */
+function localDateParts(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
 function cell(row, ...keys) {
   for (const key of keys) {
     if (row[key] != null && String(row[key]).trim() !== '') return row[key];
@@ -522,9 +541,7 @@ async function bulkDeactivateKeywords(projectId, orgId, ids) {
 // ─── Rank Snapshots ───────────────────────────────────────────────────────────
 
 function todayDateOnly() {
-  const d = new Date();
-  const pad = (n) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  return localDateParts(new Date());
 }
 
 // `orgId` and `projectId` are NOT NULL on rank_snapshots but were never being
@@ -548,7 +565,7 @@ async function addRankSnapshot(keywordId, position, checkedAt, orgId) {
 function toDateOnlyString(value) {
   if (!value) return null;
   if (typeof value === 'string') return value.slice(0, 10);
-  if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString().slice(0, 10);
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return localDateParts(value);
   return null;
 }
 
@@ -868,21 +885,7 @@ function normalizeIndexed(raw) {
   return ['yes', 'y', 'true', '1', 'indexed'].includes(v);
 }
 
-function localDateParts(d) {
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-}
-
-/**
- * Convert Excel serials / Date objects / common strings into YYYY-MM-DD, or an error string.
- *
- * The result lands in a DATEONLY column, so it must be the calendar date that
- * was written in the sheet — never that date pushed through a timezone.
- * `toISOString()` is exactly that push and must not be used here: xlsx (with
- * cellDates) hands back a Date sitting at *local* midnight, so on any UTC+n
- * server `new Date(2026, 7, 28).toISOString()` is "2026-08-27" and every
- * imported link silently lands a day early. Read the local Y/M/D components off
- * the Date instead — that's what localDateParts is for.
- */
+/** Convert Excel serials / Date objects / common strings into YYYY-MM-DD, or an error string. */
 function parseSheetDate(raw) {
   if (raw == null || raw === '') return { value: null };
   if (raw instanceof Date && !Number.isNaN(raw.getTime())) {

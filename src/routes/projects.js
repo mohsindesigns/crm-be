@@ -23,5 +23,6 @@ router.post('/:id/assign', rbac('projects.act'), (req, res, next) => ProjectCont
 router.post('/:id/action', (req, res, next) => ProjectController.action(req, res, next));
 router.post('/:id/rewind', rbac('projects.rewind'), (req, res, next) => ProjectController.rewind(req, res, next));
 router.post('/:id/cancel', rbac('projects.manage'), (req, res, next) => ProjectController.cancel(req, res, next));
+router.patch('/:id/status', rbac('projects.manage'), (req, res, next) => ProjectController.setStatus(req, res, next));
 
 module.exports = router;

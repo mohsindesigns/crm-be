@@ -483,6 +483,418 @@ class StripeService {
   }
 
   /**
+   * Find/create the Stripe Customer for a Personal invoice contact. Same
+   * account as _ensureCustomer, kept separate because PersonalContact carries
+   * its own email field directly rather than a nested Contact association.
+   */
+  async _ensurePersonalCustomer(contact) {
+    const s = stripe();
+
+    if (contact.stripeCustomerId) {
+      try {
+        const existing = await s.customers.retrieve(contact.stripeCustomerId);
+        if (existing && !existing.deleted) return existing.id;
+      } catch {
+        // Deleted or from a different account — fall through and create fresh.
+      }
+    }
+
+    const customer = await s.customers.create({
+      name: contact.name || undefined,
+      email: contact.contactEmail || undefined,
+      metadata: {
+        cadencePersonalContactId: contact.id,
+        cadenceOrgId: contact.orgId,
+      },
+    });
+    await contact.update({ stripeCustomerId: customer.id });
+    return customer.id;
+  }
+
+  /** Personal-invoice counterpart to _resumeExisting. */
+  async _resumeExistingPersonal(invoice) {
+    if (!invoice.stripeInvoiceId) return null;
+    const s = stripe();
+    let existing;
+    try {
+      existing = await s.checkout.sessions.retrieve(invoice.stripeInvoiceId);
+    } catch {
+      return null;
+    }
+
+    if (existing.status === 'complete') {
+      const result = await this._markPaidFromPersonalInvoiceSession(existing);
+      return { alreadyPaid: true, fullySettled: result?.fullySettled !== false };
+    }
+    if (existing.status === 'open' && existing.url) {
+      return { url: existing.url, stripeInvoiceId: existing.id, resumed: true };
+    }
+    return null;
+  }
+
+  async startPersonalInvoicePayment(personalInvoiceId, orgId, opts = {}) {
+    return this._withInvoiceLock(`personal:${personalInvoiceId}`, () => this._startPersonalInvoicePaymentLocked(personalInvoiceId, orgId, opts));
+  }
+
+  /** Personal-invoice counterpart to _startPaymentLocked. Same account, own tables. */
+  async _startPersonalInvoicePaymentLocked(personalInvoiceId, orgId, { method = null, payAmount = null } = {}) {
+    const s = stripe();
+
+    const invoice = await db.PersonalInvoice.findOne({
+      where: { id: personalInvoiceId, orgId },
+      include: [
+        { model: db.PersonalInvoiceLine, as: 'lines' },
+        { model: db.PersonalContact, as: 'contact' },
+      ],
+    });
+    if (!invoice) {
+      const err = new Error('Personal invoice not found.');
+      err.status = 404;
+      throw err;
+    }
+    if (invoice.status === INVOICE_STATUS.PAID || invoice.status === 'paid') {
+      const err = new Error('This invoice is already paid.');
+      err.status = 400;
+      throw err;
+    }
+    if (invoice.status === INVOICE_STATUS.VOID || invoice.status === 'void') {
+      const err = new Error('This invoice has been voided.');
+      err.status = 400;
+      throw err;
+    }
+
+    const currency = String(invoice.currency || 'USD').toLowerCase();
+
+    const openStripeInvoiceId = invoice.stripeInvoiceId;
+    const previousPartialAmount = invoice.stripePartialAmount;
+    const resumed = await this._resumeExistingPersonal(invoice);
+    if (resumed?.alreadyPaid && resumed.fullySettled) {
+      const err = new Error('This invoice has already been paid.');
+      err.status = 400;
+      throw err;
+    }
+    if (resumed?.alreadyPaid) await invoice.reload();
+
+    const total = parseFloat(invoice.total) || 0;
+    const paidRows = await db.PersonalPayment.findAll({ where: { personalInvoiceId: invoice.id }, attributes: ['amount'] });
+    const amountAlreadyPaid = paidRows.reduce((sum, p) => sum + (parseFloat(p.amount) || 0), 0);
+    const amountDue = Math.round((total - amountAlreadyPaid) * 100) / 100;
+    if (amountDue <= 0) {
+      const err = new Error('There is nothing left to pay on this invoice.');
+      err.status = 400;
+      throw err;
+    }
+
+    const requested = payAmount === null || payAmount === undefined || payAmount === ''
+      ? null
+      : Math.round((Number(payAmount) || 0) * 100) / 100;
+    if (requested !== null && !(requested > 0)) {
+      const err = new Error('Enter an amount greater than zero to pay.');
+      err.status = 400;
+      throw err;
+    }
+    if (requested !== null && requested > amountDue) {
+      const err = new Error(`You can pay at most ${invoice.currency} ${amountDue.toFixed(2)} on this invoice.`);
+      err.status = 400;
+      throw err;
+    }
+    const chargeAmount = requested !== null ? requested : amountDue;
+    const isPartPayment = chargeAmount < amountDue;
+
+    if (resumed?.url && !isPartPayment && !previousPartialAmount) {
+      await invoice.update({ stripeHostedUrl: resumed.url });
+      return { url: resumed.url, resumed: true, chargeAmount, amountDue, isPartPayment: false };
+    }
+    if (resumed?.url) {
+      try {
+        await s.checkout.sessions.expire(openStripeInvoiceId);
+      } catch (err) {
+        const e = new Error('Could not cancel the previous payment page. Please refresh and try again in a moment.');
+        e.status = 409;
+        throw e;
+      }
+      await invoice.update({ stripeInvoiceId: null, stripeHostedUrl: null, stripePartialAmount: null });
+    }
+
+    const customerId = await this._ensurePersonalCustomer(invoice.contact);
+    // Personal invoices always charge the fee — there's no client-level
+    // chargeCardFee toggle for a contact that isn't a Client.
+    const fee = await processingFeeFor(orgId, chargeAmount, currency, { chargeFee: true });
+    const settings = await db.PaymentSetting.resolve(orgId).catch(() => null);
+    const dueDays = Math.max(0, settings?.invoiceDueDays ?? 7);
+    const expiresAt = Math.floor(Date.now() / 1000)
+      + Math.min(Math.max(dueDays, 1) * 86400, 23 * 3600 + 59 * 60);
+
+    const lineItems = [];
+    if (isPartPayment) {
+      lineItems.push({
+        price_data: {
+          currency,
+          unit_amount: toMinorUnits(chargeAmount, currency),
+          product_data: {
+            name: `Part payment for invoice ${invoice.number} (balance ${invoice.currency} ${(amountDue - chargeAmount).toFixed(2)} remains)`.slice(0, 300),
+          },
+        },
+        quantity: 1,
+      });
+    } else {
+      const alreadyPaid = Math.round((total - amountDue) * 100) / 100;
+      const lines = alreadyPaid > 0 ? [] : (invoice.lines || []);
+      if (lines.length) {
+        for (const line of lines) {
+          const lineAmount = Number(line.amount) || (Number(line.qty) || 0) * (Number(line.unitPrice) || 0);
+          if (lineAmount <= 0) continue;
+          lineItems.push({
+            price_data: {
+              currency,
+              unit_amount: toMinorUnits(lineAmount, currency),
+              product_data: { name: String(line.description || 'Services').slice(0, 300) },
+            },
+            quantity: 1,
+          });
+        }
+      }
+      if (!lineItems.length) {
+        lineItems.push({
+          price_data: {
+            currency,
+            unit_amount: toMinorUnits(amountDue, currency),
+            product_data: { name: `Invoice ${invoice.number}` },
+          },
+          quantity: 1,
+        });
+      }
+    }
+
+    if (fee > 0) {
+      lineItems.push({
+        price_data: {
+          currency,
+          unit_amount: toMinorUnits(fee, currency),
+          product_data: { name: 'Card processing fee' },
+        },
+        quantity: 1,
+      });
+    }
+
+    const metadata = {
+      // Distinguishes this from an official-invoice/document session in the
+      // webhook — see handleEvent. Deliberately no cadenceInvoiceId/cadenceClientId.
+      cadencePersonalInvoiceId: invoice.id,
+      cadenceOrgId: orgId,
+      cadenceInvoiceNumber: invoice.number,
+      cadenceProcessingFee: String(fee),
+      cadenceChargeAmount: String(chargeAmount),
+      cadencePartPayment: isPartPayment ? '1' : '0',
+      cadenceMethodLabel: method?.label || 'Credit / Debit Card (Stripe)',
+    };
+
+    const returnBase = invoice.publicToken
+      ? `${frontendBase()}/personal-invoice/${invoice.publicToken}`
+      : `${frontendBase()}/personal-invoices/${invoice.id}`;
+
+    const session = await s.checkout.sessions.create({
+      mode: 'payment',
+      customer: customerId,
+      line_items: lineItems,
+      success_url: `${returnBase}?payment=success`,
+      cancel_url: `${returnBase}?payment=cancelled`,
+      expires_at: expiresAt,
+      metadata,
+      payment_intent_data: { metadata },
+    });
+
+    if (!session.url) {
+      const err = new Error('Stripe did not return a payment link. Please try again or use another payment method.');
+      err.status = 502;
+      throw err;
+    }
+
+    await invoice.update({
+      stripeInvoiceId: session.id,
+      stripeHostedUrl: session.url,
+      stripePartialAmount: isPartPayment ? chargeAmount : null,
+    });
+
+    return {
+      url: session.url,
+      stripeInvoiceId: session.id,
+      amountDue,
+      chargeAmount,
+      isPartPayment,
+      remainingAfter: Math.round((amountDue - chargeAmount) * 100) / 100,
+      processingFee: fee,
+      currency: invoice.currency,
+    };
+  }
+
+  /**
+   * Pull the current state of a Personal invoice straight from Stripe.
+   * Personal-invoice counterpart to syncFromStripe.
+   */
+  async syncPersonalInvoiceFromStripe(personalInvoiceId, orgId) {
+    const invoice = await db.PersonalInvoice.findOne({ where: { id: personalInvoiceId, orgId } });
+    if (!invoice) {
+      const err = new Error('Personal invoice not found.');
+      err.status = 404;
+      throw err;
+    }
+    if (!invoice.stripeInvoiceId) {
+      const err = new Error('No card payment was ever started for this invoice, so there is nothing to check.');
+      err.status = 400;
+      throw err;
+    }
+
+    let session;
+    try {
+      session = await stripe().checkout.sessions.retrieve(invoice.stripeInvoiceId);
+    } catch (err) {
+      const e = new Error(`Could not reach Stripe for this invoice: ${err.message}`);
+      e.status = 502;
+      throw e;
+    }
+
+    if (session.status === 'complete') {
+      const result = await this._markPaidFromPersonalInvoiceSession(session);
+      if (result?.fullySettled === false) {
+        return {
+          status: 'part_paid',
+          message: `Part payment confirmed with Stripe — ${invoice.currency || ''} ${Number(result.remaining).toFixed(2)} is still outstanding, so the invoice stays open.`.replace(/\s+/g, ' ').trim(),
+        };
+      }
+      return { status: 'paid', message: 'Payment confirmed with Stripe — the invoice is now marked paid.' };
+    }
+
+    return {
+      status: session.status,
+      message: `Stripe reports this payment page as "${session.status}" — no payment has cleared yet.`,
+    };
+  }
+
+  /** Resolve our PersonalInvoice row from a Checkout Session object. */
+  async _localPersonalInvoiceFor(session) {
+    const localId = session?.metadata?.cadencePersonalInvoiceId;
+    if (localId) {
+      const byMeta = await db.PersonalInvoice.findByPk(localId);
+      if (byMeta) return byMeta;
+    }
+    if (session?.id) {
+      return db.PersonalInvoice.findOne({ where: { stripeInvoiceId: session.id } });
+    }
+    return null;
+  }
+
+  /**
+   * Personal-invoice counterpart to _markPaidFromSession — writes PersonalPayment
+   * rows and flips PersonalInvoice.status. No SubscriptionService call: personal
+   * invoices don't map to any subscription/entitlement.
+   */
+  async _markPaidFromPersonalInvoiceSession(session) {
+    const invoice = await this._localPersonalInvoiceFor(session);
+    if (!invoice) return { ignored: 'unknown_personal_invoice' };
+
+    const providerRef = extractPaymentRef(session);
+
+    const existing = await db.PersonalPayment.findOne({
+      where: { personalInvoiceId: invoice.id, providerRef },
+    });
+    if (existing) return { ok: true, deduped: true };
+
+    const currency = session.currency || invoice.currency;
+    const fee = Number(session.metadata?.cadenceProcessingFee) || 0;
+    const collected = fromMinorUnits(session.amount_total, currency);
+    const applied = Math.max(0, Math.round((collected - fee) * 100) / 100);
+
+    await db.PersonalPayment.create({
+      id: uuidv4(),
+      personalInvoiceId: invoice.id,
+      provider: 'stripe',
+      providerRef,
+      amount: applied,
+      processingFee: fee,
+      methodLabel: session.metadata?.cadenceMethodLabel || 'Credit / Debit Card (Stripe)',
+      paidAt: new Date(),
+    });
+
+    const total = Number(invoice.total) || 0;
+    const paidRows = await db.PersonalPayment.findAll({ where: { personalInvoiceId: invoice.id }, attributes: ['amount'] });
+    const totalPaid = Math.round(paidRows.reduce((sum, p) => sum + (parseFloat(p.amount) || 0), 0) * 100) / 100;
+    const remaining = Math.round(Math.max(0, total - totalPaid) * 100) / 100;
+    const fullySettled = remaining <= 0.005;
+
+    if (fullySettled) {
+      if (invoice.status !== INVOICE_STATUS.PAID && invoice.status !== 'paid') {
+        await invoice.update({ status: INVOICE_STATUS.PAID });
+      }
+      require('./PersonalInvoiceService').sendPaymentThankYou(invoice, invoice.orgId, {
+        amount: applied,
+        currency,
+        methodLabel: session.metadata?.cadenceMethodLabel || 'Credit / Debit Card (Stripe)',
+      }).catch(() => {});
+    } else {
+      const stillOpen = invoice.dueAt && invoice.dueAt < new Date().toISOString().split('T')[0]
+        ? INVOICE_STATUS.OVERDUE
+        : INVOICE_STATUS.SENT;
+      await invoice.update({
+        status: stillOpen,
+        stripeInvoiceId: null,
+        stripeHostedUrl: null,
+        stripePartialAmount: null,
+      });
+    }
+
+    await this._notifyPersonalStaff(invoice, {
+      type: 'payment_received',
+      title: fullySettled
+        ? `Card payment received: ${invoice.number}`
+        : `Part card payment received: ${invoice.number}`,
+      body: fullySettled
+        ? `${invoice.currency || ''} ${applied.toFixed(2)} paid by card via Stripe. Invoice marked paid automatically.`.trim()
+        : `${invoice.currency || ''} ${applied.toFixed(2)} paid by card via Stripe. ${invoice.currency || ''} ${remaining.toFixed(2)} still outstanding — the invoice stays open.`.trim(),
+    });
+
+    return { ok: true, invoiceId: invoice.id, fullySettled, remaining };
+  }
+
+  async _onPersonalPaymentFailed(session) {
+    const invoice = await this._localPersonalInvoiceFor(session);
+    if (!invoice) return { ignored: 'unknown_personal_invoice' };
+    await this._notifyPersonalStaff(invoice, {
+      type: 'payment_failed',
+      title: `Card payment failed: ${invoice.number}`,
+      body: 'The contact\'s card payment did not go through. They can retry from the pay link, or settle another way.',
+    });
+    return { ok: true };
+  }
+
+  async _onPersonalInvoiceCancelled(session) {
+    const invoice = await this._localPersonalInvoiceFor(session);
+    if (!invoice) return { ignored: 'unknown_personal_invoice' };
+    if (invoice.status === INVOICE_STATUS.PAID || invoice.status === 'paid') return { ok: true };
+    await invoice.update({ stripeInvoiceId: null, stripeHostedUrl: null });
+    return { ok: true };
+  }
+
+  /** In-app notification to admins + anyone with personalInvoices.read — Personal-invoice counterpart to _notifyStaff. */
+  async _notifyPersonalStaff(invoice, payload) {
+    try {
+      const users = await db.User.findAll({
+        where: { orgId: invoice.orgId },
+        include: [{ model: db.Role, as: 'role' }],
+      });
+      const recipients = users.filter((u) =>
+        ['super_admin', 'admin'].includes(u.role?.key) || u.role?.permissions?.['personalInvoices.read']);
+      await Promise.all(recipients.map((u) => NotificationService.notify(u.id, invoice.orgId, {
+        ...payload,
+        refTable: 'personal_invoices',
+        refId: invoice.id,
+      })));
+    } catch (err) {
+      console.error('[StripeService] personal invoice staff notification failed:', err.message);
+    }
+  }
+
+  /**
    * Pay-before-convert for a CustomerDocument (quotation/agreement/proposal).
    *
    * A real Client, Project and Invoice only get created once Stripe confirms
@@ -713,12 +1125,22 @@ class StripeService {
         // carries cadenceDocumentId instead of cadenceInvoiceId — no Invoice
         // row exists yet, so it needs the conversion step first.
         if (obj?.metadata?.cadenceDocumentId) return this._convertAndMarkPaidFromDocument(obj);
+        // Personal invoices are a separate table with their own metadata key —
+        // checked before the plain-Invoice fallback so a personal-invoice
+        // session never gets misresolved against the official Invoice table.
+        if (obj?.metadata?.cadencePersonalInvoiceId) return this._markPaidFromPersonalInvoiceSession(obj);
         return this._markPaidFromSession(obj);
       }
-      case 'checkout.session.async_payment_failed':
-        return this._onPaymentFailed(event.data.object);
-      case 'checkout.session.expired':
-        return this._onInvoiceCancelled(event.data.object);
+      case 'checkout.session.async_payment_failed': {
+        const obj = event.data.object;
+        if (obj?.metadata?.cadencePersonalInvoiceId) return this._onPersonalPaymentFailed(obj);
+        return this._onPaymentFailed(obj);
+      }
+      case 'checkout.session.expired': {
+        const obj = event.data.object;
+        if (obj?.metadata?.cadencePersonalInvoiceId) return this._onPersonalInvoiceCancelled(obj);
+        return this._onInvoiceCancelled(obj);
+      }
       default:
         return { ignored: event.type };
     }

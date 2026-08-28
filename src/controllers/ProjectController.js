@@ -255,6 +255,13 @@ class ProjectController {
       res.json(project);
     } catch (err) { next(err); }
   }
+
+  async setStatus(req, res, next) {
+    try {
+      const project = await ProjectService.setStatus(req.params.id, req.orgId, req.user.id, req.body.status, req.body.note);
+      res.json(project);
+    } catch (err) { next(err); }
+  }
 }
 
 module.exports = new ProjectController();

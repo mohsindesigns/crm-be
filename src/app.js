@@ -13,6 +13,9 @@ const tasksRouter = require('./routes/tasks');
 const recurringTaskRulesRouter = require('./routes/recurringTaskRules');
 const commentsRouter = require('./routes/comments');
 const invoicesRouter = require('./routes/invoices');
+const personalInvoicesRouter = require('./routes/personalInvoices');
+const personalContactsRouter = require('./routes/personalContacts');
+const publicPersonalInvoicesRouter = require('./routes/publicPersonalInvoices');
 const notificationsRouter = require('./routes/notifications');
 const adminRouter = require('./routes/admin');
 const mediaRouter = require('./routes/media');
@@ -126,6 +129,8 @@ app.use('/api/projects/:projectId/tasks', tasksRouter);
 app.use('/api/projects/:projectId/recurring-task-rules', recurringTaskRulesRouter);
 app.use('/api/projects/:projectId/comments', commentsRouter);
 app.use('/api/invoices', invoicesRouter);
+app.use('/api/personal-invoices', personalInvoicesRouter);
+app.use('/api/personal-contacts', personalContactsRouter);
 app.use('/api/notifications', notificationsRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api/media', mediaRouter);
@@ -139,6 +144,7 @@ app.use('/api/portal', portalRouter);
 app.use('/api/documents', documentsRouter);
 app.use('/api/public/documents', publicDocumentsRouter);
 app.use('/api/public/invoices', publicInvoicesRouter);
+app.use('/api/public/personal-invoices', publicPersonalInvoicesRouter);
 app.use('/api/messages', messagesRouter);
 app.use('/api/portal/messages', portalMessagesRouter);
 app.use('/api/lead-forms', leadFormsRouter);
@@ -346,6 +352,10 @@ app.schemaReady = (async () => {
     await db.WhiteLabelConfig.ensureSchema();  // adds businessAddress/…/taxNumber + the letterhead block
     await db.Company.ensureSchema();           // new table; legal entities behind the letterhead
     await db.DocumentSequence.ensureSchema();  // new table; per-company/type/year document numbering
+    await db.PersonalContact.ensureSchema();      // new table; Personal Invoices bill-to contacts, unrelated to Client
+    await db.PersonalInvoice.ensureSchema();      // new table; depends on personal_contacts + companies
+    await db.PersonalInvoiceLine.ensureSchema();  // new table; depends on personal_invoices
+    await db.PersonalPayment.ensureSchema();      // new table; depends on personal_invoices
     await db.ChatRoom.ensureSchema();          // client-scoped Messages rooms
     await db.ChatMember.ensureSchema();        // depends on chat_rooms / users / contacts
     await db.ChatMessage.ensureSchema();       // depends on chat_rooms

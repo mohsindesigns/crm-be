@@ -2144,7 +2144,7 @@ function normalizeWorkingDays(value, fallback = 26) {
   return n;
 }
 
-async function createPayrollRun(period, orgId, createdBy, { workingDaysPerMonth } = {}) {
+async function createPayrollRun(period, orgId, createdBy, { workingDaysPerMonth, includeOvertime } = {}) {
   const existing = await PayrollRun.findOne({ where: { orgId, period } });
   if (existing) throw Object.assign(new Error(`Payroll run for ${period} already exists`), { status: 409 });
   const settings = await getOrCreatePayrollSettings(orgId);
@@ -2152,7 +2152,10 @@ async function createPayrollRun(period, orgId, createdBy, { workingDaysPerMonth 
   const wdpm = workingDaysPerMonth != null && workingDaysPerMonth !== ''
     ? normalizeWorkingDays(workingDaysPerMonth, defaultDays)
     : defaultDays;
-  return PayrollRun.create({ orgId, period, createdBy, workingDaysPerMonth: wdpm });
+  return PayrollRun.create({
+    orgId, period, createdBy, workingDaysPerMonth: wdpm,
+    includeOvertime: includeOvertime !== false,
+  });
 }
 
 async function updatePayrollRun(id, orgId, updates = {}) {
@@ -2165,11 +2168,29 @@ async function updatePayrollRun(id, orgId, updates = {}) {
   if (updates.workingDaysPerMonth != null && updates.workingDaysPerMonth !== '') {
     patch.workingDaysPerMonth = normalizeWorkingDays(updates.workingDaysPerMonth);
   }
+  if (updates.includeOvertime != null) {
+    patch.includeOvertime = !!updates.includeOvertime;
+  }
   if (Object.keys(patch).length === 0) {
     throw Object.assign(new Error('No valid fields to update.'), { status: 400 });
   }
   await run.update(patch);
   return run;
+}
+
+// Temporary: lets HR delete a payroll run outright while QA-ing the workflow.
+// Not the app's usual soft-delete pattern — remove this once testing is done.
+async function deletePayrollRun(id, orgId) {
+  const run = await PayrollRun.findOne({ where: { id, orgId } });
+  if (!run) throw Object.assign(new Error('Payroll run not found'), { status: 404 });
+  const items = await PayrollItem.findAll({ where: { payrollRunId: id }, attributes: ['id'] });
+  const itemIds = items.map((i) => i.id);
+  if (itemIds.length) {
+    await SalarySlip.destroy({ where: { payrollItemId: itemIds } });
+    await PayrollItem.destroy({ where: { id: itemIds } });
+  }
+  await run.destroy();
+  return { success: true };
 }
 
 // Converts every N late arrivals in the payroll month (settings.lateOccurrencesPerDeduction)
@@ -2394,7 +2415,7 @@ async function calculatePayrollItems(runId, orgId, { workingDaysPerMonth } = {})
     });
 
     const perDayRate = monthlySalary / daysInMonth;
-    const overtimePay = overtimeHours > 0
+    const overtimePay = overtimeHours > 0 && run.includeOvertime
       ? Math.round((perDayRate / hoursPerDay) * overtimeHours * otMultiplier * 100) / 100
       : 0;
 
@@ -3176,7 +3197,7 @@ module.exports = {
   getSalaryBeneficiaries, setSalaryBeneficiaries,
   listTaxYears, createTaxYear, updateTaxYear, activateTaxYear, deleteTaxYear,
   createTaxSlab, updateTaxSlab, deleteTaxSlab, getActiveTaxSlabs,
-  listPayrollRuns, createPayrollRun, updatePayrollRun, advancePayrollStatus,
+  listPayrollRuns, createPayrollRun, updatePayrollRun, deletePayrollRun, advancePayrollStatus,
   revertPayrollRun, calculatePayrollItems, getPayrollItems, upsertPayrollItem,
   employeeReviewPayroll, rectifyPayrollItem, getDisbursementData,
   listHrDocuments, createHrDocument, generateAndSaveDocument, requestEmployeeDocument,

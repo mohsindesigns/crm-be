@@ -351,15 +351,22 @@ router.get('/payroll', rbac('hr.read'), async (req, res, next) => {
 
 router.post('/payroll', rbac('hr.manage'), async (req, res, next) => {
   try {
-    const { period, workingDaysPerMonth } = req.body;
+    const { period, workingDaysPerMonth, includeOvertime } = req.body;
     if (!period) return res.status(400).json({ error: 'period is required (YYYY-MM)' });
-    res.status(201).json(await HrService.createPayrollRun(period, req.orgId, req.user.id, { workingDaysPerMonth }));
+    res.status(201).json(await HrService.createPayrollRun(period, req.orgId, req.user.id, { workingDaysPerMonth, includeOvertime }));
   } catch (e) { next(e); }
 });
 
 router.patch('/payroll/:id', rbac('hr.manage'), async (req, res, next) => {
   try {
     res.json(await HrService.updatePayrollRun(req.params.id, req.orgId, req.body));
+  } catch (e) { next(e); }
+});
+
+// Temporary: hard-delete a payroll run while QA-ing the workflow — remove once done.
+router.delete('/payroll/:id', adminOnly, rbac('hr.manage'), async (req, res, next) => {
+  try {
+    res.json(await HrService.deletePayrollRun(req.params.id, req.orgId));
   } catch (e) { next(e); }
 });
 

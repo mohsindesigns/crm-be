@@ -28,6 +28,14 @@ module.exports = (sequelize, DataTypes) => {
       allowNull: false,
       defaultValue: 26,
     },
+    // Per-run switch: whether calculatePayrollItems pays out overtime for this
+    // month. Attendance-detected overtimeHours are still recorded either way —
+    // this only zeroes the overtimePay addition to gross when off.
+    includeOvertime: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: true,
+    },
     createdBy: {
       type: DataTypes.CHAR(36),
       references: { model: 'users', key: 'id' },
