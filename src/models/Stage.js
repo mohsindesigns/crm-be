@@ -1,4 +1,5 @@
 const { v4: uuidv4 } = require('uuid');
+const { ensureColumns } = require('../utils/schemaSync');
 
 module.exports = (sequelize, DataTypes) => {
   const Stage = sequelize.define('Stage', {
@@ -52,6 +53,17 @@ module.exports = (sequelize, DataTypes) => {
     description: {
       type: DataTypes.TEXT,
     },
+    // Whether this stage shows as a pill in the project timeline. A hidden
+    // work stage also auto-advances once its advance rule is satisfied
+    // (see workflow/autoAdvance.js) instead of waiting on a manual click —
+    // its work still happens through the stage's own tab (Keywords, Content,
+    // etc). Hidden approval stages still require a manual Approve/Reject;
+    // only their pill is suppressed, since the engine never auto-decides a
+    // real approve/reject choice.
+    showInTimeline: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: true,
+    },
   }, {
     tableName: 'stages',
     indexes: [
@@ -60,6 +72,8 @@ module.exports = (sequelize, DataTypes) => {
     ],
     timestamps: false,
   });
+
+  Stage.ensureSchema = async () => ensureColumns(Stage);
 
   Stage.associate = (db) => {
     Stage.belongsTo(db.WorkflowTemplate, { foreignKey: 'templateId', as: 'template' });

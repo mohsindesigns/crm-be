@@ -2,6 +2,7 @@ const { v4: uuidv4 } = require('uuid');
 const { Op } = require('sequelize');
 const db = require('../models');
 const { TASK_STATUS } = require('../config/constants');
+const { autoAdvancePastHiddenStages } = require('../workflow/autoAdvance');
 const NotificationService = require('./NotificationService');
 const EmailService = require('./EmailService');
 const BlogSheetSync = require('./BlogSheetSync');
@@ -442,6 +443,18 @@ class TaskService {
         transaction: t,
       });
     });
+
+    // A task finishing may be the last thing gating a hidden work stage's
+    // advance rule — replaces the manual "Mark Complete" click for stages an
+    // admin hid from the timeline (see workflow/autoAdvance.js). Fire-and-forget:
+    // this must never block the response to whoever just completed their task.
+    if (newStatus === TASK_STATUS.DONE || newStatus === TASK_STATUS.APPROVED) {
+      db.Project.findByPk(task.projectId)
+        .then((project) => (project && project.currentStageKey === task.stageKey
+          ? autoAdvancePastHiddenStages(project, orgId)
+          : null))
+        .catch((err) => console.error('[TaskService] Auto-advance after task completion failed:', err.message));
+    }
 
     // Fire-and-forget in-app notifications
     if (newStatus === TASK_STATUS.SUBMITTED || newStatus === TASK_STATUS.IN_REVIEW) {

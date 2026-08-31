@@ -378,6 +378,7 @@ app.schemaReady = (async () => {
     await db.RequirementFormTemplate.ensureSchema(); // new table; reusable client requirement forms
     await db.ClientRequest.ensureSchema();           // new table; depends on requirement_form_templates/projects/clients/contacts
     await db.ExportTemplate.ensureSchema();          // new table; saved column sets for Admin → Export Data
+    await db.Stage.ensureSchema();                   // adds show_in_timeline — per-stage timeline visibility toggle
   } catch (err) {
     console.error('[Schema] ensureSchema failed:', err.message);
   }

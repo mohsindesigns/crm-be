@@ -93,6 +93,7 @@ class WorkflowAdminService {
         stageType: s.stageType || 'work',
         requiresArtifact: s.requiresArtifact || false,
         isTerminal: s.isTerminal || false,
+        showInTimeline: s.showInTimeline !== false,
         advanceRule: s.advanceRule || 'manual',
         taskType: s.taskType,
         approvalGranularity: s.approvalGranularity,

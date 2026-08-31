@@ -1,7 +1,7 @@
 const { body } = require('express-validator');
-const { v4: uuidv4 } = require('uuid');
 const ProjectService = require('../services/ProjectService');
 const { performAction, rewindStage } = require('../workflow/engine');
+const { autoCreateStageTasks, applyForwardAdvanceSideEffects, autoAdvancePastHiddenStages } = require('../workflow/autoAdvance');
 const validate = require('../middleware/validate');
 const db = require('../models');
 const EmailService = require('../services/EmailService');
@@ -36,7 +36,15 @@ class ProjectController {
       // Kick off tasks for the first stage so the stage owner sees work immediately
       const firstStage = project.template?.stages?.[0];
       if (firstStage) await autoCreateStageTasks(project, firstStage, req.orgId);
-      res.status(201).json(project);
+      // A hidden first stage with nothing gating it (e.g. single_action, no
+      // tasks) should skip through immediately rather than sitting there with
+      // no task-completion event to ever trigger it.
+      const advanced = await autoAdvancePastHiddenStages(project, req.orgId).catch((err) => {
+        console.error('[ProjectController] Auto-advance on project creation failed:', err.message);
+        return null;
+      });
+      const response = advanced ? await ProjectService.findById(project.id, req.orgId, req.user) : project;
+      res.status(201).json(response);
     } catch (err) { next(err); }
   }
 
@@ -167,31 +175,21 @@ class ProjectController {
         note: req.body.note,
       });
 
-      const { Op } = require('sequelize');
       // A backward move (rejection) = toStage has a lower orderIndex than fromStage.
       const isBackward = result.toStage.orderIndex < result.fromStage.orderIndex;
 
       if (!isBackward) {
-        // Forward advance: implicitly complete any open auto-tasks for the stage just left.
-        await db.Task.update(
-          { status: 'done', completedAt: new Date() },
-          {
-            where: {
-              projectId: project.id,
-              stageKey: result.fromStage.key,
-              autoCreated: true,
-              status: { [Op.notIn]: ['done', 'approved'] },
-            },
-          }
-        );
-        // Create tasks for the new stage (no-op if they already exist).
-        await autoCreateStageTasks(project, result.toStage, req.orgId);
-        // Recurring SEO projects landing on their terminal stage get their monthly
-        // review + ranking-update rules provisioned automatically (fire-and-forget —
-        // this must never block the stage-advance response).
-        RecurringTaskRuleService.handleTerminalStageReached(project, result.toStage, req.orgId).catch((err) => {
-          console.error('[ProjectController] Failed to auto-provision recurring task rules:', err.message);
+        await applyForwardAdvanceSideEffects(project, result.fromStage, result.toStage, req.orgId);
+        // If this landed on another hidden work stage that's already satisfied
+        // (or chains through several), keep going — the response should reflect
+        // wherever the project actually ended up, not a stale mid-chain stage.
+        // `result.fromStage` stays as this request's own fromStage on purpose:
+        // that's what actually changed because of this manual action.
+        const chained = await autoAdvancePastHiddenStages(project, req.orgId).catch((err) => {
+          console.error('[ProjectController] Auto-advance after stage action failed:', err.message);
+          return null;
         });
+        if (chained) result.toStage = chained.toStage;
       } else {
         // Backward move (rejection): re-open the tasks in the stage we're returning to
         // so the assignee sees them in My Tasks again.
@@ -265,64 +263,3 @@ class ProjectController {
 }
 
 module.exports = new ProjectController();
-
-/**
- * Auto-create tasks when a work stage is entered or a project is created.
- * - Approval stages are skipped (they advance via project action, not task completion).
- * - The stage owner (from ProjectAssignment) is set as assigneeId so the task
- *   appears in their "My Tasks" view immediately.
- * - 'content' stages: one task per unique keyword pageName.
- * - All other work stages: a single generic task.
- */
-async function autoCreateStageTasks(project, stage, orgId) {
-  if (stage.stageType === 'approval') return;
-
-  const existing = await db.Task.count({ where: { projectId: project.id, stageKey: stage.key, autoCreated: true } });
-  if (existing > 0) return;
-
-  // Resolve the stage owner so the task appears in their My Tasks
-  let assigneeId = null;
-  if (stage.ownerRoleSlot) {
-    const assignment = await db.ProjectAssignment.findOne({
-      where: { projectId: project.id, roleSlot: stage.ownerRoleSlot },
-    });
-    assigneeId = assignment?.userId ?? null;
-  }
-
-  if (stage.taskType === 'content') {
-    const keywords = await db.Keyword.findAll({
-      where: { projectId: project.id },
-      attributes: ['pageName'],
-      group: ['pageName'],
-    });
-
-    const pageNames = keywords.map((k) => k.pageName).filter(Boolean);
-    if (pageNames.length === 0) return;
-
-    await db.Task.bulkCreate(
-      pageNames.map((pageName) => ({
-        id: uuidv4(),
-        orgId,
-        projectId: project.id,
-        stageKey: stage.key,
-        type: 'content',
-        title: pageName,
-        assigneeId,
-        status: 'todo',
-        autoCreated: true,
-      }))
-    );
-  } else {
-    await db.Task.create({
-      id: uuidv4(),
-      orgId,
-      projectId: project.id,
-      stageKey: stage.key,
-      type: stage.taskType || 'work',
-      title: `${stage.name} — auto task`,
-      assigneeId,
-      status: 'todo',
-      autoCreated: true,
-    });
-  }
-}
