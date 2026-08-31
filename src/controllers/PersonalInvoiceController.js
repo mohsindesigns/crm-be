@@ -18,6 +18,11 @@ class PersonalInvoiceController {
     } catch (err) { next(err); }
   }
 
+  async update(req, res, next) {
+    try { res.json(await PersonalInvoiceService.update(req.params.id, req.orgId, req.body)); }
+    catch (err) { next(err); }
+  }
+
   async updateStatus(req, res, next) {
     try { res.json(await PersonalInvoiceService.updateStatus(req.params.id, req.orgId, req.body.status)); }
     catch (err) { next(err); }
@@ -42,13 +47,6 @@ class PersonalInvoiceController {
       res.setHeader('Content-Disposition', `attachment; filename="${invoice.number}.pdf"`);
       res.setHeader('Cache-Control', 'no-store');
       res.send(buffer);
-    } catch (err) { next(err); }
-  }
-
-  async syncStripe(req, res, next) {
-    try {
-      const StripeService = require('../services/StripeService');
-      res.json(await StripeService.syncPersonalInvoiceFromStripe(req.params.id, req.orgId));
     } catch (err) { next(err); }
   }
 

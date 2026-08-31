@@ -1,6 +1,6 @@
 const xlsx = require('xlsx');
 const { Op } = require('sequelize');
-const { Keyword, Backlink, ContentSubmission, BlogTask, RankSnapshot, Project, Client, WhiteLabelConfig, Task, Artifact, User, Role, Stage, ProjectAssignment } = require('../models');
+const { Keyword, KeywordBatch, Backlink, ContentSubmission, BlogTask, RankSnapshot, Project, Client, WhiteLabelConfig, Task, Artifact, User, Role, Stage, ProjectAssignment } = require('../models');
 const {
   createPdfBuffer, drawTable, drawFooter, drawReportFooter, drawStatCards, drawPill, BRAND_COLOR,
 } = require('./PdfService');
@@ -84,6 +84,26 @@ function sheetNumber(raw) {
   if (!Number.isFinite(value)) return null;
   const multiplier = match[2].toLowerCase() === 'k' ? 1000 : match[2].toLowerCase() === 'm' ? 1000000 : 1;
   return Math.round(value * multiplier);
+}
+
+// "Secondary Keywords" sheet/form cells don't reliably arrive comma-separated —
+// keyword-research tools (Ahrefs, Semrush, …) commonly export a "Related
+// keywords" list as one bullet-prefixed entry per line, and pasting that into
+// Excel keeps the line breaks and bullet glyphs as-is. The frontend list view
+// already tolerates this (see parseKeywordList's `/[\n,;]+/` split); this is
+// the same normalization for anywhere the string is stored or printed —
+// PDFKit's standard fonts only support the WinAnsi/Latin-1 glyph range, so an
+// un-normalized bullet or smart-typography character comes out as a garbled
+// "Ð" per line in the PDF report instead of erroring loudly.
+function normalizeKeywordList(raw) {
+  if (!raw) return null;
+  const BULLET_PREFIX = /^[\s\u2022\u25CF\u25E6\u2023\u2043\u00B7*\-\u2013\u2014]+/;
+  const NOT_WINANSI = /[^\x20-\x7E\u00A0-\u00FF]/g;
+  const items = String(raw)
+    .split(/[\n\r,;]+/)
+    .map((s) => s.replace(BULLET_PREFIX, '').replace(NOT_WINANSI, '').trim())
+    .filter(Boolean);
+  return items.length ? items.join(', ') : null;
 }
 
 async function ensureContentTask(orgId, project, pageName, assigneeId, actorUserId) {
@@ -241,7 +261,12 @@ async function listKeywords(projectId, orgId, { includeInactive = false } = {}) 
   await assertProjectAccess(projectId, orgId);
   return Keyword.findAll({
     where: { projectId, ...(includeInactive ? {} : { status: 'active' }) },
-    include: [{ association: 'assignedWriter', attributes: ['id', 'name'] }],
+    include: [
+      { association: 'assignedWriter', attributes: ['id', 'name'] },
+      // Pending/rejected rows still show on the sheet (transparency) — the
+      // frontend reads approvalStatus for the badge and this for the reason.
+      { association: 'batch', attributes: ['id', 'status', 'fileName', 'rejectionReason'] },
+    ],
     order: SHEET_ORDER,
   });
 }
@@ -257,7 +282,17 @@ async function createKeyword(data, orgId) {
   const project = await assertProjectAccess(data.projectId, orgId);
   const sortOrder = data.sortOrder != null ? data.sortOrder : await nextSortOrder(Keyword, data.projectId);
   const status = normalizeKeywordStatus(data.status) || 'active';
-  const kw = await Keyword.create({ ...data, status, sortOrder });
+  // A manual single-row add is never batch-gated — batchId/approvalStatus are
+  // only ever set by bulkImportKeywords/reviewKeywordBatch, never trusted from
+  // a client payload (which otherwise spreads straight through here).
+  const kw = await Keyword.create({
+    ...data,
+    secondaryKeywords: normalizeKeywordList(data.secondaryKeywords),
+    batchId: null,
+    approvalStatus: 'approved',
+    status,
+    sortOrder,
+  });
 
   // Assigning a writer at creation time should spin up their content task too,
   // same as assigning one later via updateKeyword or via bulk import.
@@ -268,7 +303,13 @@ async function createKeyword(data, orgId) {
   return kw;
 }
 
-async function bulkImportKeywords(projectId, orgId, fileBuffer, createdBy) {
+// Bulk-imported keywords no longer go live immediately — they land `pending`
+// under a new KeywordBatch and sit in the org's Approvals inbox until a
+// teammate (not the uploader) or an admin approves or rejects the whole
+// sheet at once. See reviewKeywordBatch for the decision side and
+// ApprovalService's `keyword_batch` source for how this reaches the inbox.
+// Manual single-row adds (createKeyword) are unaffected and stay instant.
+async function bulkImportKeywords(projectId, orgId, fileBuffer, createdBy, fileName) {
   const project = await assertProjectAccess(projectId, orgId);
   const wb = xlsx.read(fileBuffer, { type: 'buffer' });
   const ws = wb.Sheets[wb.SheetNames[0]];
@@ -287,7 +328,7 @@ async function bulkImportKeywords(projectId, orgId, fileBuffer, createdBy) {
     const record = {
       projectId,
       primaryKeyword,
-      secondaryKeywords: cell(row, 'Secondary Keywords', 'secondary_keywords') || null,
+      secondaryKeywords: normalizeKeywordList(cell(row, 'Secondary Keywords', 'secondary_keywords')),
       kd: sheetNumber(cell(row, 'KD', 'kd')),
       volume: sheetNumber(cell(row, 'Volume', 'volume', 'Search Volume', 'Vol')),
       targetUrl: cell(row, 'URL', 'Target URL', 'url') || null,
@@ -302,23 +343,87 @@ async function bulkImportKeywords(projectId, orgId, fileBuffer, createdBy) {
     return record;
   }).filter(Boolean);
 
-  const created = await Keyword.bulkCreate(records, { validate: true });
-
-  // Spin up one content task per unique page+writer (same as manual assign).
-  const taskKeys = new Set();
-  for (const rec of records) {
-    if (!rec.assignedWriterId) continue;
-    const pageName = rec.pageName || rec.primaryKeyword;
-    const key = `${rec.assignedWriterId}::${pageName}`;
-    if (taskKeys.has(key)) continue;
-    taskKeys.add(key);
-    await ensureContentTask(orgId, project, pageName, rec.assignedWriterId, createdBy);
+  if (!records.length) {
+    const err = new Error('No valid rows found — make sure the sheet has a "Keyword" column.');
+    err.status = 400;
+    throw err;
   }
 
-  return created;
+  const batch = await KeywordBatch.create({
+    projectId,
+    fileName: fileName || null,
+    rowCount: records.length,
+    submittedBy: createdBy,
+    status: 'pending',
+  });
+
+  const created = await Keyword.bulkCreate(
+    records.map((rec) => ({ ...rec, batchId: batch.id, approvalStatus: 'pending' })),
+    { validate: true },
+  );
+
+  // Content tasks (and the writer's "your work" view) only make sense once the
+  // sheet is actually live — deferred to reviewKeywordBatch on approval.
+  return { batch, created };
 }
 
-async function updateKeyword(id, updates, orgId, actorUserId) {
+/**
+ * Approve or reject an entire bulk keyword upload. Approving cascades
+ * approvalStatus: 'approved' onto every keyword the batch created and, only
+ * now, spins up the content tasks a writer assignment on the sheet implied.
+ * Rejecting requires a reason and flips the same rows to 'rejected' — they
+ * stay on the sheet (soft, not deleted) so the uploader can see why and
+ * re-import a corrected sheet.
+ */
+async function reviewKeywordBatch(batchId, updates, orgId, reviewer) {
+  const batch = await KeywordBatch.findOne({
+    where: { id: batchId },
+    include: [{ model: Project, as: 'project', where: { orgId }, attributes: ['id', 'currentStageKey'] }],
+  });
+  if (!batch) throw Object.assign(new Error('Keyword batch not found'), { status: 404 });
+  if (batch.status !== 'pending') {
+    throw Object.assign(new Error('This upload has already been decided.'), { status: 400 });
+  }
+  if (batch.submittedBy === reviewer?.id) {
+    throw Object.assign(new Error('You cannot approve your own upload.'), { status: 403 });
+  }
+
+  const status = updates?.status === 'approved' ? 'approved' : 'rejected';
+  if (status === 'rejected' && !String(updates?.rejectionReason || '').trim()) {
+    throw Object.assign(new Error('Tell the uploader why this was rejected.'), { status: 400 });
+  }
+
+  await batch.update({
+    status,
+    rejectionReason: status === 'rejected' ? updates.rejectionReason : null,
+    reviewedBy: reviewer?.id || null,
+    reviewedAt: new Date(),
+  });
+
+  await Keyword.update(
+    { approvalStatus: status, ...(status === 'rejected' ? { status: 'inactive' } : {}) },
+    { where: { batchId: batch.id } },
+  );
+
+  if (status === 'approved') {
+    const rows = await Keyword.findAll({
+      where: { batchId: batch.id, assignedWriterId: { [Op.ne]: null } },
+      attributes: ['pageName', 'primaryKeyword', 'assignedWriterId'],
+    });
+    const taskKeys = new Set();
+    for (const rec of rows) {
+      const pageName = rec.pageName || rec.primaryKeyword;
+      const key = `${rec.assignedWriterId}::${pageName}`;
+      if (taskKeys.has(key)) continue;
+      taskKeys.add(key);
+      await ensureContentTask(orgId, batch.project, pageName, rec.assignedWriterId, reviewer?.id);
+    }
+  }
+
+  return batch;
+}
+
+async function updateKeyword(id, updates, orgId, actor) {
   const kw = await Keyword.findOne({
     where: { id },
     include: [{ model: Project, as: 'project', where: { orgId }, attributes: ['id', 'currentStageKey'] }],
@@ -326,7 +431,19 @@ async function updateKeyword(id, updates, orgId, actorUserId) {
   if (!kw) throw Object.assign(new Error('Keyword not found'), { status: 404 });
 
   const patch = { ...updates };
+  // approvalStatus/batchId only ever change via reviewKeywordBatch — never
+  // trust them from a PATCH body (that's how a pending row would self-approve).
+  delete patch.approvalStatus;
+  delete patch.batchId;
   if (Object.prototype.hasOwnProperty.call(patch, 'status')) {
+    // Active/Inactive is admin-only — same boundary as delete and the bulk
+    // sheet actions (see deleteKeyword). A non-admin can still add keywords
+    // and assign writers, just not change what's live.
+    const isManager = ['super_admin', 'admin'].includes(actor?.role?.key)
+      || !!actor?.role?.permissions?.['projects.manage'];
+    if (!isManager) {
+      throw Object.assign(new Error('Only an administrator can change a keyword\'s Active/Inactive status.'), { status: 403 });
+    }
     const normalized = normalizeKeywordStatus(patch.status);
     if (!normalized) {
       throw Object.assign(new Error('Status must be "active" or "inactive".'), { status: 400 });
@@ -339,10 +456,12 @@ async function updateKeyword(id, updates, orgId, actorUserId) {
 
   // Assigning a writer spins up their content-writing task for this page — unless
   // they already have one open for it (re-assigning the same page's other keywords
-  // to the same writer shouldn't spam duplicate tasks).
-  if (assigningWriter) {
+  // to the same writer shouldn't spam duplicate tasks). Skipped while the keyword
+  // is still pending its own upload approval — reviewKeywordBatch creates the task
+  // once (and only if) the batch is approved, using whatever writer is set then.
+  if (assigningWriter && kw.approvalStatus === 'approved') {
     const pageName = kw.pageName || kw.primaryKeyword;
-    await ensureContentTask(orgId, kw.project, pageName, patch.assignedWriterId, actorUserId);
+    await ensureContentTask(orgId, kw.project, pageName, patch.assignedWriterId, actor?.id);
   }
   return kw;
 }
@@ -399,11 +518,10 @@ async function lockedKeywordIdSet(projectId) {
  * real foreign key from rank_snapshots.keywordId to keywords.id, which would
  * otherwise reject the delete.
  *
- * Not admin-only: the person who added the keyword can delete it themselves
- * too, but only while it's still theirs to take back — once a writer is on
- * the hook for it or its content has been approved, only an admin/manager can
- * touch it (same as `deleteContent`'s submitter-vs-manager split). Those two
- * guards exist to protect in-progress work, not to soften the delete itself.
+ * Admin-only, full stop — a regular project.act user can add keywords and
+ * assign writers, but deleting (and, see updateKeyword, flipping active/
+ * inactive) is reserved for super_admin/admin, same as the bulk sheet
+ * actions below. The route also carries `adminOnly`; this is the backstop.
  */
 async function deleteKeyword(id, orgId, actor) {
   const kw = await Keyword.findOne({
@@ -414,8 +532,8 @@ async function deleteKeyword(id, orgId, actor) {
 
   const isManager = ['super_admin', 'admin'].includes(actor?.role?.key)
     || !!actor?.role?.permissions?.['projects.manage'];
-  if (!isManager && kw.createdBy !== actor?.id) {
-    throw Object.assign(new Error('Only the person who added this keyword (or an admin) can delete it.'), { status: 403 });
+  if (!isManager) {
+    throw Object.assign(new Error('Only an administrator can delete a keyword.'), { status: 403 });
   }
   if (kw.assignedWriterId) {
     throw Object.assign(new Error('This keyword is assigned to a content writer and cannot be deleted.'), { status: 400 });
@@ -599,7 +717,7 @@ async function listRankings(projectId, orgId, { from, to } = {}) {
 
   const [keywords, snapshots] = await Promise.all([
     Keyword.findAll({
-      where: { projectId, status: 'active' },
+      where: { projectId, status: 'active', approvalStatus: 'approved' },
       attributes: ['id', 'primaryKeyword', 'pageName', 'targetUrl', 'volume', 'kd'],
       order: SHEET_ORDER,
     }),
@@ -1128,10 +1246,15 @@ async function createContent(data, orgId, caller) {
   if (Array.isArray(data.keywordIds) && data.keywordIds.length) {
     const kws = await Keyword.findAll({
       where: { id: data.keywordIds, projectId: data.projectId },
-      attributes: ['id', 'assignedWriterId', 'status'],
+      attributes: ['id', 'assignedWriterId', 'status', 'approvalStatus'],
     });
     if (kws.some((k) => k.status === 'inactive')) {
       const err = new Error('Inactive keywords cannot be used for content submissions.');
+      err.status = 400;
+      throw err;
+    }
+    if (kws.some((k) => k.approvalStatus !== 'approved')) {
+      const err = new Error('Keywords still pending upload approval cannot be used for content submissions.');
       err.status = 400;
       throw err;
     }
@@ -1361,9 +1484,10 @@ async function reviewContent(id, updates, orgId, reviewer) {
 
   // If every *active* keyword now has an approved submission covering it,
   // the pool is empty; try to auto-advance the project. Inactive keywords are
-  // ignored so a focus change doesn't block stage completion.
+  // ignored so a focus change doesn't block stage completion — pending/rejected
+  // upload-approval keywords are ignored the same way, since they aren't live yet.
   const [keywords, approvedSubmissions] = await Promise.all([
-    Keyword.findAll({ where: { projectId: cs.projectId, status: 'active' }, attributes: ['id'] }),
+    Keyword.findAll({ where: { projectId: cs.projectId, status: 'active', approvalStatus: 'approved' }, attributes: ['id'] }),
     ContentSubmission.findAll({ where: { projectId: cs.projectId, status: 'approved' }, attributes: ['keywordIds'] }),
   ]);
   const coveredIds = new Set();
@@ -2226,7 +2350,7 @@ async function generateKeywordCsv(projectId, orgId) {
   ];
   const rows = keywords.map((k) => [
     k.primaryKeyword,
-    k.secondaryKeywords || '',
+    normalizeKeywordList(k.secondaryKeywords) || '',
     k.volume ?? '',
     k.kd ?? '',
     k.status === 'inactive' ? 'Inactive' : 'Active',
@@ -2307,7 +2431,7 @@ async function generateKeywordReportBuffer(projectId, orgId, letterheadFields) {
         rows: keywords.map((k, i) => ({
           sr: i + 1,
           main: k.primaryKeyword,
-          support: k.secondaryKeywords || '—',
+          support: normalizeKeywordList(k.secondaryKeywords) || '—',
           volume: k.volume != null ? k.volume.toLocaleString() : '—',
           kd: k.kd ?? null,
           status: k.status === 'inactive' ? 'Inactive' : 'Active',
@@ -2387,7 +2511,7 @@ async function generateBacklinkReportBuffer(projectId, orgId, letterheadFields) 
 }
 
 module.exports = {
-  listKeywords, createKeyword, bulkImportKeywords, updateKeyword, deleteKeyword, clearKeywords, bulkDeleteKeywords, bulkActivateKeywords, bulkDeactivateKeywords,
+  listKeywords, createKeyword, bulkImportKeywords, reviewKeywordBatch, updateKeyword, deleteKeyword, clearKeywords, bulkDeleteKeywords, bulkActivateKeywords, bulkDeactivateKeywords,
   addRankSnapshot, listRankings, recordRankings, deleteRankingDate, bulkImportRankings,
   listBacklinks, createBacklink, updateBacklink, deleteBacklink, clearBacklinks, bulkDeleteBacklinks, bulkDeactivateBacklinks, bulkImportBacklinks, bulkUpdateBacklinkStatus,
   listContent, createContent, reviewContent, deleteContent, bulkDeleteContent, syncApprovedContentTasks,

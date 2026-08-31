@@ -19,7 +19,6 @@ const DEFAULT_INVOICE_TERMS = 'This invoice covers only the items listed above. 
 const PAYMENT_PROVIDER_LABELS = {
   manual: 'Manual / Cash',
   bank: 'Bank Transfer',
-  stripe: 'Stripe: Credit/Debit Card',
   paddle: 'Paddle',
   payfast: 'PayFast',
   wise: 'Wise',
@@ -145,7 +144,6 @@ class PersonalInvoiceService {
       throw err;
     }
     await this._healOverdue([invoice]);
-    await this._reconcileWithStripe(invoice);
     return invoice;
   }
 
@@ -220,21 +218,6 @@ class PersonalInvoiceService {
     };
   }
 
-  async _reconcileWithStripe(invoice) {
-    if (!invoice?.stripeInvoiceId) return invoice;
-    const open = [INVOICE_STATUS.SENT, INVOICE_STATUS.OVERDUE, INVOICE_STATUS.PAYMENT_REVIEW,
-      'sent', 'overdue', 'payment_review'];
-    if (!open.includes(invoice.status)) return invoice;
-    try {
-      const StripeService = require('./StripeService');
-      await StripeService.syncPersonalInvoiceFromStripe(invoice.id, invoice.orgId);
-      await invoice.reload();
-    } catch (err) {
-      console.warn(`[PersonalInvoiceService] Stripe reconcile skipped for ${invoice.number}:`, err.message);
-    }
-    return invoice;
-  }
-
   async ensurePublicToken(invoice) {
     if (!invoice) return null;
     if (invoice.publicToken) return invoice.publicToken;
@@ -257,39 +240,11 @@ class PersonalInvoiceService {
       return null;
     }
 
-    const method = invoice.preferredPaymentMethod
-      || (invoice.preferredPaymentMethodId
-        ? await this._paymentMethodById(orgId, invoice.preferredPaymentMethodId).catch(() => null)
-        : null);
-
     const manualLink = toAbsoluteHttpUrl(invoice.paymentLinkUrl);
-    if (method?.kind !== 'stripe' && manualLink) {
-      return manualLink;
-    }
-
-    const isStripe = method?.kind === 'stripe' || (!!invoice.stripeHostedUrl && !manualLink);
-    if (!isStripe) {
-      return manualLink || null;
-    }
+    if (manualLink) return manualLink;
 
     await this.ensurePublicToken(invoice).catch(() => null);
-    const publicUrl = this.publicInvoiceUrl(invoice);
-    if (publicUrl) return publicUrl;
-
-    if (invoice.stripeHostedUrl) {
-      return toAbsoluteHttpUrl(invoice.stripeHostedUrl) || null;
-    }
-    try {
-      const StripeService = require('./StripeService');
-      const started = await StripeService.startPersonalInvoicePayment(invoice.id, orgId, { method });
-      return started?.url || null;
-    } catch (err) {
-      console.warn(
-        `[PersonalInvoiceService] Could not create Stripe pay link for ${invoice.number}:`,
-        err.message || err,
-      );
-      return null;
-    }
+    return this.publicInvoiceUrl(invoice);
   }
 
   async sendPaymentThankYou(invoice, orgId, { amount, currency, methodLabel } = {}) {
@@ -441,6 +396,68 @@ class PersonalInvoiceService {
     return invoice;
   }
 
+  async update(id, orgId, data) {
+    const invoice = await db.PersonalInvoice.findOne({ where: { id, orgId } });
+    if (!invoice) {
+      const err = new Error('Personal invoice not found.');
+      err.status = 404;
+      throw err;
+    }
+    if (invoice.status !== INVOICE_STATUS.DRAFT) {
+      const err = new Error('Only draft invoices can be edited.');
+      err.status = 400;
+      throw err;
+    }
+
+    if (data.contactId) {
+      const contact = await db.PersonalContact.findOne({ where: { id: data.contactId, orgId } });
+      if (!contact) {
+        const err = new Error('Unknown contact.');
+        err.status = 400;
+        throw err;
+      }
+    }
+
+    const company = data.companyId !== undefined
+      ? await this._companyById(orgId, data.companyId).catch(() => null)
+      : null;
+
+    const lines = (data.lines || []).map((l) => ({
+      id: uuidv4(),
+      description: l.description,
+      qty: l.qty,
+      unitPrice: l.unitPrice,
+      amount: Number(l.qty) * Number(l.unitPrice),
+    }));
+    const total = lines.reduce((sum, l) => sum + l.amount, 0);
+    const issuedAt = toDateOnly(data.issuedAt) || invoice.issuedAt;
+    const dueAt = toDateOnly(data.dueAt) || issuedAt;
+
+    await db.sequelize.transaction(async (t) => {
+      await db.PersonalInvoiceLine.destroy({ where: { personalInvoiceId: id }, transaction: t });
+      if (lines.length > 0) {
+        await db.PersonalInvoiceLine.bulkCreate(
+          lines.map((l) => ({ ...l, personalInvoiceId: id })),
+          { transaction: t },
+        );
+      }
+      await invoice.update({
+        contactId: data.contactId || invoice.contactId,
+        companyId: data.companyId !== undefined ? (company?.id || null) : invoice.companyId,
+        currency: data.currency || invoice.currency,
+        issuedAt,
+        dueAt,
+        total,
+        notes: data.notes !== undefined ? data.notes : invoice.notes,
+        allowPartialPayment: data.allowPartialPayment !== undefined
+          ? await this.resolveAllowPartialPayment(orgId, data.allowPartialPayment)
+          : invoice.allowPartialPayment,
+      }, { transaction: t });
+    });
+
+    return this.findById(id, orgId);
+  }
+
   async updateStatus(id, orgId, status) {
     const invoice = await this.findById(id, orgId);
     if (invoice.status === INVOICE_STATUS.VOID) {
@@ -546,6 +563,11 @@ class PersonalInvoiceService {
         err.status = 400;
         throw err;
       }
+      if (method?.kind === 'stripe') {
+        const err = new Error('Stripe is not available for personal invoices.');
+        err.status = 400;
+        throw err;
+      }
 
       const nextCompany = companyId !== undefined
         ? await this._companyById(orgId, companyId, { transaction: t })
@@ -571,28 +593,10 @@ class PersonalInvoiceService {
         updates.companyId = nextCompany?.id || null;
       }
 
-      if (method?.kind !== 'stripe') {
-        updates.stripeInvoiceId = null;
-        updates.stripeHostedUrl = null;
-      }
-
       if (Object.keys(updates).length) await locked.update(updates, { transaction: t });
     });
 
-    const configured = await this.findById(id, orgId);
-    if (configured?.preferredPaymentMethod?.kind === 'stripe' && !configured.stripeHostedUrl) {
-      try {
-        const StripeService = require('./StripeService');
-        await StripeService.startPersonalInvoicePayment(id, orgId, { method: configured.preferredPaymentMethod });
-      } catch (err) {
-        console.warn(
-          `[PersonalInvoiceService] Stripe pay link not ready after configure for ${configured.number}:`,
-          err.message || err,
-        );
-      }
-      return this.findById(id, orgId);
-    }
-    return configured;
+    return this.findById(id, orgId);
   }
 
   async settlementFor(invoiceId, { total = null } = {}) {

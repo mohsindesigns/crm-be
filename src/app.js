@@ -334,7 +334,8 @@ app.schemaReady = (async () => {
     await db.Holiday.ensureSchema();         // new table; public/company holidays
     await db.ShiftSchedule.ensureSchema();   // new table; seasonal shift timings (e.g. Ramadan)
     await db.HrDocument.ensureSchema(); // widens `type` ENUM (cv, cnic_front, cnic_back, ...)
-    await db.Keyword.ensureSchema();    // adds targetLocation
+    await db.KeywordBatch.ensureSchema(); // new table; bulk keyword-import approval queue
+    await db.Keyword.ensureSchema();    // adds targetLocation, batchId, approvalStatus — depends on keyword_batches
     await db.RecurringTaskRule.ensureSchema(); // new table; depends on projects
     await db.Task.ensureSchema();       // adds ruleId/acceptedAt + widens status ENUM w/ `accepted` — depends on recurring_task_rules
     await db.Artifact.ensureSchema();   // adds taskId/taskEventId — depends on tasks

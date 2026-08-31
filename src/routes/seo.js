@@ -70,23 +70,31 @@ router.get('/projects/:projectId/keywords/csv', rbac('projects.read'), async (re
   } catch (e) { next(e); }
 });
 
+// Imported rows land `pending` under a new KeywordBatch — see SeoService.bulkImportKeywords.
+// They don't go live until someone else (or an admin) approves the batch from
+// the Approvals inbox (SeoService.reviewKeywordBatch, via ApprovalService).
 router.post('/projects/:projectId/keywords/import', rbac('projects.act'), upload.single('file'), async (req, res, next) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-    const rows = await SeoService.bulkImportKeywords(req.params.projectId, req.orgId, req.file.buffer, req.user.id);
-    res.status(201).json({ imported: rows.length, rows });
+    const { batch, created } = await SeoService.bulkImportKeywords(
+      req.params.projectId, req.orgId, req.file.buffer, req.user.id, req.file.originalname,
+    );
+    res.status(201).json({ imported: created.length, rows: created, batch });
   } catch (e) { next(e); }
 });
 
+// assignedWriterId/pageName/etc. stay open to any project.act user; a status
+// change is adminOnly-equivalent — see SeoService.updateKeyword's own check
+// (kept there, not here, because this route also carries non-status fields).
 router.patch('/keywords/:id', rbac('projects.act'), async (req, res, next) => {
   try {
-    res.json(await SeoService.updateKeyword(req.params.id, req.body, req.orgId, req.user.id));
+    res.json(await SeoService.updateKeyword(req.params.id, req.body, req.orgId, req.user));
   } catch (e) { next(e); }
 });
 
-// Permanently deletes — not adminOnly: the keyword's own submitter can delete
-// it too while it's still unassigned/unapproved — see SeoService.deleteKeyword.
-router.delete('/keywords/:id', rbac('projects.act'), async (req, res, next) => {
+// Admin-only — same boundary as clear-sheet/bulk-delete/bulk-deactivate below;
+// see SeoService.deleteKeyword.
+router.delete('/keywords/:id', adminOnly, rbac('projects.act'), async (req, res, next) => {
   try {
     const kw = await SeoService.deleteKeyword(req.params.id, req.orgId, req.user);
     res.json({ message: 'Keyword deleted', keyword: kw });
@@ -105,9 +113,9 @@ router.post('/projects/:projectId/keywords/bulk-delete', adminOnly, rbac('projec
   } catch (e) { next(e); }
 });
 
-// Not adminOnly, same as PATCH /keywords/:id { status: 'active' } — reactivating
-// isn't destructive, so it's gated the same way the per-row status dropdown is.
-router.post('/projects/:projectId/keywords/bulk-activate', rbac('projects.act'), async (req, res, next) => {
+// adminOnly, matching bulk-deactivate/bulk-delete/clear-sheet and the per-row
+// status dropdown (SeoService.updateKeyword) — active/inactive is admin-only.
+router.post('/projects/:projectId/keywords/bulk-activate', adminOnly, rbac('projects.act'), async (req, res, next) => {
   try {
     res.json(await SeoService.bulkActivateKeywords(req.params.projectId, req.orgId, req.body?.ids));
   } catch (e) { next(e); }

@@ -58,8 +58,23 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.INTEGER,
       allowNull: true,
     },
+    // Groups the rows created by one bulk sheet upload — see models/KeywordBatch.js.
+    // Null for a manually added keyword (SeoService.createKeyword), which has no
+    // batch and is never gated by approvalStatus below.
     batchId: {
       type: DataTypes.CHAR(36),
+      references: { model: 'keyword_batches', key: 'id' },
+    },
+    // Denormalized off the batch's status purely so every "is this keyword live"
+    // query (pool stats, content-submission eligibility, ranking import) can
+    // filter on the Keyword row itself instead of joining keyword_batches. A
+    // manual add or a keyword whose batch never existed defaults straight to
+    // 'approved'; a bulk import starts 'pending' and SeoService.reviewKeywordBatch
+    // cascades the approve/reject decision onto every row sharing its batchId.
+    approvalStatus: {
+      type: DataTypes.ENUM('pending', 'approved', 'rejected'),
+      allowNull: false,
+      defaultValue: 'approved',
     },
     createdBy: {
       type: DataTypes.CHAR(36),
@@ -102,6 +117,7 @@ module.exports = (sequelize, DataTypes) => {
     Keyword.belongsTo(db.ProjectCycle, { foreignKey: 'cycleId', as: 'cycle' });
     Keyword.belongsTo(db.User, { foreignKey: 'createdBy', as: 'creator' });
     Keyword.belongsTo(db.User, { foreignKey: 'assignedWriterId', as: 'assignedWriter' });
+    Keyword.belongsTo(db.KeywordBatch, { foreignKey: 'batchId', as: 'batch' });
     Keyword.hasMany(db.RankSnapshot, { foreignKey: 'keywordId', as: 'rankings' });
   };
 

@@ -470,6 +470,58 @@ const SOURCES = {
     },
   },
 
+  // ── Bulk keyword-sheet uploads. One row per KeywordBatch, not per keyword —
+  // approving/rejecting decides the whole sheet at once (SeoService.reviewKeywordBatch),
+  // same "not your own" rule as content_submission/blog_task below.
+  keyword_batch: {
+    label: 'Keyword upload',
+    group: 'SEO',
+    canView: (ctx) => ctx.can('projects.read'),
+    build(ctx, status) {
+      const where = {
+        status,
+        [Op.or]: [
+          { submittedBy: ctx.user.id },
+          { projectId: { [Op.in]: ctx.assignedProjectIds } },
+        ],
+      };
+      return {
+        where,
+        include: [
+          {
+            model: db.Project, as: 'project', attributes: ['id', 'name'],
+            where: { orgId: ctx.orgId }, required: true,
+          },
+          userInclude('submitter'), userInclude('reviewer'),
+        ],
+        order: [['createdAt', 'DESC']],
+      };
+    },
+    map(b, ctx) {
+      const count = b.rowCount || 0;
+      return {
+        title: `${count} keyword${count === 1 ? '' : 's'} uploaded`,
+        subtitle: `${b.project?.name || 'Project'}${b.fileName ? ` · ${b.fileName}` : ''}`,
+        detail: b.rejectionReason || null,
+        requester: personFrom(b.submitter),
+        counterparty: personFrom(b.reviewer),
+        counterpartyLabel: 'Reviewed by',
+        submittedAt: b.createdAt,
+        decidedAt: b.reviewedAt || null,
+        href: b.projectId ? `/projects/${b.projectId}?tab=keywords` : null,
+        canAct: ctx.can('projects.act') && b.submittedBy !== ctx.user.id,
+        actionHint: b.submittedBy === ctx.user.id ? 'You cannot approve your own upload.' : null,
+      };
+    },
+    decide(ctx, id, decision, reason) {
+      return SeoService.reviewKeywordBatch(
+        id,
+        { status: decision === 'approve' ? 'approved' : 'rejected', rejectionReason: reason },
+        ctx.orgId, ctx.user,
+      );
+    },
+  },
+
   // ── Quotations/agreements out with a prospect. Read-only here on purpose: the
   // *client* approves these from their tokenized public link, so there is no
   // staff-side decide — only visibility into what is still outstanding.
@@ -571,6 +623,7 @@ const MODEL_FOR = {
   contractor_invoice: db.ContractorInvoice,
   content_submission: db.ContentSubmission,
   blog_task: db.BlogTask,
+  keyword_batch: db.KeywordBatch,
   customer_document: db.CustomerDocument,
   worker_profile: db.Worker,
 };

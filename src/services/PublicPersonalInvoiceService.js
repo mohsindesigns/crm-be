@@ -48,28 +48,11 @@ class PublicPersonalInvoiceService {
     return { total, amountPaid: Math.round(paid * 100) / 100, amountDue: due };
   }
 
-  async _reconcile(invoice) {
-    if (!invoice.stripeInvoiceId) return invoice;
-    if (![...PAYABLE_STATUSES, INVOICE_STATUS.PAYMENT_REVIEW, 'payment_review'].includes(invoice.status)) {
-      return invoice;
-    }
-    try {
-      const StripeService = require('./StripeService');
-      await StripeService.syncPersonalInvoiceFromStripe(invoice.id, invoice.orgId);
-    } catch (err) {
-      console.warn(`[PublicPersonalInvoiceService] Could not reconcile ${invoice.number} with Stripe:`, err.message);
-      return invoice;
-    }
-    return this._findByToken(invoice.publicToken);
-  }
-
   async getByToken(token) {
-    let invoice = await this._findByToken(token);
-    invoice = await this._reconcile(invoice);
+    const invoice = await this._findByToken(token);
     const { total, amountPaid, amountDue } = this._settlement(invoice);
 
     const branding = await db.WhiteLabelConfig.findOne({ where: { orgId: invoice.orgId } });
-    const isStripe = invoice.preferredPaymentMethod?.kind === 'stripe';
     const isPayable = PAYABLE_STATUSES.includes(invoice.status) && amountDue > 0.005;
 
     return {
@@ -86,7 +69,7 @@ class PublicPersonalInvoiceService {
         amountPaid,
         amountDue,
         allowPartialPayment: !!invoice.allowPartialPayment,
-        canPayByCard: isPayable && isStripe,
+        canPayByCard: false,
         canPayPartial: isPayable && !!invoice.allowPartialPayment,
         isPayable,
         paymentLinkUrl: invoice.paymentLinkUrl || null,
@@ -116,44 +99,6 @@ class PublicPersonalInvoiceService {
         email: branding?.emailFrom || null,
       },
     };
-  }
-
-  async startPayment(token, { amount = null } = {}) {
-    const invoice = await this._findByToken(token);
-
-    if (!invoice.allowPartialPayment && amount != null) {
-      const { amountDue } = this._settlement(invoice);
-      if (Number(amount) < amountDue - 0.005) {
-        const err = new Error('Partial payment is not enabled for this invoice.');
-        err.status = 400;
-        throw err;
-      }
-    }
-
-    if (!PAYABLE_STATUSES.includes(invoice.status)) {
-      const err = new Error(
-        invoice.status === INVOICE_STATUS.PAID || invoice.status === 'paid'
-          ? 'This invoice has already been paid in full.'
-          : 'This invoice is not currently awaiting payment.',
-      );
-      err.status = 409;
-      throw err;
-    }
-
-    const method = invoice.preferredPaymentMethod?.kind === 'stripe'
-      ? invoice.preferredPaymentMethod
-      : await db.PaymentMethod.findOne({ where: { orgId: invoice.orgId, kind: 'stripe', isActive: true } });
-    if (!method) {
-      const err = new Error('Card payment is not available for this invoice.');
-      err.status = 400;
-      throw err;
-    }
-
-    const StripeService = require('./StripeService');
-    return StripeService.startPersonalInvoicePayment(invoice.id, invoice.orgId, {
-      method,
-      payAmount: amount ?? null,
-    });
   }
 
   async getPdfBuffer(token) {

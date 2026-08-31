@@ -39,6 +39,7 @@ const modelFiles = [
   'Task',
   'TaskEvent',
   'RecurringTaskRule',
+  'KeywordBatch',
   'Keyword',
   'ContentSubmission',
   'Backlink',
