@@ -43,6 +43,7 @@ const clientRequestsRouter = require('./routes/clientRequests');
 const approvalsRouter = require('./routes/approvals');
 const exportsRouter = require('./routes/exports');
 const publicClientRequestsRouter = require('./routes/publicClientRequests');
+const searchRouter = require('./routes/search');
 const errorHandler = require('./middleware/errorHandler');
 const activityLogger = require('./middleware/activityLogger');
 
@@ -158,6 +159,7 @@ app.use('/api/projects/:projectId/client-requests', clientRequestsRouter);
 app.use('/api/approvals', approvalsRouter);
 app.use('/api/public/client-requests', publicClientRequestsRouter);
 app.use('/api/exports', exportsRouter);
+app.use('/api/search', searchRouter);
 
 // 404
 app.use((req, res) => res.status(404).json({ message: 'Not found.' }));
