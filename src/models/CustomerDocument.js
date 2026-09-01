@@ -211,6 +211,16 @@ module.exports = (sequelize, DataTypes) => {
     stripeHostedUrl: {
       type: DataTypes.TEXT,
     },
+    // Carried onto the invoice(s) InvoiceService.create raises when this document
+    // converts (see CustomerDocumentService#convert) — an explicit per-document
+    // choice that overrides the org-wide default, same as Invoice.allowPartialPayment
+    // on the manual "New Invoice" form. Replaces the old installment-plan flow:
+    // one invoice is always raised for the full amount, and the client can pay it
+    // down in however many chunks they like instead of a pre-split schedule.
+    allowPartialPayment: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
     // Soft delete — see models/softDeletable.js. Deactivated rows drop out of
     // default listings but are never destroyed.
     isActive: isActiveAttribute(DataTypes),

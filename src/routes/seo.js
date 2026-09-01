@@ -172,6 +172,31 @@ router.delete('/projects/:projectId/rankings/:date', adminOnly, rbac('projects.a
   } catch (e) { next(e); }
 });
 
+// ─── Supporting Keyword Rankings ───────────────────────────────────────────────
+// The Monthly Report's Supporting Keywords card — same keywords × report-dates
+// shape as /rankings above, but nested one level under each main keyword.
+router.get('/projects/:projectId/supporting-keywords/rankings', rbac('projects.read'), async (req, res, next) => {
+  try {
+    res.json(await SeoService.listSupportingKeywordRankings(req.params.projectId, req.orgId, {
+      from: req.query.from, to: req.query.to,
+    }));
+  } catch (e) { next(e); }
+});
+
+router.post('/projects/:projectId/supporting-keywords/rankings', rbac('projects.act'), async (req, res, next) => {
+  try {
+    res.status(201).json(await SeoService.recordSupportingKeywordRankings(req.params.projectId, req.orgId, req.body));
+  } catch (e) { next(e); }
+});
+
+// "Show to client" is a display flag, not a status change — open to any
+// project.act user, same as assignedWriterId/pageName on the main keyword.
+router.patch('/supporting-keywords/:id', rbac('projects.act'), async (req, res, next) => {
+  try {
+    res.json(await SeoService.updateSupportingKeyword(req.params.id, req.body, req.orgId));
+  } catch (e) { next(e); }
+});
+
 // ─── Backlinks ────────────────────────────────────────────────────────────────
 router.get('/projects/:projectId/backlinks', rbac('projects.read'), async (req, res, next) => {
   try {

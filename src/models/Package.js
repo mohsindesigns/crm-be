@@ -85,18 +85,6 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.BOOLEAN,
       defaultValue: false,
     },
-    // Installment plan for one-time (non-recurring) package sales: an array of
-    // { type: 'percent'|'amount', value, offsetDays, label } — e.g. 40% due
-    // immediately, 30% in 30 days, 30% in 60 days; or a mix of percentages and
-    // flat amounts. Percent-type rows should sum to 100 (validated where this is
-    // set). Older rows saved before `type`/`value` existed still store
-    // { percent, offsetDays, label } and are read as percent-type — see
-    // ClientService#sellPackage's normalization. When set, selling the package
-    // generates all N invoices upfront instead of the default "no invoice
-    // created automatically" behavior for one-time sales.
-    installmentPlan: {
-      type: DataTypes.JSON,
-    },
   }, {
     tableName: 'packages',
     timestamps: false,

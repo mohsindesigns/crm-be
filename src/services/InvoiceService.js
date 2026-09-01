@@ -827,10 +827,10 @@ class InvoiceService {
    * Whether a new invoice should allow part payment.
    *
    * An explicit value on the request always wins — that's the admin ticking (or
-   * deliberately clearing) the box on the New Invoice form. When nothing is
-   * supplied the org-level default decides, which is the only way the option
-   * reaches invoices no human raises: retainer renewals, package installments
-   * and quotation conversions are all issued by schedulers and services, and
+   * deliberately clearing) the box on the New Invoice form, sell-package form, or
+   * quotation/agreement form. When nothing is supplied the org-level default
+   * decides, which is the only way the option reaches invoices no human raises:
+   * retainer renewals and unattended scheduler passes are issued by services, and
    * before this they were hard-coded to false forever.
    *
    * Never throws — a missing/unreadable settings row just means "off", which is
@@ -845,8 +845,8 @@ class InvoiceService {
   }
 
   // `data.status` lets system callers (RetainerService.autoCreate, RetainerScheduler,
-  // installment-plan generation) issue an already-`sent` invoice — they're
-  // system-generated recurring/installment bills going straight to the client, not
+  // package/document sale billing) issue an already-`sent` invoice — they're
+  // system-generated recurring/one-time bills going straight to the client, not
   // a draft an admin is still preparing. Defaults to DRAFT, preserving today's
   // behavior for the manual "New Invoice" form.
   //

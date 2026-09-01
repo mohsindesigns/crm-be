@@ -42,6 +42,12 @@ module.exports = (sequelize, DataTypes) => {
       allowNull: false,
       defaultValue: false,
     },
+    // Set by duplicateTaxYear — tracks which year a copy was cloned from, purely
+    // for provenance display (e.g. "duplicated from 2024-25"). Never enforced.
+    sourceTaxYearId: {
+      type: DataTypes.CHAR(36),
+      allowNull: true,
+    },
   }, {
     tableName: 'tax_years',
     indexes: [{ fields: ['org_id'] }, { fields: ['org_id', 'is_active'] }],
@@ -50,6 +56,7 @@ module.exports = (sequelize, DataTypes) => {
   TaxYear.associate = (db) => {
     TaxYear.belongsTo(db.Org, { foreignKey: 'orgId', as: 'org' });
     TaxYear.hasMany(db.TaxSlab, { foreignKey: 'taxYearId', as: 'slabs' });
+    TaxYear.belongsTo(db.TaxYear, { foreignKey: 'sourceTaxYearId', as: 'sourceTaxYear' });
   };
 
   TaxYear.ensureSchema = () => ensureColumns(TaxYear);

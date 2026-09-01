@@ -1910,11 +1910,14 @@ async function getWorkerYtdPriorTax(workerId, orgId, taxYearStartDate, beforePer
 async function listTaxYears(orgId, { includeInactive = false } = {}) {
   return TaxYear.findAll({
     where: { orgId, ...(includeInactive ? {} : { isArchived: false }) },
-    include: [{
-      model: TaxSlab,
-      as: 'slabs',
-      ...(includeInactive ? {} : { where: { isActive: true }, required: false }),
-    }],
+    include: [
+      {
+        model: TaxSlab,
+        as: 'slabs',
+        ...(includeInactive ? {} : { where: { isActive: true }, required: false }),
+      },
+      { model: TaxYear, as: 'sourceTaxYear', attributes: ['id', 'label'], required: false },
+    ],
     order: [['startDate', 'DESC']],
   });
 }
@@ -1939,6 +1942,7 @@ async function createTaxYear(orgId, data) {
 async function updateTaxYear(id, orgId, updates) {
   const year = await TaxYear.findOne({ where: { id, orgId } });
   if (!year) throw Object.assign(new Error('Tax year not found'), { status: 404 });
+  assertTaxYearMutable(year, 'its label/dates are');
   const patch = {};
   if (updates.label !== undefined) patch.label = String(updates.label).trim();
   if (updates.startDate !== undefined) patch.startDate = updates.startDate;
@@ -1970,14 +1974,69 @@ async function deleteTaxYear(id, orgId, archived = true) {
   return { message: archived ? 'Tax year archived' : 'Tax year restored', taxYear: year };
 }
 
+// Clones a tax year's dates and label plus every slab (active or not) so a new
+// fiscal year can start from last year's brackets instead of re-entering them.
+async function duplicateTaxYear(id, orgId) {
+  const year = await TaxYear.findOne({
+    where: { id, orgId },
+    include: [{ model: TaxSlab, as: 'slabs' }],
+  });
+  if (!year) throw Object.assign(new Error('Tax year not found'), { status: 404 });
+
+  const copy = await TaxYear.create({
+    orgId,
+    label: `${year.label} (copy)`,
+    startDate: year.startDate,
+    endDate: year.endDate,
+    isActive: false,
+    sourceTaxYearId: year.id,
+  });
+
+  const slabs = year.slabs || [];
+  if (slabs.length) {
+    await TaxSlab.bulkCreate(slabs.map((s) => ({
+      taxYearId: copy.id,
+      minAmount: s.minAmount,
+      maxAmount: s.maxAmount,
+      ratePercent: s.ratePercent,
+      fixedAmount: s.fixedAmount,
+      sortOrder: s.sortOrder,
+      isActive: s.isActive,
+    })));
+  }
+
+  return TaxYear.findByPk(copy.id, {
+    include: [
+      { model: TaxSlab, as: 'slabs' },
+      { model: TaxYear, as: 'sourceTaxYear', attributes: ['id', 'label'], required: false },
+    ],
+  });
+}
+
 async function assertTaxYearAccess(taxYearId, orgId) {
   const year = await TaxYear.findOne({ where: { id: taxYearId, orgId } });
   if (!year) throw Object.assign(new Error('Tax year not found'), { status: 404 });
   return year;
 }
 
+// Once a tax year is the active one, payroll is live-calculating against it —
+// editing its label/dates or slabs out from under a running payroll cycle
+// would silently change already-processed math. Everything unlocks again once
+// a different year is activated (this one is no longer live), but stays
+// locked while active — including duplicates, which are only ever created
+// inactive so they're editable up until the moment they're activated.
+function assertTaxYearMutable(year, whatIsLocked = 'it') {
+  if (year.isActive) {
+    throw Object.assign(
+      new Error(`This tax year is active — ${whatIsLocked} locked. Activate another year first, or edit a different (inactive) tax year.`),
+      { status: 409 },
+    );
+  }
+}
+
 async function createTaxSlab(taxYearId, orgId, data) {
-  await assertTaxYearAccess(taxYearId, orgId);
+  const year = await assertTaxYearAccess(taxYearId, orgId);
+  assertTaxYearMutable(year, 'its slabs are');
   const minAmount = parseFloat(data.minAmount);
   if (Number.isNaN(minAmount) || minAmount < 0) {
     throw Object.assign(new Error('minAmount must be a non-negative number.'), { status: 400 });
@@ -2003,9 +2062,10 @@ async function createTaxSlab(taxYearId, orgId, data) {
 async function updateTaxSlab(id, orgId, updates) {
   const slab = await TaxSlab.findOne({
     where: { id },
-    include: [{ model: TaxYear, as: 'taxYear', where: { orgId }, attributes: ['id'] }],
+    include: [{ model: TaxYear, as: 'taxYear', where: { orgId }, attributes: ['id', 'isActive'] }],
   });
   if (!slab) throw Object.assign(new Error('Tax slab not found'), { status: 404 });
+  assertTaxYearMutable(slab.taxYear, 'its slabs are');
   const patch = {};
   if (updates.minAmount !== undefined) patch.minAmount = parseFloat(updates.minAmount);
   if (updates.maxAmount !== undefined) {
@@ -2024,9 +2084,10 @@ async function updateTaxSlab(id, orgId, updates) {
 async function deleteTaxSlab(id, orgId, active = false) {
   const slab = await TaxSlab.findOne({
     where: { id },
-    include: [{ model: TaxYear, as: 'taxYear', where: { orgId }, attributes: ['id'] }],
+    include: [{ model: TaxYear, as: 'taxYear', where: { orgId }, attributes: ['id', 'isActive'] }],
   });
   if (!slab) throw Object.assign(new Error('Tax slab not found'), { status: 404 });
+  assertTaxYearMutable(slab.taxYear, 'its slabs are');
   await slab.update({ isActive: active });
   return { message: active ? 'Tax slab set to Active' : 'Tax slab set to Inactive', slab };
 }
@@ -3195,7 +3256,7 @@ module.exports = {
   listLeaveRequests, createLeaveRequest, createEmployeeLeaveRequest, getEmployeeLeaveBalance, reviewLeave,
   getOrCreatePayrollSettings, updatePayrollSettings,
   getSalaryBeneficiaries, setSalaryBeneficiaries,
-  listTaxYears, createTaxYear, updateTaxYear, activateTaxYear, deleteTaxYear,
+  listTaxYears, createTaxYear, updateTaxYear, activateTaxYear, deleteTaxYear, duplicateTaxYear,
   createTaxSlab, updateTaxSlab, deleteTaxSlab, getActiveTaxSlabs,
   listPayrollRuns, createPayrollRun, updatePayrollRun, deletePayrollRun, advancePayrollStatus,
   revertPayrollRun, calculatePayrollItems, getPayrollItems, upsertPayrollItem,

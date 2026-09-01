@@ -144,6 +144,10 @@ router.post('/tax-years/:id/activate', rbac('hr.manage'), async (req, res, next)
   try { res.json(await HrService.activateTaxYear(req.params.id, req.orgId)); } catch (e) { next(e); }
 });
 
+router.post('/tax-years/:id/duplicate', rbac('hr.manage'), async (req, res, next) => {
+  try { res.status(201).json(await HrService.duplicateTaxYear(req.params.id, req.orgId)); } catch (e) { next(e); }
+});
+
 // Archives, never destroys — see services/SoftDeleteService.js.
 router.delete('/tax-years/:id', adminOnly, rbac('hr.manage'), async (req, res, next) => {
   try { res.json(await HrService.deleteTaxYear(req.params.id, req.orgId, true)); } catch (e) { next(e); }

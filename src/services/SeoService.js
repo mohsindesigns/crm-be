@@ -1,6 +1,6 @@
 const xlsx = require('xlsx');
 const { Op } = require('sequelize');
-const { Keyword, KeywordBatch, Backlink, ContentSubmission, BlogTask, RankSnapshot, Project, Client, WhiteLabelConfig, Task, Artifact, User, Role, Stage, ProjectAssignment } = require('../models');
+const { Keyword, KeywordBatch, SupportingKeyword, SupportingKeywordRanking, Backlink, ContentSubmission, BlogTask, RankSnapshot, Project, Client, WhiteLabelConfig, Task, Artifact, User, Role, Stage, ProjectAssignment } = require('../models');
 const {
   createPdfBuffer, drawTable, drawFooter, drawReportFooter, drawStatCards, drawPill, BRAND_COLOR,
 } = require('./PdfService');
@@ -466,30 +466,11 @@ async function updateKeyword(id, updates, orgId, actor) {
   return kw;
 }
 
-async function keywordHasApprovedContent(keywordId, projectId) {
-  const rows = await ContentSubmission.findAll({
-    where: { projectId },
-    attributes: ['keywordIds', 'status', 'pageName', 'submittedBy', 'createdAt', 'revisionNumber'],
-    order: [['createdAt', 'DESC'], ['revisionNumber', 'DESC']],
-  });
-  // Latest submission per page+writer only — a reopen that flipped/left a
-  // rejected revise must not leave an older Approved still locking the keyword.
-  const seen = new Set();
-  for (const cs of rows) {
-    if (cs.status === 'superseded') continue;
-    const key = `${cs.pageName || ''}::${cs.submittedBy || ''}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    if (cs.status === 'approved' && (cs.keywordIds || []).includes(keywordId)) return true;
-  }
-  return false;
-}
-
-// A keyword is locked from deletion once it's handed to a writer — not just
-// once its content is approved. Assigning a writer means work may already be
-// underway (or a task already exists for it); pulling the keyword out from
-// under that mid-flight, before anything's even been submitted, would orphan
-// their work. Only unassigned keywords stay freely deletable.
+// A keyword is "locked" once it's handed to a writer or its content is
+// approved — used to protect the non-destructive bulk deactivate actions
+// (clearKeywords, bulkDeactivateKeywords) from pulling work out from under a
+// writer mid-flight. Deletion itself is admin-only and, being permanent and
+// deliberate, is not subject to this lock — an admin can delete any keyword.
 async function lockedKeywordIdSet(projectId) {
   const [assigned, submissions] = await Promise.all([
     Keyword.findAll({ where: { projectId, assignedWriterId: { [Op.ne]: null } }, attributes: ['id'] }),
@@ -535,12 +516,6 @@ async function deleteKeyword(id, orgId, actor) {
   if (!isManager) {
     throw Object.assign(new Error('Only an administrator can delete a keyword.'), { status: 403 });
   }
-  if (kw.assignedWriterId) {
-    throw Object.assign(new Error('This keyword is assigned to a content writer and cannot be deleted.'), { status: 400 });
-  }
-  if (await keywordHasApprovedContent(kw.id, kw.projectId)) {
-    throw Object.assign(new Error('This keyword has approved content and cannot be deleted.'), { status: 400 });
-  }
   await RankSnapshot.destroy({ where: { keywordId: kw.id } });
   await kw.destroy();
   return kw;
@@ -568,7 +543,6 @@ async function bulkDeleteKeywords(projectId, orgId, ids) {
     throw Object.assign(new Error('You can change at most 200 keywords at a time.'), { status: 400 });
   }
 
-  const protectedIds = await lockedKeywordIdSet(projectId);
   const rows = await Keyword.findAll({
     where: { id: idList, projectId },
     attributes: ['id'],
@@ -580,10 +554,6 @@ async function bulkDeleteKeywords(projectId, orgId, ids) {
   for (const id of idList) {
     if (!found.has(id)) {
       skipped.push({ id, reason: 'not_found' });
-      continue;
-    }
-    if (protectedIds.has(id)) {
-      skipped.push({ id, reason: 'assigned_or_approved' });
       continue;
     }
     deleted.push(id);
@@ -806,6 +776,174 @@ async function deleteRankingDate(projectId, orgId, date) {
   if (!day) throw Object.assign(new Error('A report date is required.'), { status: 400 });
   const deleted = await RankSnapshot.destroy({ where: { projectId, date: day } });
   return { date: day, deleted };
+}
+
+// ─── Supporting Keyword Rankings ───────────────────────────────────────────────
+//
+// Keyword.secondaryKeywords is a single free-text field (comma/line separated
+// phrases) — fine for display, but there's nowhere to hang a per-phrase rank
+// position or a "show this one to the client" flag. SupportingKeyword gives
+// each phrase a stable row for that; this section keeps those rows in sync
+// with the text and records/reads rankings against them, mirroring the main
+// listRankings/recordRankings/RankSnapshot pattern above.
+
+function parseSupportingKeywordPhrases(raw) {
+  if (!raw) return [];
+  return String(raw).split(/[\n\r,;]+/).map((s) => s.trim()).filter(Boolean);
+}
+
+// Additive only: a phrase dropped from the text leaves its row (and any
+// recorded rankings) exactly where it is rather than deleting it. Existing
+// rows are matched by normalized text so re-saving the same phrase — or a
+// bulk import re-writing the same keyword — never creates a duplicate.
+async function syncSupportingKeywords(keyword) {
+  const phrases = parseSupportingKeywordPhrases(keyword.secondaryKeywords);
+  if (!phrases.length) return;
+  const existing = await SupportingKeyword.findAll({ where: { keywordId: keyword.id } });
+  const byNorm = new Set(existing.map((sk) => normName(sk.text)));
+  let sortOrder = existing.reduce((max, sk) => Math.max(max, sk.sortOrder ?? -1), -1) + 1;
+  for (const phrase of phrases) {
+    const key = normName(phrase);
+    if (byNorm.has(key)) continue;
+    byNorm.add(key);
+    await SupportingKeyword.create({
+      projectId: keyword.projectId,
+      keywordId: keyword.id,
+      text: phrase,
+      sortOrder: sortOrder++,
+    });
+  }
+}
+
+/**
+ * The Monthly Report's Supporting Keywords card: every active/approved main
+ * keyword down the side, its supporting phrases nested underneath, each with
+ * its own position-by-date grid — same dates/movement shape as listRankings.
+ */
+async function listSupportingKeywordRankings(projectId, orgId, { from, to } = {}) {
+  await assertProjectAccess(projectId, orgId);
+
+  const mainKeywords = await Keyword.findAll({
+    where: { projectId, status: 'active', approvalStatus: 'approved' },
+    attributes: ['id', 'projectId', 'primaryKeyword', 'secondaryKeywords'],
+    order: SHEET_ORDER,
+  });
+
+  // Self-healing: picks up phrases added/edited on the keyword since the last
+  // sync, so this never needs a one-time backfill for keywords that predate
+  // the feature.
+  for (const kw of mainKeywords) await syncSupportingKeywords(kw);
+
+  const keywordIds = mainKeywords.map((k) => k.id);
+  const supporting = keywordIds.length
+    ? await SupportingKeyword.findAll({
+        where: { keywordId: keywordIds },
+        order: [['sortOrder', 'ASC'], ['createdAt', 'ASC']],
+      })
+    : [];
+
+  const supportingIds = supporting.map((s) => s.id);
+  const where = { supportingKeywordId: supportingIds };
+  if (from && to) where.date = { [Op.between]: [String(from).slice(0, 10), String(to).slice(0, 10)] };
+  else if (from) where.date = { [Op.gte]: String(from).slice(0, 10) };
+  else if (to) where.date = { [Op.lte]: String(to).slice(0, 10) };
+
+  const snapshots = supportingIds.length
+    ? await SupportingKeywordRanking.findAll({ where, order: [['date', 'ASC']] })
+    : [];
+
+  const dates = [...new Set(snapshots.map((s) => String(s.date).slice(0, 10)))].sort();
+  const latest = dates[dates.length - 1] || null;
+  const previous = dates[dates.length - 2] || null;
+
+  const positionsById = new Map();
+  for (const s of snapshots) {
+    if (!positionsById.has(s.supportingKeywordId)) positionsById.set(s.supportingKeywordId, {});
+    positionsById.get(s.supportingKeywordId)[String(s.date).slice(0, 10)] = s.position;
+  }
+
+  const supportingByKeyword = new Map();
+  for (const sk of supporting) {
+    if (!supportingByKeyword.has(sk.keywordId)) supportingByKeyword.set(sk.keywordId, []);
+    const positions = positionsById.get(sk.id) || {};
+    const latestPos = latest != null ? (positions[latest] ?? null) : null;
+    const prevPos = previous != null ? (positions[previous] ?? null) : null;
+    supportingByKeyword.get(sk.keywordId).push({
+      id: sk.id,
+      text: sk.text,
+      showToClient: sk.showToClient,
+      positions,
+      latestPosition: latestPos,
+      previousPosition: prevPos,
+      change: latestPos != null && prevPos != null ? prevPos - latestPos : null,
+    });
+  }
+
+  const rows = mainKeywords.map((k) => ({
+    keywordId: k.id,
+    primaryKeyword: k.primaryKeyword,
+    supportingKeywords: supportingByKeyword.get(k.id) || [],
+  }));
+
+  return { dates, rows, latestDate: latest, previousDate: previous };
+}
+
+/**
+ * Records one report date's positions for supporting keywords —
+ * { date, entries: [{ supportingKeywordId, position }] }, same semantics as
+ * recordRankings (null/blank position = "checked, not ranking").
+ */
+async function recordSupportingKeywordRankings(projectId, orgId, { date, entries }) {
+  await assertProjectAccess(projectId, orgId);
+
+  const day = toDateOnlyString(date) || todayDateOnly();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+    throw Object.assign(new Error('A valid report date (YYYY-MM-DD) is required.'), { status: 400 });
+  }
+  const list = Array.isArray(entries) ? entries : [];
+  if (!list.length) {
+    throw Object.assign(new Error('No rankings provided.'), { status: 400 });
+  }
+
+  const valid = new Set(
+    (await SupportingKeyword.findAll({ where: { projectId }, attributes: ['id'] })).map((sk) => sk.id)
+  );
+
+  let saved = 0;
+  for (const entry of list) {
+    if (!valid.has(entry.supportingKeywordId)) continue;
+    const raw = entry.position;
+    const position = raw === '' || raw == null ? null : parseInt(raw, 10);
+    if (position != null && (Number.isNaN(position) || position < 0)) {
+      throw Object.assign(
+        new Error(`Position must be a positive number (got "${raw}").`), { status: 400 }
+      );
+    }
+    const where = { projectId, supportingKeywordId: entry.supportingKeywordId, date: day, searchEngine: 'google' };
+    const existing = await SupportingKeywordRanking.findOne({ where });
+    if (existing) await existing.update({ position });
+    else {
+      await SupportingKeywordRanking.create({
+        orgId, projectId, supportingKeywordId: entry.supportingKeywordId, date: day, position, searchEngine: 'google',
+      });
+    }
+    saved += 1;
+  }
+  return { date: day, saved };
+}
+
+/** Toggles the "show to client" flag — the only field a strategist edits directly on a supporting keyword row. */
+async function updateSupportingKeyword(id, updates, orgId) {
+  const sk = await SupportingKeyword.findOne({
+    where: { id },
+    include: [{ model: Project, as: 'project', where: { orgId }, attributes: [] }],
+  });
+  if (!sk) throw Object.assign(new Error('Supporting keyword not found'), { status: 404 });
+  if (!Object.prototype.hasOwnProperty.call(updates, 'showToClient')) {
+    throw Object.assign(new Error('Nothing to update.'), { status: 400 });
+  }
+  await sk.update({ showToClient: !!updates.showToClient });
+  return sk;
 }
 
 /**
@@ -2513,6 +2651,7 @@ async function generateBacklinkReportBuffer(projectId, orgId, letterheadFields) 
 module.exports = {
   listKeywords, createKeyword, bulkImportKeywords, reviewKeywordBatch, updateKeyword, deleteKeyword, clearKeywords, bulkDeleteKeywords, bulkActivateKeywords, bulkDeactivateKeywords,
   addRankSnapshot, listRankings, recordRankings, deleteRankingDate, bulkImportRankings,
+  listSupportingKeywordRankings, recordSupportingKeywordRankings, updateSupportingKeyword,
   listBacklinks, createBacklink, updateBacklink, deleteBacklink, clearBacklinks, bulkDeleteBacklinks, bulkDeactivateBacklinks, bulkImportBacklinks, bulkUpdateBacklinkStatus,
   listContent, createContent, reviewContent, deleteContent, bulkDeleteContent, syncApprovedContentTasks,
   listBlogTasks, createBlogTask, updateBlogTask,

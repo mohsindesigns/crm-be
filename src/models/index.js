@@ -41,6 +41,8 @@ const modelFiles = [
   'RecurringTaskRule',
   'KeywordBatch',
   'Keyword',
+  'SupportingKeyword',
+  'SupportingKeywordRanking',
   'ContentSubmission',
   'Backlink',
   'BlogTask',

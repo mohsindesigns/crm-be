@@ -443,6 +443,7 @@ class CustomerDocumentService {
       lineItems: (isCompare || isMenu) ? null : (Array.isArray(data.lineItems) && data.lineItems.length ? data.lineItems : null),
       validUntil,
       scopeTerms: data.scopeTerms ? sanitizeDocumentHtml(data.scopeTerms) : null,
+      allowPartialPayment: !!data.allowPartialPayment,
       status: 'draft',
       createdBy: userId,
     });
@@ -541,6 +542,7 @@ class CustomerDocumentService {
       scopeTerms: data.scopeTerms !== undefined
         ? (data.scopeTerms ? sanitizeDocumentHtml(data.scopeTerms) : null)
         : document.scopeTerms,
+      allowPartialPayment: data.allowPartialPayment !== undefined ? !!data.allowPartialPayment : document.allowPartialPayment,
     });
 
     return document;
@@ -1084,6 +1086,7 @@ class CustomerDocumentService {
             dueAt: today,
             notes: firstBillingLine ? invoiceNote : null,
             lines: [{ description: item.lineDescription, qty: 1, unitPrice: item.chargedPrice }],
+            allowPartialPayment: document.allowPartialPayment,
             skipIfZero: true,
             mergeWithOpenInvoice: true,
           });

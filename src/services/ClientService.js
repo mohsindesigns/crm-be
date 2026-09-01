@@ -465,12 +465,6 @@ class ClientService {
     // discount at all has nothing to expire back to.
     const discountCycles = discountType ? (parseInt(data.discountCycles, 10) || null) : null;
     const currency = pkg.currency || client.defaultCurrency;
-    // An installment plan set on this specific sale overrides whatever plan is
-    // baked into the package template — different clients buying the same
-    // package can still agree to different payment schedules.
-    const installmentPlan = Array.isArray(data.installmentPlan) && data.installmentPlan.length
-      ? data.installmentPlan
-      : pkg.installmentPlan;
     // Prefer an explicit start date; otherwise use the server's local calendar day
     // (not UTC) so early-morning PKT sales don't land on "yesterday".
     const startDate = (data.startDate && String(data.startDate).slice(0, 10)) || (() => {
@@ -503,7 +497,7 @@ class ClientService {
 
       const projects = [];
       // Hosting-style packages: skip the workflow/project spawn entirely, still
-      // bill normally below (see the isRecurring/installment blocks after commit).
+      // bill normally below (see the isRecurring/one-time blocks after commit).
       for (const svc of pkg.skipProjectCreation ? [] : services) {
         if (!svc.serviceTypeKey) continue;
 
@@ -566,12 +560,13 @@ class ClientService {
     //
     // Recurring package (or spawned recurring workflow) → retainer + first invoice now;
     // later cycles via RetainerScheduler on nextInvoiceDate.
-    // One-time + installmentPlan → one invoice per installment (due today = sent;
-    // future due dates = draft until the scheduler issues them on the due date).
-    // One-time with no plan → single invoice for the full sold price (due on start).
+    // One-time → a single invoice for the full sold price (due on start). Partial
+    // payment (client paying that one invoice down in however many chunks they
+    // like) is an Invoice-level flag (`allowPartialPayment`, see the sell form),
+    // not a pre-split schedule of separate invoices.
     const isRecurring = !!(pkg.isRecurring || projects.some((p) => p.isRecurring));
     let retainerCreated = false;
-    let installmentInvoices = [];
+    let saleInvoices = [];
     let billingError = null;
     const today = (() => {
       const d = new Date();
@@ -610,71 +605,11 @@ class ClientService {
         console.error('[ClientService] Failed to auto-create retainer for package sale:', err.stack || err.message);
         billingError = `The package was sold, but the retainer/invoice could not be created: ${err.message}`;
       }
-    } else if (Array.isArray(installmentPlan) && installmentPlan.length > 0) {
-      try {
-        // Prefer an explicit dueAt (calendar date from the sell form). Fall back to
-        // offsetDays for package-template plans that still store relative days.
-        const startMs = new Date(`${startDate}T12:00:00`).getTime();
-        const plan = installmentPlan;
-        for (let i = 0; i < plan.length; i++) {
-          const installment = plan[i];
-          // `type`/`value` is the current shape; older rows (and template rows
-          // saved before this existed) only have `percent` — treat those as
-          // percent-type for backward compatibility.
-          const isAmount = installment.type === 'amount';
-          const rawValue = installment.value !== undefined && installment.value !== null && installment.value !== ''
-            ? installment.value
-            : (isAmount ? installment.amount : installment.percent);
-          const value = Number(rawValue) || 0;
-          if (value <= 0) continue;
-          let dueAt = null;
-          if (installment.dueAt && /^\d{4}-\d{2}-\d{2}/.test(String(installment.dueAt))) {
-            dueAt = String(installment.dueAt).slice(0, 10);
-          } else {
-            const offsetDays = Number(installment.offsetDays) || 0;
-            const d = new Date(startMs);
-            d.setDate(d.getDate() + offsetDays);
-            const pad = (n) => String(n).padStart(2, '0');
-            dueAt = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-          }
-          const amount = isAmount
-            ? Math.round(value * 100) / 100
-            : Math.round(soldPrice * (value / 100) * 100) / 100;
-          // A free package produces zero-value installments — nothing to bill, so
-          // skip them rather than issuing $0.00 invoices the client can't pay.
-          if (!(amount > 0)) continue;
-          // Issue immediately when the installment is already due; otherwise keep as
-          // draft until RetainerScheduler promotes it on the due date.
-          const status = dueAt <= today ? 'sent' : 'draft';
-          const inv = await InvoiceService.create(orgId, {
-            clientId,
-            clientPackageId: clientPackage.id,
-            currency,
-            status,
-            issuedAt: status === 'sent' ? today : dueAt,
-            dueAt,
-            notes: `Installment ${i + 1} of ${plan.length} — package: ${pkg.name}`,
-            lines: [{
-              description: installment.label || `Installment ${i + 1} of ${plan.length} — ${pkg.name}`,
-              qty: 1,
-              unitPrice: amount,
-            }],
-            // Same due date + client → one invoice with a line per package installment.
-            mergeWithOpenInvoice: true,
-          });
-          if (inv) installmentInvoices.push(inv);
-        }
-        // Silence on a free package is correct, not an error — only flag a plan
-        // that was actually worth something but produced nothing.
-        if (installmentInvoices.length === 0 && soldPrice > 0) {
-          billingError = 'Installment plan had no valid amounts — no invoices were created.';
-        }
-      } catch (err) {
-        console.error('[ClientService] Failed to generate installment invoices for package sale:', err.stack || err.message);
-        billingError = `The package was sold, but installment invoices could not be generated: ${err.message}`;
-      }
     } else if (soldPrice > 0) {
       // Plain one-time sale: always create the invoice so billing isn't left manual.
+      // `allowPartialPayment` (from the sell form, defaulting like any other manual
+      // invoice to the org-wide default when omitted) is what lets the client pay
+      // this down in however many chunks they like instead of the full balance at once.
       try {
         const inv = await InvoiceService.create(orgId, {
           clientId,
@@ -685,10 +620,11 @@ class ClientService {
           dueAt: startDate,
           notes: `Package sale: ${pkg.name}`,
           lines: [{ description: pkg.name, qty: 1, unitPrice: soldPrice }],
+          allowPartialPayment: data.allowPartialPayment,
           // Same client buying several packages → one invoice, multiple line items.
           mergeWithOpenInvoice: true,
         });
-        installmentInvoices.push(inv);
+        saleInvoices.push(inv);
       } catch (err) {
         console.error('[ClientService] Failed to create invoice for one-time package sale:', err.stack || err.message);
         billingError = `The package was sold, but the invoice could not be created: ${err.message}`;
@@ -715,8 +651,8 @@ class ClientService {
       projects,
       isRecurring,
       retainerCreated,
-      installmentInvoices,
-      invoicesCreated: installmentInvoices.length,
+      saleInvoices,
+      invoicesCreated: saleInvoices.length,
       billingError,
     };
   }
@@ -776,12 +712,12 @@ class ClientService {
           discountType: entry.discountType,
           discountValue: entry.discountValue,
           discountCycles: entry.discountCycles,
-          installmentPlan: entry.installmentPlan,
           // Shared across the sale — this is what makes the line items land on
           // one invoice rather than several, and every spawned project carry
           // the same delivery target/notes from the sale.
           startDate: data.startDate,
           deliveryDate: data.deliveryDate,
+          allowPartialPayment: data.allowPartialPayment,
           // Each package in the order can carry its own scope note; falls back to
           // the sale-wide description when a given entry doesn't set one.
           description: entry.description || data.description,
@@ -808,7 +744,7 @@ class ClientService {
       projects: sold.flatMap((s) => s.projects || []),
       clientPackages: sold.map((s) => s.clientPackage),
       retainersCreated: sold.filter((s) => s.retainerCreated).length,
-      installmentInvoices: sold.flatMap((s) => s.installmentInvoices || []),
+      saleInvoices: sold.flatMap((s) => s.saleInvoices || []),
       failed,
       billingError: billingErrors.length ? billingErrors.join(' · ') : null,
     };
