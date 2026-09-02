@@ -74,6 +74,14 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.JSON,
       defaultValue: [],
     },
+    // When true, calculatePayrollItems skips income-tax withholding entirely
+    // for this worker every month (e.g. below the tax threshold, or already
+    // taxed elsewhere) — see HrService#calculatePayrollItems. Does not affect
+    // Basic/Medical/component earnings, only the tax deduction line.
+    taxExempt: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
     currency: {
       type: DataTypes.STRING(10),
       defaultValue: 'PKR',

@@ -2,6 +2,7 @@ const { createPdfBuffer, fetchImageBuffer } = require('./PdfService');
 const { letterheadForOrg } = require('./letterhead');
 const { drawSalarySlip } = require('./SalarySlipPdf');
 const { formatPeriod } = require('../utils/formatPeriod');
+const { getTaxYearForPeriod } = require('./HrService');
 const { PayrollItem, Worker, PayrollRun, User, WhiteLabelConfig, Company } = require('../models');
 
 /**
@@ -122,12 +123,18 @@ async function generateSlipBuffer(payrollItemId, orgId) {
   const additions = item.additions || {};
   const deductions = item.deductions || {};
 
-  const [brandConfig, letterhead, hrCompany] = await Promise.all([
+  const [brandConfig, letterhead, hrCompany, taxYear] = await Promise.all([
     WhiteLabelConfig.findOne({ where: { orgId } }),
     // 'hr' — a payslip is an HR document, so it must carry the HR entity and
     // NOT the commercial letterhead note (see letterheadForOrg).
     letterheadForOrg(orgId, 'hr'),
     Company.primaryFor(orgId, 'hr').catch(() => null),
+    // The tax year that actually COVERS this run's period — same resolution
+    // HrService#calculatePayrollItems used to withhold the tax in the first
+    // place (by date range, not just whichever year is flagged isActive), so
+    // a back-dated/reprinted slip always shows the fiscal year it was really
+    // taxed against, not today's active year.
+    item.run?.period ? getTaxYearForPeriod(orgId, item.run.period) : null,
   ]);
 
   const earnings = toRows(additions, EARNING_LABELS, EARNING_ORDER);
@@ -190,6 +197,22 @@ async function generateSlipBuffer(payrollItemId, orgId) {
     grossEarnings,
     totalDeductions,
     netSalary,
+
+    // Explains the single "Income Tax" deduction row: the cumulative-YTD
+    // method (utils/payrollCalc.js#computeCumulativeTax) withholds this
+    // month's tax off an annualized projection, not off this month's salary
+    // in isolation, so the flat rupee figure alone is not auditable without
+    // the fiscal-year window and the YTD numbers it was computed from.
+    taxBreakdown: item.taxAmount > 0 ? {
+      taxYearLabel: taxYear?.label || null,
+      taxYearStart: fmtDate(taxYear?.startDate),
+      taxYearEnd: fmtDate(taxYear?.endDate),
+      monthlyTaxable: Number(item.monthlyTaxable) || 0,
+      taxableYTD: Number(item.taxableYTD) || 0,
+      projectedAnnualTaxable: Number(item.projectedAnnualTaxable) || 0,
+      annualTaxProjected: Number(item.annualTaxProjected) || 0,
+      taxThisMonth: Number(item.taxAmount) || 0,
+    } : null,
 
     daysInMonth,
     daysPresent: item.presentDays || 0,

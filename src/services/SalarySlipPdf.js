@@ -173,6 +173,38 @@ function drawSalarySlip(doc, d) {
   doc.save().moveTo(midX, colTop).lineTo(midX, totalY + totalH).lineWidth(0.7).strokeColor(LINE).stroke().restore();
   y = totalY + totalH;
 
+  // ── Tax details — explains the single "Income Tax" deduction line above.
+  // Withholding is an annualized cumulative-YTD figure (Section 7 of the
+  // payroll tax spec), not a tax on this month's salary alone, so it's only
+  // auditable alongside the fiscal tax-year window and the YTD numbers it
+  // was derived from. That window comes from the TaxYear record that
+  // actually covered this pay period, never a hardcoded Jan–Dec assumption.
+  if (d.taxBreakdown) {
+    const tb = d.taxBreakdown;
+    const boxH = 44;
+    doc.rect(left, y, width, boxH).fill(BAND2);
+    rule(y, left, width, LINE);
+
+    const yearRange = tb.taxYearStart && tb.taxYearEnd ? `${tb.taxYearStart} – ${tb.taxYearEnd}` : '—';
+    const heading = tb.taxYearLabel ? `TAX DETAILS — Tax Year ${tb.taxYearLabel} (${yearRange})` : `TAX DETAILS — ${yearRange}`;
+    text(heading, PAD, y + 6, { size: 7.5, bold: true, color: MUTED, characterSpacing: 0.6 });
+
+    const fields = [
+      ['Taxable This Month', money(tb.monthlyTaxable)],
+      ['Taxable Year-to-Date', money(tb.taxableYTD)],
+      ['Projected Annual Taxable', money(tb.projectedAnnualTaxable)],
+      ['Projected Annual Tax', money(tb.annualTaxProjected)],
+    ];
+    const fCellW = inner / fields.length;
+    fields.forEach(([label, val], i) => {
+      const fx = PAD + fCellW * i;
+      text(label, fx, y + 19, { size: 7, color: MUTED });
+      text(val, fx, y + 30, { size: 8.5, bold: true });
+    });
+
+    y += boxH;
+  }
+
   // ── Attendance strip — five evenly spaced figures ─────────────────────────
   rule(y);
   const attH = 46;

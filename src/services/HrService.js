@@ -67,6 +67,7 @@ function normalizeWorkerUpdates(updates) {
   // '' means "Default" in the Timing Policy picker — coerce to null rather
   // than writing an empty string into the CHAR(36) column.
   if ('shiftScheduleId' in clean && !clean.shiftScheduleId) clean.shiftScheduleId = null;
+  if ('taxExempt' in clean) clean.taxExempt = !!clean.taxExempt;
   // Drop incomplete/garbage rows (blank name, non-numeric or zero amount)
   // before they ever reach the DB — calculatePayrollItems would silently
   // skip them anyway (see payrollCalc#computeSalaryComponents), so this just
@@ -2603,7 +2604,7 @@ async function calculatePayrollItems(runId, orgId, { workingDaysPerMonth } = {})
     // Never a flat ×12 (that's the over-taxed-mid-year-joiner bug, Section 8).
     let taxThisMonth = 0;
     let taxCalc = null;
-    if (taxYear && taxSlabs.length) {
+    if (taxYear && taxSlabs.length && !worker.taxExempt) {
       const { taxableYTDPrior, taxDeductedYTDPrior } = await getWorkerYtdPriorTax(
         worker.id, orgId, String(taxYear.startDate), run.period,
       );
@@ -3348,7 +3349,7 @@ module.exports = {
   getOrCreatePayrollSettings, updatePayrollSettings,
   getSalaryBeneficiaries, setSalaryBeneficiaries,
   listTaxYears, createTaxYear, updateTaxYear, activateTaxYear, deleteTaxYear, duplicateTaxYear,
-  createTaxSlab, updateTaxSlab, deleteTaxSlab, getActiveTaxSlabs,
+  createTaxSlab, updateTaxSlab, deleteTaxSlab, getActiveTaxSlabs, getTaxYearForPeriod,
   listPayrollRuns, createPayrollRun, updatePayrollRun, deletePayrollRun, advancePayrollStatus,
   revertPayrollRun, calculatePayrollItems, getPayrollItems, upsertPayrollItem,
   employeeReviewPayroll, rectifyPayrollItem, getDisbursementData,
