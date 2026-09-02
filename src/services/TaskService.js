@@ -302,6 +302,94 @@ class TaskService {
     return this.getById(task.id, orgId, task.projectId);
   }
 
+  // Fixes a mis-assigned task: creator/admin can hand it to someone else, but only
+  // up to the point the current assignee has actually accepted it (or, for a
+  // technical-audit task, up to admin approval) — once accepted, work may already
+  // be underway, so that path goes through a normal reassignment-after-the-fact
+  // conversation instead of silently swapping the owner under them.
+  async reassign(taskId, orgId, newAssigneeId, actor) {
+    const task = await db.Task.findOne({
+      where: { id: taskId, orgId },
+      include: [{ model: db.Project, as: 'project', attributes: ['id', 'name'] }],
+    });
+    if (!task) {
+      const err = new Error('Task not found.');
+      err.status = 404;
+      throw err;
+    }
+
+    const isAdmin = ['super_admin', 'admin'].includes(actor?.role?.key)
+      || !!actor?.role?.permissions?.['projects.manage'];
+    if (!isAdmin && task.createdBy !== actor.id) {
+      const err = new Error('Only the task creator or an admin can reassign this task.');
+      err.status = 403;
+      throw err;
+    }
+
+    const pendingAudit = task.requiresTechnicalAudit && task.auditStatus === 'pending';
+    if (!pendingAudit && (task.status !== TASK_STATUS.TODO || task.acceptedAt)) {
+      const err = new Error('This task has already been accepted and can no longer be reassigned.');
+      err.status = 400;
+      throw err;
+    }
+
+    const newAssignee = await db.User.findOne({ where: { id: newAssigneeId, orgId } });
+    if (!newAssignee) {
+      const err = new Error('Assignee not found.');
+      err.status = 404;
+      throw err;
+    }
+
+    const oldAssigneeId = pendingAudit ? task.pendingAssigneeId : task.assigneeId;
+    if (oldAssigneeId === newAssigneeId) {
+      return this.getById(task.id, orgId, task.projectId);
+    }
+
+    const update = pendingAudit ? { pendingAssigneeId: newAssigneeId } : { assigneeId: newAssigneeId };
+    // Mirror #create's assigner-becomes-reviewer default when the task had no
+    // explicit reviewer yet and is no longer being handed to its own creator.
+    if (!pendingAudit && !task.reviewerId && newAssigneeId !== task.createdBy) {
+      update.reviewerId = task.createdBy;
+    }
+
+    await db.sequelize.transaction(async (t) => {
+      await db.TaskEvent.create({
+        id: uuidv4(),
+        taskId: task.id,
+        fromStatus: task.status,
+        toStatus: task.status,
+        actorUserId: actor.id,
+        reasonCategory: 'reassigned',
+        note: `Reassigned to ${newAssignee.name}.`,
+      }, { transaction: t });
+      await task.update(update, { transaction: t });
+    });
+
+    if (!pendingAudit) {
+      (async () => {
+        if (newAssignee.email) {
+          EmailService.sendTaskAssigned(newAssignee.email, newAssignee.name, task.title, task.project?.name, task.dueAt);
+        }
+        NotificationService.notify(newAssignee.id, orgId, {
+          type: 'task_assigned',
+          title: `Task reassigned to you: "${task.title}"`,
+          body: `You've been assigned a task on ${task.project?.name}. Status: To do.`,
+          ...taskNotifyRef(task.projectId, task.id),
+        });
+        if (oldAssigneeId && oldAssigneeId !== actor.id) {
+          NotificationService.notify(oldAssigneeId, orgId, {
+            type: 'task_update',
+            title: `Task reassigned: "${task.title}"`,
+            body: `This task was reassigned to ${newAssignee.name}.`,
+            ...taskNotifyRef(task.projectId, task.id),
+          });
+        }
+      })().catch(() => {});
+    }
+
+    return this.getById(task.id, orgId, task.projectId);
+  }
+
   async transition(taskId, orgId, newStatus, actor, reasonCategory, note, attachmentIds) {
     const task = await db.Task.findOne({
       where: { id: taskId, orgId },

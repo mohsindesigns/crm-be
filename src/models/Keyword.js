@@ -80,6 +80,30 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.CHAR(36),
       references: { model: 'users', key: 'id' },
     },
+    // On-page SEO "implemented" tracking for an approved keyword's target page —
+    // independent of approvalStatus above, and mirrors ContentSubmission's second,
+    // separate review loop that only ever applies to already-`approved` rows.
+    implementationStatus: {
+      type: DataTypes.ENUM('not_started', 'submitted', 'approved', 'rejected'),
+      defaultValue: 'not_started',
+    },
+    implementedBy: {
+      type: DataTypes.CHAR(36),
+      references: { model: 'users', key: 'id' },
+    },
+    implementedAt: {
+      type: DataTypes.DATE,
+    },
+    implementationRejectionReason: {
+      type: DataTypes.TEXT,
+    },
+    implementationReviewedBy: {
+      type: DataTypes.CHAR(36),
+      references: { model: 'users', key: 'id' },
+    },
+    implementationReviewedAt: {
+      type: DataTypes.DATE,
+    },
   }, {
     tableName: 'keywords',
     indexes: [{ fields: ['project_id'] }, { fields: ['cycle_id'] }],
@@ -119,6 +143,8 @@ module.exports = (sequelize, DataTypes) => {
     Keyword.belongsTo(db.User, { foreignKey: 'assignedWriterId', as: 'assignedWriter' });
     Keyword.belongsTo(db.KeywordBatch, { foreignKey: 'batchId', as: 'batch' });
     Keyword.hasMany(db.RankSnapshot, { foreignKey: 'keywordId', as: 'rankings' });
+    Keyword.belongsTo(db.User, { foreignKey: 'implementedBy', as: 'implementer' });
+    Keyword.belongsTo(db.User, { foreignKey: 'implementationReviewedBy', as: 'implementationReviewer' });
   };
 
   return Keyword;

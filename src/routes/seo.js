@@ -341,6 +341,36 @@ router.patch('/content/:id/implementation-review', rbac('projects.act'), async (
   } catch (e) { next(e); }
 });
 
+router.patch('/projects/:projectId/blogs/bulk-implement', rbac('projects.act'), async (req, res, next) => {
+  try {
+    res.json(await SeoService.bulkMarkBlogImplemented(req.params.projectId, req.orgId, req.body?.ids, req.user));
+  } catch (e) { next(e); }
+});
+
+router.patch('/blogs/:id/implementation-review', rbac('projects.act'), async (req, res, next) => {
+  try {
+    res.json(await SeoService.reviewBlogImplementation(req.params.id, {
+      status: req.body.status,
+      rejectionReason: req.body.rejectionReason,
+    }, req.orgId, req.user));
+  } catch (e) { next(e); }
+});
+
+router.patch('/projects/:projectId/keywords/bulk-implement', rbac('projects.act'), async (req, res, next) => {
+  try {
+    res.json(await SeoService.bulkMarkKeywordImplemented(req.params.projectId, req.orgId, req.body?.ids, req.user));
+  } catch (e) { next(e); }
+});
+
+router.patch('/keywords/:id/implementation-review', rbac('projects.act'), async (req, res, next) => {
+  try {
+    res.json(await SeoService.reviewKeywordImplementation(req.params.id, {
+      status: req.body.status,
+      rejectionReason: req.body.rejectionReason,
+    }, req.orgId, req.user));
+  } catch (e) { next(e); }
+});
+
 // ─── Blog Tasks ───────────────────────────────────────────────────────────────
 router.get('/projects/:projectId/blogs', rbac('projects.read'), async (req, res, next) => {
   try {

@@ -266,6 +266,8 @@ async function listKeywords(projectId, orgId, { includeInactive = false } = {}) 
       // Pending/rejected rows still show on the sheet (transparency) — the
       // frontend reads approvalStatus for the badge and this for the reason.
       { association: 'batch', attributes: ['id', 'status', 'fileName', 'rejectionReason'] },
+      { association: 'implementer', attributes: ['id', 'name'] },
+      { association: 'implementationReviewer', attributes: ['id', 'name'] },
     ],
     order: SHEET_ORDER,
   });
@@ -1756,6 +1758,205 @@ async function reviewImplementation(id, updates, orgId, reviewer) {
   return cs;
 }
 
+// Same "mark implemented" step as bulkMarkImplemented, for approved Blog Tasks
+// (an approved blog post gets published/implemented on the live site).
+async function bulkMarkBlogImplemented(projectId, orgId, ids, actor) {
+  await assertProjectAccess(projectId, orgId);
+  const idList = Array.isArray(ids) ? [...new Set(ids.filter(Boolean))] : [];
+  if (!idList.length) {
+    throw Object.assign(new Error('No blog IDs provided.'), { status: 400 });
+  }
+
+  const isManager = ['super_admin', 'admin'].includes(actor?.role?.key)
+    || !!actor?.role?.permissions?.['projects.manage'];
+  if (!isManager) {
+    const assignment = await ProjectAssignment.findOne({
+      where: {
+        projectId,
+        userId: actor.id,
+        roleSlot: { [Op.in]: ['project_strategist', 'project_manager'] },
+      },
+    });
+    if (!assignment) {
+      throw Object.assign(new Error('Only the assigned Project Strategist, Project Manager, or an admin can mark blogs implemented.'), { status: 403 });
+    }
+  }
+
+  const rows = await BlogTask.findAll({
+    where: {
+      id: idList,
+      projectId,
+      status: 'approved',
+      implementationStatus: { [Op.in]: [null, 'not_started', 'rejected'] },
+    },
+  });
+  for (const row of rows) {
+    await row.update({
+      implementationStatus: 'submitted',
+      implementedBy: actor.id,
+      implementedAt: new Date(),
+      implementationRejectionReason: null,
+    });
+  }
+  return { marked: rows.length, skipped: idList.length - rows.length };
+}
+
+async function reviewBlogImplementation(id, updates, orgId, reviewer) {
+  const bt = await BlogTask.findOne({
+    where: { id },
+    include: [{ model: Project, as: 'project', where: { orgId } }],
+  });
+  if (!bt) throw Object.assign(new Error('Blog task not found.'), { status: 404 });
+  if (bt.implementationStatus !== 'submitted') {
+    throw Object.assign(new Error('Only blogs awaiting implementation review can be approved or rejected.'), { status: 400 });
+  }
+
+  const status = updates.status;
+  if (!['approved', 'rejected'].includes(status)) {
+    throw Object.assign(new Error('Status must be "approved" or "rejected".'), { status: 400 });
+  }
+  const reason = String(updates.rejectionReason || '').trim();
+  if (status === 'rejected' && !reason) {
+    throw Object.assign(new Error('A rejection reason is required.'), { status: 400 });
+  }
+
+  const isManager = ['super_admin', 'admin'].includes(reviewer?.role?.key)
+    || !!reviewer?.role?.permissions?.['projects.manage'];
+  if (bt.implementedBy && bt.implementedBy === reviewer?.id && !isManager) {
+    throw Object.assign(new Error('You cannot review your own implementation.'), { status: 400 });
+  }
+  if (!isManager) {
+    const assignment = await ProjectAssignment.findOne({
+      where: { projectId: bt.projectId, userId: reviewer.id, roleSlot: 'project_manager' },
+    });
+    if (!assignment) {
+      throw Object.assign(new Error('Only an admin or the assigned Project Manager can review implementation.'), { status: 403 });
+    }
+  }
+
+  await bt.update({
+    implementationStatus: status,
+    implementationRejectionReason: status === 'rejected' ? reason : null,
+    implementationReviewedBy: reviewer.id,
+    implementationReviewedAt: new Date(),
+  });
+
+  if (bt.implementedBy) {
+    NotificationService.notify(bt.implementedBy, orgId, {
+      type: status === 'approved' ? 'implementation_approved' : 'implementation_rejected',
+      title: status === 'approved'
+        ? `Implementation approved: "${bt.title}"`
+        : `Implementation rejected: "${bt.title}"`,
+      body: reason || null,
+      refTable: 'projects',
+      refId: bt.projectId,
+    });
+  }
+
+  return bt;
+}
+
+// Same "mark implemented" step as bulkMarkImplemented, for approved keywords —
+// here it means the on-page SEO work (title/meta/H1 etc.) for that keyword's
+// target page has been done on the live site.
+async function bulkMarkKeywordImplemented(projectId, orgId, ids, actor) {
+  await assertProjectAccess(projectId, orgId);
+  const idList = Array.isArray(ids) ? [...new Set(ids.filter(Boolean))] : [];
+  if (!idList.length) {
+    throw Object.assign(new Error('No keyword IDs provided.'), { status: 400 });
+  }
+
+  const isManager = ['super_admin', 'admin'].includes(actor?.role?.key)
+    || !!actor?.role?.permissions?.['projects.manage'];
+  if (!isManager) {
+    const assignment = await ProjectAssignment.findOne({
+      where: {
+        projectId,
+        userId: actor.id,
+        roleSlot: { [Op.in]: ['project_strategist', 'project_manager'] },
+      },
+    });
+    if (!assignment) {
+      throw Object.assign(new Error('Only the assigned Project Strategist, Project Manager, or an admin can mark keywords implemented.'), { status: 403 });
+    }
+  }
+
+  const rows = await Keyword.findAll({
+    where: {
+      id: idList,
+      projectId,
+      status: 'active',
+      approvalStatus: 'approved',
+      implementationStatus: { [Op.in]: [null, 'not_started', 'rejected'] },
+    },
+  });
+  for (const row of rows) {
+    await row.update({
+      implementationStatus: 'submitted',
+      implementedBy: actor.id,
+      implementedAt: new Date(),
+      implementationRejectionReason: null,
+    });
+  }
+  return { marked: rows.length, skipped: idList.length - rows.length };
+}
+
+async function reviewKeywordImplementation(id, updates, orgId, reviewer) {
+  const kw = await Keyword.findOne({
+    where: { id },
+    include: [{ model: Project, as: 'project', where: { orgId } }],
+  });
+  if (!kw) throw Object.assign(new Error('Keyword not found.'), { status: 404 });
+  if (kw.implementationStatus !== 'submitted') {
+    throw Object.assign(new Error('Only keywords awaiting implementation review can be approved or rejected.'), { status: 400 });
+  }
+
+  const status = updates.status;
+  if (!['approved', 'rejected'].includes(status)) {
+    throw Object.assign(new Error('Status must be "approved" or "rejected".'), { status: 400 });
+  }
+  const reason = String(updates.rejectionReason || '').trim();
+  if (status === 'rejected' && !reason) {
+    throw Object.assign(new Error('A rejection reason is required.'), { status: 400 });
+  }
+
+  const isManager = ['super_admin', 'admin'].includes(reviewer?.role?.key)
+    || !!reviewer?.role?.permissions?.['projects.manage'];
+  if (kw.implementedBy && kw.implementedBy === reviewer?.id && !isManager) {
+    throw Object.assign(new Error('You cannot review your own implementation.'), { status: 400 });
+  }
+  if (!isManager) {
+    const assignment = await ProjectAssignment.findOne({
+      where: { projectId: kw.projectId, userId: reviewer.id, roleSlot: 'project_manager' },
+    });
+    if (!assignment) {
+      throw Object.assign(new Error('Only an admin or the assigned Project Manager can review implementation.'), { status: 403 });
+    }
+  }
+
+  await kw.update({
+    implementationStatus: status,
+    implementationRejectionReason: status === 'rejected' ? reason : null,
+    implementationReviewedBy: reviewer.id,
+    implementationReviewedAt: new Date(),
+  });
+
+  if (kw.implementedBy) {
+    const label = kw.pageName || kw.primaryKeyword;
+    NotificationService.notify(kw.implementedBy, orgId, {
+      type: status === 'approved' ? 'implementation_approved' : 'implementation_rejected',
+      title: status === 'approved'
+        ? `Implementation approved: "${label}"`
+        : `Implementation rejected: "${label}"`,
+      body: reason || null,
+      refTable: 'projects',
+      refId: kw.projectId,
+    });
+  }
+
+  return kw;
+}
+
 async function deleteContent(id, orgId, actor) {
   const cs = await ContentSubmission.findOne({
     where: { id },
@@ -1890,6 +2091,8 @@ async function listBlogSheet(projectId, orgId, { includeInactive = false } = {})
       { association: 'assignedWriter', attributes: ['id', 'name'] },
       { association: 'assignedDesigner', attributes: ['id', 'name'] },
       { association: 'reviewer', attributes: ['id', 'name'] },
+      { association: 'implementer', attributes: ['id', 'name'] },
+      { association: 'implementationReviewer', attributes: ['id', 'name'] },
     ],
     order: SHEET_ORDER,
   });
@@ -2768,6 +2971,8 @@ module.exports = {
   listBacklinks, createBacklink, updateBacklink, deleteBacklink, clearBacklinks, bulkDeleteBacklinks, bulkDeactivateBacklinks, bulkImportBacklinks, bulkUpdateBacklinkStatus,
   listContent, createContent, reviewContent, deleteContent, bulkDeleteContent, syncApprovedContentTasks,
   bulkMarkImplemented, reviewImplementation,
+  bulkMarkBlogImplemented, reviewBlogImplementation,
+  bulkMarkKeywordImplemented, reviewKeywordImplementation,
   listBlogTasks, createBlogTask, updateBlogTask,
   listBlogSheet, createBlogSheetRow, submitBlogDeliverable, bulkImportBlogTasks,
   reviewBlogTask, deleteBlogTask, deactivateBlogTask, setBlogTaskActive, bulkDeleteBlogTasks, bulkDeactivateBlogTasks, bulkActivateBlogTasks, syncApprovedBlogTasks,

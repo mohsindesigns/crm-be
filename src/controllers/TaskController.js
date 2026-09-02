@@ -56,6 +56,13 @@ class TaskController {
     } catch (err) { next(err); }
   }
 
+  async reassign(req, res, next) {
+    try {
+      const task = await TaskService.reassign(req.params.taskId, req.orgId, req.body.assigneeId, req.user);
+      res.json(task);
+    } catch (err) { next(err); }
+  }
+
   async approveAudit(req, res, next) {
     try {
       const isAdmin = req.user?.role?.key === 'super_admin' || req.user?.role?.key === 'admin';

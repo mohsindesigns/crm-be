@@ -119,6 +119,30 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.CHAR(36),
       references: { model: 'users', key: 'id' },
     },
+    // Post-approval "implemented on the live page" tracking, independent of the
+    // approve/reject lifecycle above — mirrors ContentSubmission's second, separate
+    // review loop that only ever applies to already-`approved` rows.
+    implementationStatus: {
+      type: DataTypes.ENUM('not_started', 'submitted', 'approved', 'rejected'),
+      defaultValue: 'not_started',
+    },
+    implementedBy: {
+      type: DataTypes.CHAR(36),
+      references: { model: 'users', key: 'id' },
+    },
+    implementedAt: {
+      type: DataTypes.DATE,
+    },
+    implementationRejectionReason: {
+      type: DataTypes.TEXT,
+    },
+    implementationReviewedBy: {
+      type: DataTypes.CHAR(36),
+      references: { model: 'users', key: 'id' },
+    },
+    implementationReviewedAt: {
+      type: DataTypes.DATE,
+    },
     // Soft delete — see models/softDeletable.js. Deactivated rows drop out of
     // default listings but are never destroyed.
     isActive: isActiveAttribute(DataTypes),
@@ -142,6 +166,8 @@ module.exports = (sequelize, DataTypes) => {
     BlogTask.belongsTo(db.User, { foreignKey: 'assignedWriterId', as: 'assignedWriter' });
     BlogTask.belongsTo(db.User, { foreignKey: 'assignedDesignerId', as: 'assignedDesigner' });
     BlogTask.belongsTo(db.User, { foreignKey: 'reviewedBy', as: 'reviewer' });
+    BlogTask.belongsTo(db.User, { foreignKey: 'implementedBy', as: 'implementer' });
+    BlogTask.belongsTo(db.User, { foreignKey: 'implementationReviewedBy', as: 'implementationReviewer' });
   };
 
   return BlogTask;
