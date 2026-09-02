@@ -337,9 +337,13 @@ function letterheadBlocks(resolved) {
     else groups.push({ legalName: entity.legalName, items: [entity] });
   }
 
+  // `showHeading` is set by `filterLetterheadFields`; absent (undefined) for
+  // every other caller, which keeps the heading on by default.
+  const showHeading = resolved.showHeading !== false;
+
   groups.forEach((group, gi) => {
     if (gi > 0) out.push({ type: 'gap' });
-    out.push({ type: 'heading', value: group.legalName });
+    if (showHeading) out.push({ type: 'heading', value: group.legalName });
 
     for (const entity of group.items) {
       pushAddress(`${entity.officeLabel}:`, entity.address);
@@ -373,11 +377,9 @@ function letterheadLines(lh) {
 
 /**
  * Field keys a "what company details show on this export" checkbox list lets
- * a caller toggle per document. The legal name (heading) isn't included —
- * dropping it would leave the block with no identity at all, so it always
- * prints.
+ * a caller toggle per document.
  */
-const LETTERHEAD_FIELD_KEYS = ['logo', 'address', 'tax', 'email', 'phone', 'website', 'note'];
+const LETTERHEAD_FIELD_KEYS = ['logo', 'name', 'address', 'tax', 'email', 'phone', 'website', 'note'];
 
 /**
  * Normalizes a checkbox selection from a request into what a caller stores or
@@ -399,6 +401,11 @@ function normalizeLetterheadFields(input) {
  * `loadLetterheadLogo` treats a blank URL as "fall back to the bundled default
  * wordmark", not "draw nothing", so clearing `logoUrl` here would print a logo
  * instead of suppressing it.
+ *
+ * The legal-name heading is handled via `showHeading` (consumed by
+ * `letterheadBlocks`) rather than by blanking `legalName` on each entity —
+ * `legalName` is also used to group entities sharing a name, so clearing it
+ * here would break that grouping.
  */
 function filterLetterheadFields(resolved, fields) {
   if (!resolved || fields == null) return resolved;
@@ -411,7 +418,9 @@ function filterLetterheadFields(resolved, fields) {
     phone: enabled.has('phone') ? e.phone : '',
     website: enabled.has('website') ? e.website : '',
   }));
-  return { ...resolved, entities, note: enabled.has('note') ? resolved.note : '' };
+  return {
+    ...resolved, entities, note: enabled.has('note') ? resolved.note : '', showHeading: enabled.has('name'),
+  };
 }
 
 /** Whether the logo should be drawn at all — see `filterLetterheadFields`. */

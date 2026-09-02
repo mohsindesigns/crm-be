@@ -625,11 +625,16 @@ async function createHoliday(orgId, data) {
   if (endDate && endDate < date) {
     throw Object.assign(new Error('The holiday end date cannot be before its start date.'), { status: 400 });
   }
-  return Holiday.create({
+  const holiday = await Holiday.create({
     orgId, name, date, endDate,
     isRecurring: !!data.isRecurring,
     note: data.note || null,
   });
+  // Reflect it onto the attendance log immediately — fixes any already-marked
+  // absence (e.g. a retroactive holiday, or one declared after the overnight
+  // sweep ran) rather than leaving it to the next payroll run or manual sweep.
+  await ensureHolidayMarks(orgId, date, endDate || date);
+  return holiday;
 }
 
 async function updateHoliday(id, orgId, updates) {
@@ -644,6 +649,7 @@ async function updateHoliday(id, orgId, updates) {
     throw Object.assign(new Error('The holiday end date cannot be before its start date.'), { status: 400 });
   }
   await holiday.update(patch);
+  if (holiday.isActive) await ensureHolidayMarks(orgId, holiday.date, holiday.endDate || holiday.date);
   return holiday;
 }
 
@@ -652,25 +658,95 @@ async function deleteHoliday(id, orgId, active = false) {
   const holiday = await Holiday.findOne({ where: { id, orgId } });
   if (!holiday) throw Object.assign(new Error('Holiday not found.'), { status: 404 });
   await holiday.update({ isActive: active });
+  if (active) await ensureHolidayMarks(orgId, holiday.date, holiday.endDate || holiday.date);
   return holiday;
 }
 
-/** The holiday covering `dateStr`, or null. Matches month/day for recurring rows. */
-async function findHolidayFor(orgId, dateStr) {
+/** Does holiday `h` cover `dateStr`? Matches month/day for recurring rows. */
+function holidayCoversDate(h, dateStr) {
   const day = String(dateStr).slice(0, 10);
+  const start = String(h.date).slice(0, 10);
+  const end = h.endDate ? String(h.endDate).slice(0, 10) : start;
+  if (h.isRecurring) {
+    // Fixed-date annual holiday — compare month/day across the whole span.
+    const mmdd = day.slice(5);
+    return mmdd >= start.slice(5) && mmdd <= end.slice(5);
+  }
+  return day >= start && day <= end;
+}
+
+/** The holiday covering `dateStr`, or null. */
+async function findHolidayFor(orgId, dateStr) {
   const holidays = await Holiday.findAll({ where: { orgId, isActive: true } });
-  const mmdd = day.slice(5);
-  return holidays.find((h) => {
-    const start = String(h.date).slice(0, 10);
-    const end = h.endDate ? String(h.endDate).slice(0, 10) : start;
-    if (h.isRecurring) {
-      // Fixed-date annual holiday — compare month/day across the whole span.
-      const startMd = start.slice(5);
-      const endMd = end.slice(5);
-      return mmdd >= startMd && mmdd <= endMd;
+  return holidays.find((h) => holidayCoversDate(h, dateStr)) || null;
+}
+
+/**
+ * Reflects declared holidays onto the attendance log for a date range (capped
+ * at today, same as ensureWeekendMarks): fills missing rows with `holiday`,
+ * and — unlike ensureWeekendMarks — repairs any `absent` row with no check-in,
+ * since that's exactly what happens when the overnight sweep marked someone
+ * absent before HR declared the day a holiday (or declared it retroactively).
+ * Never touches present/half_day/leave rows, or any row with an actual check-in.
+ */
+async function ensureHolidayMarks(orgId, rangeStart, rangeEnd) {
+  const workerIds = await attendanceWorkerIds(orgId);
+  if (!workerIds.length) return;
+
+  const { date: todayKarachi } = nowInKarachi();
+  const start = String(rangeStart).slice(0, 10);
+  const cappedEnd = String(rangeEnd).slice(0, 10) > todayKarachi ? todayKarachi : String(rangeEnd).slice(0, 10);
+  if (start > cappedEnd) return;
+
+  const holidays = await Holiday.findAll({ where: { orgId, isActive: true } });
+  if (!holidays.length) return;
+
+  const holidayByDate = new Map();
+  for (let t = new Date(`${start}T00:00:00Z`).getTime(); t <= new Date(`${cappedEnd}T00:00:00Z`).getTime(); t += 86400000) {
+    const date = new Date(t).toISOString().slice(0, 10);
+    const match = holidays.find((h) => holidayCoversDate(h, date));
+    if (match) holidayByDate.set(date, match);
+  }
+  if (!holidayByDate.size) return;
+
+  const holidayDates = [...holidayByDate.keys()];
+  const existing = await Attendance.findAll({
+    where: { orgId, workerId: { [Op.in]: workerIds }, date: { [Op.in]: holidayDates } },
+  });
+  const byKey = new Map(existing.map((a) => [`${a.workerId}|${a.date}`, a]));
+
+  const toCreate = [];
+  const repairs = [];
+  for (const workerId of workerIds) {
+    for (const date of holidayDates) {
+      const row = byKey.get(`${workerId}|${date}`);
+      if (row) {
+        if (row.status === 'absent' && !row.checkIn) repairs.push(row);
+        continue;
+      }
+      toCreate.push({
+        orgId, workerId, date, status: 'holiday',
+        note: holidayByDate.get(date).name, source: 'system',
+      });
     }
-    return day >= start && day <= end;
-  }) || null;
+  }
+
+  await Promise.all(repairs.map((row) => row.update({
+    status: 'holiday',
+    note: holidayByDate.get(row.date).name,
+    source: 'system',
+    checkOut: null, hours: null, isLate: false, lateMinutes: null, markedBy: null,
+  })));
+
+  // Insert only missing rows beyond the repairs above — never overwrite present/leave.
+  if (toCreate.length) {
+    try {
+      await Attendance.bulkCreate(toCreate, { ignoreDuplicates: true });
+    } catch (err) {
+      // Unique (worker_id, date) races shouldn't fail the attendance view.
+      console.error('[HrService] ensureHolidayMarks skipped:', err.message);
+    }
+  }
 }
 
 // ─── Shift schedules (seasonal timings, e.g. Ramadan) ─────────────────────────
@@ -881,6 +957,8 @@ async function getAttendanceSummary(orgId, month) {
   // Stamp configured weekly offs onto the log so Sat/Sun show as Weekend without
   // HR having to bulk-mark every weekend by hand.
   await ensureWeekendMarks(orgId, monthStart, monthEnd);
+  // Same for declared holidays — also repairs any already-marked `absent` row.
+  await ensureHolidayMarks(orgId, monthStart, monthEnd);
 
   const workers = await Worker.findAll({
     where: { orgId, status: 'active' },
@@ -2379,6 +2457,7 @@ async function calculatePayrollItems(runId, orgId, { workingDaysPerMonth } = {})
   const monthEnd = `${year}-${month}-${String(daysInMonth).padStart(2, '0')}`;
   const weekendDays = normalizeWeekendDays(settings.weekendDays);
   await ensureWeekendMarks(orgId, monthStart, monthEnd);
+  await ensureHolidayMarks(orgId, monthStart, monthEnd);
 
   // Active this month, or inactive but employed for at least part of it — a
   // mid-month leaver's final prorated payroll is still owed even after HR

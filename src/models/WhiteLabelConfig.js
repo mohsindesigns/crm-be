@@ -79,7 +79,7 @@ module.exports = (sequelize, DataTypes) => {
     letterheadNote: {
       type: DataTypes.TEXT,
     },
-    // Comma-separated subset of ['logo','address','tax','email','phone','website','note']
+    // Comma-separated subset of ['logo','name','address','tax','email','phone','website','note']
     // — which company details print by default on the Keywords/Backlinks SEO
     // report letterhead (Admin → Branding). A report request can still override
     // this with its own `?fields=` query, but nothing in the app does anymore;

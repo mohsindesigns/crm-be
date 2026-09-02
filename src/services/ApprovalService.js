@@ -147,9 +147,18 @@ const SOURCES = {
       // owed to a specific reviewer (or the assignee/creator tracking their own
       // submission), not to "whichever admin happens to open this page" — with
       // multiple admins, each should only see reviews actually theirs to make.
+      //
+      // `blog_post` tasks are excluded: BlogSheetSync mirrors every blog_post
+      // Task onto a BlogTask sheet row (see services/BlogSheetSync.js) and
+      // that row is what the `blog_task` source below surfaces, reviewed from
+      // the project's Blogs tab. Without this exclusion the exact same
+      // submission shows up twice in this inbox — once as a generic "Task
+      // review" row and once as a "Blog submission" row — for what is, to the
+      // reviewer, a single decision either surface can make.
       const where = {
         orgId: ctx.orgId,
         status: statusWhere,
+        type: { [Op.ne]: 'blog_post' },
         [Op.or]: [
           { assigneeId: ctx.user.id },
           { reviewerId: ctx.user.id },
@@ -509,8 +518,11 @@ const SOURCES = {
         submittedAt: b.createdAt,
         decidedAt: b.reviewedAt || null,
         href: b.projectId ? `/projects/${b.projectId}?tab=keywords` : null,
-        canAct: ctx.can('projects.act') && b.submittedBy !== ctx.user.id,
-        actionHint: b.submittedBy === ctx.user.id ? 'You cannot approve your own upload.' : null,
+        // Self-approval is normally blocked (maker-checker), but an admin who
+        // uploads a sheet is still the only one able to sign off on it — so
+        // admins/super_admins are exempt from their own "not your own" rule.
+        canAct: ctx.can('projects.act') && (b.submittedBy !== ctx.user.id || ctx.isAdmin),
+        actionHint: (b.submittedBy === ctx.user.id && !ctx.isAdmin) ? 'You cannot approve your own upload.' : null,
       };
     },
     decide(ctx, id, decision, reason) {

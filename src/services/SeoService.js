@@ -384,7 +384,11 @@ async function reviewKeywordBatch(batchId, updates, orgId, reviewer) {
   if (batch.status !== 'pending') {
     throw Object.assign(new Error('This upload has already been decided.'), { status: 400 });
   }
-  if (batch.submittedBy === reviewer?.id) {
+  // Self-approval is blocked as a maker-checker control — except for
+  // admins/super_admins, who are still the only one able to sign off when
+  // they're also the one who uploaded the sheet.
+  const reviewerIsAdmin = ['super_admin', 'admin'].includes(reviewer?.role?.key);
+  if (batch.submittedBy === reviewer?.id && !reviewerIsAdmin) {
     throw Object.assign(new Error('You cannot approve your own upload.'), { status: 403 });
   }
 
