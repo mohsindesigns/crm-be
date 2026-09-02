@@ -62,6 +62,30 @@ module.exports = (sequelize, DataTypes) => {
     reviewedAt: {
       type: DataTypes.DATE,
     },
+    // Post-approval "implemented on the live page" tracking, independent of the
+    // approve/reject/superseded lifecycle above — a second, separate mini
+    // review loop that only ever applies to already-`approved` rows.
+    implementationStatus: {
+      type: DataTypes.ENUM('not_started', 'submitted', 'approved', 'rejected'),
+      defaultValue: 'not_started',
+    },
+    implementedBy: {
+      type: DataTypes.CHAR(36),
+      references: { model: 'users', key: 'id' },
+    },
+    implementedAt: {
+      type: DataTypes.DATE,
+    },
+    implementationRejectionReason: {
+      type: DataTypes.TEXT,
+    },
+    implementationReviewedBy: {
+      type: DataTypes.CHAR(36),
+      references: { model: 'users', key: 'id' },
+    },
+    implementationReviewedAt: {
+      type: DataTypes.DATE,
+    },
   }, {
     tableName: 'content_submissions',
     updatedAt: false,
@@ -71,11 +95,14 @@ module.exports = (sequelize, DataTypes) => {
     ContentSubmission.belongsTo(db.Project, { foreignKey: 'projectId', as: 'project' });
     ContentSubmission.belongsTo(db.User, { foreignKey: 'submittedBy', as: 'submitter' });
     ContentSubmission.belongsTo(db.User, { foreignKey: 'reviewedBy', as: 'reviewer' });
+    ContentSubmission.belongsTo(db.User, { foreignKey: 'implementedBy', as: 'implementer' });
+    ContentSubmission.belongsTo(db.User, { foreignKey: 'implementationReviewedBy', as: 'implementationReviewer' });
   };
 
   ContentSubmission.ensureSchema = async () => {
     await ensureColumns(ContentSubmission);
     await ensureColumnType(ContentSubmission, 'status');
+    await ensureColumnType(ContentSubmission, 'implementationStatus');
   };
 
   return ContentSubmission;

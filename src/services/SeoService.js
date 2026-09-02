@@ -1373,6 +1373,8 @@ async function listContent(projectId, orgId) {
     include: [
       { association: 'submitter', attributes: ['id', 'name'] },
       { association: 'reviewer', attributes: ['id', 'name'] },
+      { association: 'implementer', attributes: ['id', 'name'] },
+      { association: 'implementationReviewer', attributes: ['id', 'name'] },
     ],
     order: [['createdAt', 'DESC']],
   });
@@ -1644,6 +1646,113 @@ async function reviewContent(id, updates, orgId, reviewer) {
       console.error('[SeoService] Auto-advance on content pool clear failed:', err.message);
     }
   }
+  return cs;
+}
+
+/**
+ * Post-approval "mark implemented" step for Project Strategists (or an
+ * admin/PM). Independent of the approve/reject/superseded lifecycle above —
+ * only ever touches already-`approved` rows, and never advances the project's
+ * own workflow stage. Rows in `rejected` implementation state can be
+ * re-marked, so a bounced batch isn't stuck.
+ */
+async function bulkMarkImplemented(projectId, orgId, ids, actor) {
+  await assertProjectAccess(projectId, orgId);
+  const idList = Array.isArray(ids) ? [...new Set(ids.filter(Boolean))] : [];
+  if (!idList.length) {
+    throw Object.assign(new Error('No content IDs provided.'), { status: 400 });
+  }
+
+  const isManager = ['super_admin', 'admin'].includes(actor?.role?.key)
+    || !!actor?.role?.permissions?.['projects.manage'];
+  if (!isManager) {
+    const assignment = await ProjectAssignment.findOne({
+      where: {
+        projectId,
+        userId: actor.id,
+        roleSlot: { [Op.in]: ['project_strategist', 'project_manager'] },
+      },
+    });
+    if (!assignment) {
+      throw Object.assign(new Error('Only the assigned Project Strategist, Project Manager, or an admin can mark content implemented.'), { status: 403 });
+    }
+  }
+
+  const rows = await ContentSubmission.findAll({
+    where: {
+      id: idList,
+      projectId,
+      status: 'approved',
+      implementationStatus: { [Op.in]: [null, 'not_started', 'rejected'] },
+    },
+  });
+  for (const row of rows) {
+    await row.update({
+      implementationStatus: 'submitted',
+      implementedBy: actor.id,
+      implementedAt: new Date(),
+      implementationRejectionReason: null,
+    });
+  }
+  return { marked: rows.length, skipped: idList.length - rows.length };
+}
+
+// Admin/PM decision on a "marked implemented" batch — this is where the
+// content item's lifecycle ends. No further stage/status exists after this.
+async function reviewImplementation(id, updates, orgId, reviewer) {
+  const cs = await ContentSubmission.findOne({
+    where: { id },
+    include: [{ model: Project, as: 'project', where: { orgId } }],
+  });
+  if (!cs) throw Object.assign(new Error('Content submission not found.'), { status: 404 });
+  if (cs.implementationStatus !== 'submitted') {
+    throw Object.assign(new Error('Only content awaiting implementation review can be approved or rejected.'), { status: 400 });
+  }
+
+  const status = updates.status;
+  if (!['approved', 'rejected'].includes(status)) {
+    throw Object.assign(new Error('Status must be "approved" or "rejected".'), { status: 400 });
+  }
+  const reason = String(updates.rejectionReason || '').trim();
+  if (status === 'rejected' && !reason) {
+    throw Object.assign(new Error('A rejection reason is required.'), { status: 400 });
+  }
+
+  const isManager = ['super_admin', 'admin'].includes(reviewer?.role?.key)
+    || !!reviewer?.role?.permissions?.['projects.manage'];
+  // Mirrors TaskService.transition's self-review block — nobody reviews their
+  // own submission except an admin, who is exempt everywhere else in the app.
+  if (cs.implementedBy && cs.implementedBy === reviewer?.id && !isManager) {
+    throw Object.assign(new Error('You cannot review your own implementation.'), { status: 400 });
+  }
+  if (!isManager) {
+    const assignment = await ProjectAssignment.findOne({
+      where: { projectId: cs.projectId, userId: reviewer.id, roleSlot: 'project_manager' },
+    });
+    if (!assignment) {
+      throw Object.assign(new Error('Only an admin or the assigned Project Manager can review implementation.'), { status: 403 });
+    }
+  }
+
+  await cs.update({
+    implementationStatus: status,
+    implementationRejectionReason: status === 'rejected' ? reason : null,
+    implementationReviewedBy: reviewer.id,
+    implementationReviewedAt: new Date(),
+  });
+
+  if (cs.implementedBy) {
+    NotificationService.notify(cs.implementedBy, orgId, {
+      type: status === 'approved' ? 'implementation_approved' : 'implementation_rejected',
+      title: status === 'approved'
+        ? `Implementation approved: "${cs.pageName}"`
+        : `Implementation rejected: "${cs.pageName}"`,
+      body: reason || null,
+      refTable: 'projects',
+      refId: cs.projectId,
+    });
+  }
+
   return cs;
 }
 
@@ -2658,6 +2767,7 @@ module.exports = {
   listSupportingKeywordRankings, recordSupportingKeywordRankings, updateSupportingKeyword,
   listBacklinks, createBacklink, updateBacklink, deleteBacklink, clearBacklinks, bulkDeleteBacklinks, bulkDeactivateBacklinks, bulkImportBacklinks, bulkUpdateBacklinkStatus,
   listContent, createContent, reviewContent, deleteContent, bulkDeleteContent, syncApprovedContentTasks,
+  bulkMarkImplemented, reviewImplementation,
   listBlogTasks, createBlogTask, updateBlogTask,
   listBlogSheet, createBlogSheetRow, submitBlogDeliverable, bulkImportBlogTasks,
   reviewBlogTask, deleteBlogTask, deactivateBlogTask, setBlogTaskActive, bulkDeleteBlogTasks, bulkDeactivateBlogTasks, bulkActivateBlogTasks, syncApprovedBlogTasks,

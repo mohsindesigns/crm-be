@@ -425,6 +425,61 @@ const SOURCES = {
     },
   },
 
+  // ── Post-approval "marked implemented" review — a second, independent mini
+  // loop on the same ContentSubmission rows above. `status` here maps onto
+  // `implementationStatus`, not `status`.
+  content_implementation: {
+    label: 'Content implementation',
+    group: 'SEO',
+    canView: (ctx) => ctx.can('projects.read'),
+    build(ctx, status) {
+      const implementationStatus = { pending: 'submitted', approved: 'approved', rejected: 'rejected' }[status];
+      const where = { implementationStatus };
+      // Admin (or anyone with projects.manage) reviews org-wide, same as
+      // task_audit above — everyone else only sees their own project queue.
+      if (!ctx.canSeeAllProjects) {
+        where[Op.or] = [
+          { implementedBy: ctx.user.id },
+          { projectId: { [Op.in]: ctx.assignedProjectIds } },
+        ];
+      }
+      return {
+        where,
+        include: [
+          {
+            model: db.Project, as: 'project', attributes: ['id', 'name'],
+            where: { orgId: ctx.orgId }, required: true,
+          },
+          userInclude('implementer'), userInclude('implementationReviewer'),
+        ],
+        order: [['implementedAt', 'DESC']],
+      };
+    },
+    map(c, ctx) {
+      return {
+        title: c.pageName || c.fileName || 'Content implementation',
+        subtitle: c.project?.name || 'Project',
+        detail: c.implementationRejectionReason || null,
+        requester: personFrom(c.implementer),
+        counterparty: personFrom(c.implementationReviewer),
+        counterpartyLabel: 'Reviewed by',
+        submittedAt: c.implementedAt,
+        decidedAt: c.implementationReviewedAt || null,
+        href: c.projectId ? `/projects/${c.projectId}?tab=implementation` : null,
+        fileUrl: c.fileUrl || null,
+        canAct: ctx.can('projects.act') && (ctx.isAdmin || c.implementedBy !== ctx.user.id),
+        actionHint: (!ctx.isAdmin && c.implementedBy === ctx.user.id) ? 'You cannot review your own implementation.' : null,
+      };
+    },
+    decide(ctx, id, decision, reason) {
+      return SeoService.reviewImplementation(
+        id,
+        { status: decision === 'approve' ? 'approved' : 'rejected', rejectionReason: reason },
+        ctx.orgId, ctx.user,
+      );
+    },
+  },
+
   // ── SEO blog deliverables. Same Project-scoped tenancy as content.
   blog_task: {
     label: 'Blog submission',

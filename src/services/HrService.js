@@ -910,6 +910,12 @@ async function listAttendance(orgId, { workerId, month, date, page, limit } = {}
     // or past dates look empty / stuck on "today".
     const day = String(date).slice(0, 10);
     where.date = day;
+    // Repair any row the 3 AM sweep already marked `absent` before this day was
+    // (or became) a declared holiday — same repair getAttendanceSummary does,
+    // but this view wasn't running it, so stale absents never self-healed here.
+    await ensureHolidayMarks(orgId, day, day).catch((err) => {
+      console.error('[HrService] listAttendance holiday backfill skipped:', err.message);
+    });
     // If the shift window for this date has closed, persist absent rows for
     // anyone who never checked in (same rules as the 3 AM cron).
     if (isAbsentSweepDue(day)) {
@@ -920,7 +926,13 @@ async function listAttendance(orgId, { workerId, month, date, page, limit } = {}
   } else if (month) {
     const [year, m] = month.split('-');
     const daysInMonth = new Date(parseInt(year, 10), parseInt(m, 10), 0).getDate();
-    where.date = { [Op.between]: [`${year}-${m}-01`, `${year}-${m}-${String(daysInMonth).padStart(2, '0')}`] };
+    const monthStart = `${year}-${m}-01`;
+    const monthEnd = `${year}-${m}-${String(daysInMonth).padStart(2, '0')}`;
+    where.date = { [Op.between]: [monthStart, monthEnd] };
+    // Same repair — the monthly Attendance Log has the same self-heal gap as Daily Roll Call.
+    await ensureHolidayMarks(orgId, monthStart, monthEnd).catch((err) => {
+      console.error('[HrService] listAttendance holiday backfill skipped:', err.message);
+    });
   }
 
   const pageNum = Math.max(1, parseInt(page, 10) || 1);

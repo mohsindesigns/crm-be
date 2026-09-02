@@ -326,6 +326,21 @@ router.post('/projects/:projectId/content/bulk-delete', rbac('projects.act'), as
   } catch (e) { next(e); }
 });
 
+router.patch('/projects/:projectId/content/bulk-implement', rbac('projects.act'), async (req, res, next) => {
+  try {
+    res.json(await SeoService.bulkMarkImplemented(req.params.projectId, req.orgId, req.body?.ids, req.user));
+  } catch (e) { next(e); }
+});
+
+router.patch('/content/:id/implementation-review', rbac('projects.act'), async (req, res, next) => {
+  try {
+    res.json(await SeoService.reviewImplementation(req.params.id, {
+      status: req.body.status,
+      rejectionReason: req.body.rejectionReason,
+    }, req.orgId, req.user));
+  } catch (e) { next(e); }
+});
+
 // ─── Blog Tasks ───────────────────────────────────────────────────────────────
 router.get('/projects/:projectId/blogs', rbac('projects.read'), async (req, res, next) => {
   try {
