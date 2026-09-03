@@ -442,6 +442,27 @@ router.post('/projects/:projectId/blog-sheet/submit', rbac('projects.act'), uplo
   } catch (e) { next(e); }
 });
 
+// Designer deliverable submit (file optional) — mirrors the writer's submit above.
+router.post('/projects/:projectId/blog-sheet/submit-design', rbac('projects.act'), upload.single('file'), async (req, res, next) => {
+  try {
+    let fileUrl = String(req.body.fileUrl || '').trim() || undefined;
+    let fileName = String(req.body.fileName || '').trim() || undefined;
+    if (req.file) {
+      const media = await MediaService.upload(req.file.buffer, req.file.originalname, req.file.mimetype);
+      fileUrl = media.url;
+      fileName = req.file.originalname;
+    } else if (fileUrl && !fileName) {
+      fileName = 'Link';
+    }
+    const bt = await SeoService.submitBlogDesign(req.params.projectId, {
+      blogId: req.body.blogId,
+      fileUrl,
+      fileName,
+    }, req.orgId, req.user);
+    res.status(201).json(bt);
+  } catch (e) { next(e); }
+});
+
 router.post('/projects/:projectId/blog-sheet/import', rbac('projects.act'), upload.single('file'), async (req, res, next) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });

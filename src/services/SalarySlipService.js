@@ -153,16 +153,23 @@ async function generateSlipBuffer(payrollItemId, orgId) {
   const totalDeductions = deductionRows.reduce((s, r) => s + r.amount, 0);
   const netSalary = item.computedNet != null ? Number(item.computedNet) : grossEarnings - totalDeductions;
 
-  // Payment split — a locked/paid run has the frozen snapshot taken at lock
-  // time (see HrService#freezeDisbursementSplits); a draft/open_for_review run
-  // has none yet, so it's computed live off the worker's current active
-  // SalaryBeneficiary rows with the same formula instead — otherwise HR
-  // viewing/downloading a slip before locking would see no split at all even
-  // though beneficiaries are configured, which is the whole point of showing
-  // it here. Once locked, always prefer the frozen snapshot (what was
-  // actually disbursed), never recompute off beneficiaries that may have
-  // since changed.
+  // Payment split — three sources, in priority order:
+  //   1. Locked/paid run: the frozen snapshot taken at lock time (see
+  //      HrService#freezeDisbursementSplits) — what was actually disbursed,
+  //      never recomputed off beneficiaries that may have since changed.
+  //   2. Draft/open_for_review run with a percentage-only split: the
+  //      precomputed splitTaxBreakdown from the last Calculate (see
+  //      calculatePayrollItems/computeSplitPayrollTax) — each share's amount
+  //      already has its OWN independently-computed tax subtracted, so it
+  //      must be used as-is, not re-split off netSalary (which nets out the
+  //      COMBINED tax and would misallocate take-home between shares under
+  //      progressive brackets — see freezeDisbursementSplits' own comment).
+  //   3. Anything else (no beneficiaries, or a fixed-type one — out of scope
+  //      for split-then-tax): computed live off netSalary, same as before.
   let paymentSplit = Array.isArray(item.disbursementSplit) ? item.disbursementSplit : [];
+  if (!paymentSplit.length && Array.isArray(item.splitTaxBreakdown) && item.splitTaxBreakdown.length) {
+    paymentSplit = item.splitTaxBreakdown;
+  }
   if (!paymentSplit.length) {
     const activeBeneficiaries = await SalaryBeneficiary.findAll({
       where: { workerId: worker.id, orgId, isActive: true },
@@ -281,6 +288,12 @@ async function generateSlipBuffer(payrollItemId, orgId) {
         recipientName: line.name,
         relation: line.relation,
         amount: line.amount,
+        // Only present for a percentage-only split-then-tax breakdown (see
+        // computeSplitPayrollTax) — this share's own independently-computed
+        // tax, shown so the recipient can see it was already applied to
+        // their portion specifically, not to the employee's whole salary.
+        grossShare: line.grossShare,
+        tax: line.tax,
         bankAccount: maskAccountNumber(line.iban || line.bankAccountNumber),
         paymentDate: data.paymentDate,
       });

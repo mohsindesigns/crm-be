@@ -314,6 +314,125 @@ function computeDisbursementSplit(worker, netAmount, beneficiaries = []) {
   return lines;
 }
 
+/**
+ * Splits this worker's taxable salary across their PERCENTAGE-type
+ * SalaryBeneficiary shares FIRST, then runs each share through its own
+ * independent computeCumulativeTax — instead of taxing the worker's whole
+ * salary once and splitting the after-tax net (computeDisbursementSplit).
+ *
+ * This is a deliberate, explicit choice made by the org running this payroll:
+ * income tax under Section 149 is legally owed on the employee's TOTAL
+ * salary, not on however they choose to have it disbursed — taxing smaller
+ * split shares separately against the same progressive slabs collects LESS
+ * total tax than taxing the whole amount once, so the "Income Tax" figure
+ * this produces will read lower than the employee's real statutory
+ * liability. That trade-off was confirmed with the org before this was built
+ * (see HrService#calculatePayrollItems, Section 7, and the git history for
+ * this function) — this is not a bug to "fix" back to whole-salary taxation.
+ *
+ * Only PERCENTAGE-type beneficiaries participate — a `fixed` beneficiary is a
+ * flat rupee amount by definition, not a share of a taxable base, so it
+ * doesn't have a well-defined "gross share" to tax on its own. A worker with
+ * any active `fixed` beneficiary is out of scope for this function entirely;
+ * callers should fall back to the whole-salary computeCumulativeTax +
+ * computeDisbursementSplit(netAmount) path for them (see calculatePayrollItems).
+ *
+ * Prior-YTD figures (taxableYTDPrior/taxDeductedYTDPrior) are tracked only
+ * for the worker as a whole, not per beneficiary, so each share's prior YTD
+ * is approximated by applying THIS month's split ratio to the whole-worker
+ * prior totals. That's exact when the split ratio has been constant since
+ * the tax year started (the common case — beneficiaries are a standing
+ * config, not something changed monthly) and an approximation otherwise.
+ *
+ * Returns null (not run) when there are no active percentage beneficiaries —
+ * callers should fall back to the ordinary whole-salary path.
+ */
+function computeSplitPayrollTax({
+  computedGross, monthlyTaxable, taxableYTDPrior, taxDeductedYTDPrior,
+  remainingFullMonthBasic, taxYearStartDate, taxYearEndDate, period, slabs,
+  worker, beneficiaries = [],
+}) {
+  const active = (beneficiaries || []).filter((b) => b.isActive !== false);
+  const percentRows = active.filter((b) => b.splitType === 'percentage');
+  if (!percentRows.length || active.some((b) => b.splitType === 'fixed')) return null;
+
+  const percentTotal = percentRows.reduce((sum, b) => sum + (parseFloat(b.splitValue) || 0), 0);
+  if (percentTotal > 100) return null; // malformed — let the caller's normal validation catch it
+  const selfPct = round2(100 - percentTotal);
+
+  const shares = [
+    ...percentRows.map((b) => ({
+      beneficiaryId: b.id,
+      name: b.name,
+      relation: b.relation || '',
+      bankName: b.bankName || '',
+      bankAccountTitle: b.bankAccountTitle || '',
+      bankAccountNumber: b.bankAccountNumber || '',
+      iban: b.iban || '',
+      pct: parseFloat(b.splitValue) || 0,
+    })),
+    ...(selfPct > 0 ? [{
+      beneficiaryId: null,
+      name: worker.user?.name || 'Self',
+      relation: 'Self',
+      bankName: worker.bankName || '',
+      bankAccountTitle: worker.bankAccountTitle || '',
+      bankAccountNumber: worker.bankAccountNumber || '',
+      iban: worker.iban || '',
+      pct: selfPct,
+    }] : []),
+  ];
+
+  const lines = shares.map((s) => {
+    const shareGross = round2((computedGross || 0) * (s.pct / 100));
+    const shareTaxCalc = computeCumulativeTax({
+      taxYearStartDate,
+      taxYearEndDate,
+      period,
+      monthlyTaxable: round2((monthlyTaxable || 0) * (s.pct / 100)),
+      taxableYTDPrior: round2((taxableYTDPrior || 0) * (s.pct / 100)),
+      taxDeductedYTDPrior: round2((taxDeductedYTDPrior || 0) * (s.pct / 100)),
+      remainingFullMonthBasic: round2((remainingFullMonthBasic || 0) * (s.pct / 100)),
+      slabs,
+    });
+    return {
+      beneficiaryId: s.beneficiaryId,
+      name: s.name,
+      relation: s.relation,
+      bankName: s.bankName,
+      bankAccountTitle: s.bankAccountTitle,
+      bankAccountNumber: s.bankAccountNumber,
+      iban: s.iban,
+      grossShare: shareGross,
+      tax: shareTaxCalc.taxThisMonth,
+      amount: round2(shareGross - shareTaxCalc.taxThisMonth),
+      taxCalc: shareTaxCalc,
+    };
+  });
+
+  // Rounding across independently-computed shares can leave a few paisa of
+  // drift versus the true combined totals below — folded into the self line
+  // (or the largest line, if self got 0%) so nothing is invented or lost.
+  const foldInto = lines.find((l) => l.beneficiaryId === null) || lines[0];
+
+  const taxThisMonth = roundRupee(lines.reduce((sum, l) => sum + l.tax, 0));
+  const taxableYTD = round2(lines.reduce((sum, l) => sum + l.taxCalc.taxableYTD, 0));
+  const projectedAnnualTaxable = round2(lines.reduce((sum, l) => sum + l.taxCalc.projectedAnnualTaxable, 0));
+  const annualTaxProjected = roundRupee(lines.reduce((sum, l) => sum + l.taxCalc.annualTax, 0));
+
+  const trueCombinedNet = round2((computedGross || 0) - taxThisMonth);
+  const allocated = round2(lines.reduce((sum, l) => sum + l.amount, 0));
+  foldInto.amount = round2(foldInto.amount + (trueCombinedNet - allocated));
+
+  return {
+    taxThisMonth,
+    taxableYTD,
+    projectedAnnualTaxable,
+    annualTaxProjected,
+    lines: lines.map(({ taxCalc, ...l }) => l),
+  };
+}
+
 module.exports = {
   round2,
   roundRupee,
@@ -330,4 +449,5 @@ module.exports = {
   monthSpan,
   computeCumulativeTax,
   computeDisbursementSplit,
+  computeSplitPayrollTax,
 };

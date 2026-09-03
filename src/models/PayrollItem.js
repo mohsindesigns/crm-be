@@ -156,6 +156,20 @@ module.exports = (sequelize, DataTypes) => {
     deductAttendanceOverride: {
       type: DataTypes.BOOLEAN,
     },
+    // Precomputed "split first, then tax each share" breakdown — set only for
+    // a worker whose active beneficiaries are ALL percentage-type (see
+    // utils/payrollCalc.js#computeSplitPayrollTax for why fixed-type is out of
+    // scope and why this taxes below the worker's real statutory liability by
+    // design). null = ordinary whole-salary tax + net-based split instead
+    // (utils/payrollCalc.js#computeDisbursementSplit). Array of
+    // { beneficiaryId | null, name, relation, bankName, bankAccountTitle,
+    //   bankAccountNumber, iban, grossShare, tax, amount }. Computed once in
+    // calculatePayrollItems (the only place with tax-year/slab context) and
+    // read back by freezeDisbursementSplits (at lock) and SalarySlipService
+    // (pre-lock preview) rather than recomputed in either place.
+    splitTaxBreakdown: {
+      type: DataTypes.JSON,
+    },
   }, {
     tableName: 'payroll_items',
   });

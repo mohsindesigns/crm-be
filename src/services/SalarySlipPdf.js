@@ -254,6 +254,7 @@ function drawSalarySlip(doc, d) {
   // exactly who got what, same amounts as the internal disbursement sheet —
   // see SalarySlipService for why this can be a live estimate pre-lock.
   if (Array.isArray(d.paymentSplit) && d.paymentSplit.length > 1) {
+    const isSplitTax = d.paymentSplit.some((l) => l.tax != null);
     const splitRowH = 15;
     const splitHeadH = 16;
     const splitH = splitHeadH + splitRowH * d.paymentSplit.length + 6;
@@ -264,7 +265,11 @@ function drawSalarySlip(doc, d) {
     d.paymentSplit.forEach((line) => {
       const label = line.relation && line.relation !== 'Self' ? `${line.name} (${line.relation})` : line.name;
       text(label, PAD, sy, { size: 8.5 });
-      rightText(money(line.amount), width - PAD, sy, { size: 8.5, bold: true });
+      if (isSplitTax) {
+        rightText(`net ${money(line.amount)}  (tax ${money(line.tax)})`, width - PAD, sy, { size: 8, bold: true });
+      } else {
+        rightText(money(line.amount), width - PAD, sy, { size: 8.5, bold: true });
+      }
       sy += splitRowH;
     });
     y += splitH;
@@ -337,9 +342,13 @@ function drawPaymentAdvice(doc, d) {
   y += headH;
 
   y += 16;
+  const hasOwnTax = d.tax != null;
   text(
-    `Confirms a portion of ${d.employeeName || 'the employee'}'s net salary for this period, `
-    + 'disbursed directly to the recipient below per the salary-split arrangement on file.',
+    hasOwnTax
+      ? `Confirms this recipient's share of ${d.employeeName || 'the employee'}'s salary for this period, `
+        + 'with income tax applied to this share specifically, per the salary-split arrangement on file.'
+      : `Confirms a portion of ${d.employeeName || 'the employee'}'s net salary for this period, `
+        + 'disbursed directly to the recipient below per the salary-split arrangement on file.',
     PAD, y, { size: 8.5, color: MUTED, width: inner, lineBreak: true },
   );
   y += 26;
@@ -365,7 +374,32 @@ function drawPaymentAdvice(doc, d) {
     rule(y - 3, PAD, PAD + colW, LINE, true);
     rule(y - 3, PAD + colW + colGap, width - PAD, LINE, true);
   }
-  y += 20;
+  y += 4;
+  rule(y);
+
+  // ── This share's own tax — only for a percentage-only split-then-tax
+  // breakdown (computeSplitPayrollTax); absent for the ordinary net-based
+  // split, where tax was already deducted once off the employee's whole
+  // salary before any split happened.
+  if (hasOwnTax) {
+    const boxH = 40;
+    doc.rect(left, y, width, boxH).fill(BAND2);
+    text('THIS SHARE', PAD, y + 6, { size: 7.5, bold: true, color: MUTED, characterSpacing: 0.6 });
+    const fields = [
+      ['Gross Share', money(d.grossShare)],
+      ['Income Tax', money(d.tax)],
+      ['Net Payable', money(d.amount)],
+    ];
+    const fCellW = inner / fields.length;
+    fields.forEach(([label, val], i) => {
+      const fx = PAD + fCellW * i;
+      text(label, fx, y + 18, { size: 7, color: MUTED });
+      text(val, fx, y + 28, { size: 8.5, bold: true });
+    });
+    y += boxH;
+    rule(y);
+  }
+  y += 16;
 
   // ── Amount payable ───────────────────────────────────────────────────────
   const netH = 46;
@@ -384,8 +418,9 @@ function drawPaymentAdvice(doc, d) {
 
   y += 20;
   doc.font('Helvetica').fontSize(7.5);
-  const note = 'This is a payment advice, not a payslip — it carries no earnings, tax, or attendance figures of its own. '
-    + `Those all belong to ${d.employeeName || 'the employee'}'s own salary slip.`;
+  const note = hasOwnTax
+    ? `This is a payment advice, not a payslip — it carries no attendance figures of its own. Full salary and attendance details belong to ${d.employeeName || 'the employee'}'s own salary slip.`
+    : `This is a payment advice, not a payslip — it carries no earnings, tax, or attendance figures of its own. Those all belong to ${d.employeeName || 'the employee'}'s own salary slip.`;
   text(note, PAD, y, { size: 7.5, color: MUTED, width: inner, lineBreak: true });
   y += 24;
 

@@ -31,7 +31,7 @@ function isNonAttendanceRole(roleKey) {
 const {
   daysInCalendarMonth, computePayableDays, computeSalaryStructure,
   computeEarnedAmounts, computeMonthlyTaxable, computeCumulativeTax, activeRangeForMonth,
-  computeSalaryComponents, computeDisbursementSplit,
+  computeSalaryComponents, computeDisbursementSplit, computeSplitPayrollTax,
 } = require('../utils/payrollCalc');
 
 // Sanitize incoming worker updates so partial PATCH payloads never trip generic
@@ -2511,6 +2511,20 @@ async function calculatePayrollItems(runId, orgId, { workingDaysPerMonth } = {})
   });
   const overrideByWorkerId = new Map(existingItems.map((i) => [i.workerId, i.deductAttendanceOverride]));
 
+  // Active salary-split beneficiaries, fetched once in bulk and grouped by
+  // worker — needed here (not just at lock/slip time) because a percentage-
+  // only split changes how much tax is actually withheld this month. See
+  // computeSplitPayrollTax.
+  const allBeneficiaries = await SalaryBeneficiary.findAll({
+    where: { orgId, isActive: true },
+    order: [['sortOrder', 'ASC'], ['createdAt', 'ASC']],
+  });
+  const beneficiariesByWorkerId = new Map();
+  for (const b of allBeneficiaries) {
+    if (!beneficiariesByWorkerId.has(b.workerId)) beneficiariesByWorkerId.set(b.workerId, []);
+    beneficiariesByWorkerId.get(b.workerId).push(b);
+  }
+
   const results = [];
   for (const worker of workers) {
     if (!worker.salaryBase) continue;
@@ -2642,28 +2656,6 @@ async function calculatePayrollItems(runId, orgId, { workingDaysPerMonth } = {})
       otherTaxableAllowance: components.earnedTaxableTotal,
     });
 
-    // Section 7: cumulative YTD tax — annualize off the ACTUAL YTD taxable sum
-    // plus the projected remaining full months at the worker's CURRENT Basic.
-    // Never a flat ×12 (that's the over-taxed-mid-year-joiner bug, Section 8).
-    let taxThisMonth = 0;
-    let taxCalc = null;
-    if (taxYear && taxSlabs.length && !worker.taxExempt) {
-      const { taxableYTDPrior, taxDeductedYTDPrior } = await getWorkerYtdPriorTax(
-        worker.id, orgId, String(taxYear.startDate), run.period,
-      );
-      taxCalc = computeCumulativeTax({
-        taxYearStartDate: String(taxYear.startDate),
-        taxYearEndDate: String(taxYear.endDate),
-        period: run.period,
-        monthlyTaxable,
-        taxableYTDPrior,
-        taxDeductedYTDPrior,
-        remainingFullMonthBasic: structure.basic + components.fullMonthTaxableTotal,
-        slabs: taxSlabs,
-      });
-      taxThisMonth = taxCalc.taxThisMonth;
-    }
-
     const additions = {
       attendancePay: earned.earnedBasic,
       medical: earned.earnedMedical,
@@ -2685,6 +2677,71 @@ async function calculatePayrollItems(runId, orgId, { workingDaysPerMonth } = {})
     if (nonTaxableComponentNames.length) additions.nonTaxableComponents = nonTaxableComponentNames;
 
     const computedGross = computePayrollGross(earned.earnedBasic, additions);
+
+    // Section 7: cumulative YTD tax — annualize off the ACTUAL YTD taxable sum
+    // plus the projected remaining full months at the worker's CURRENT Basic.
+    // Never a flat ×12 (that's the over-taxed-mid-year-joiner bug, Section 8).
+    //
+    // A worker who has already left by this run's period (leavingDate on or
+    // before monthEnd) has no more future income to project — passing 0
+    // collapses projectedAnnualTaxable down to exactly taxableYTD (what they
+    // actually earned this tax year), which is also then exactly what
+    // annualTax/taxDueYTD reconcile against. Without this, a leaver's final
+    // slip would project a full remaining year of salary they'll never
+    // actually earn, wildly inflating "Projected Annual Taxable"/"Projected
+    // Annual Tax" on their last payslip.
+    const hasLeftByThisMonth = !!(leaveDate && leaveDate <= monthEnd);
+    let taxThisMonth = 0;
+    let taxCalc = null;
+    let splitTaxBreakdown = null;
+    if (taxYear && taxSlabs.length && !worker.taxExempt) {
+      const { taxableYTDPrior, taxDeductedYTDPrior } = await getWorkerYtdPriorTax(
+        worker.id, orgId, String(taxYear.startDate), run.period,
+      );
+      const remainingFullMonthBasic = hasLeftByThisMonth ? 0 : structure.basic + components.fullMonthTaxableTotal;
+
+      // Deliberate org policy: a worker whose active beneficiaries are ALL
+      // percentage-type gets their salary split BEFORE tax, each share taxed
+      // independently — see computeSplitPayrollTax's own comment for why this
+      // taxes below the worker's real Section 149 liability by design, and
+      // why a `fixed`-type beneficiary falls back to the ordinary path below.
+      const splitResult = computeSplitPayrollTax({
+        computedGross,
+        monthlyTaxable,
+        taxableYTDPrior,
+        taxDeductedYTDPrior,
+        remainingFullMonthBasic,
+        taxYearStartDate: String(taxYear.startDate),
+        taxYearEndDate: String(taxYear.endDate),
+        period: run.period,
+        slabs: taxSlabs,
+        worker,
+        beneficiaries: beneficiariesByWorkerId.get(worker.id) || [],
+      });
+
+      if (splitResult) {
+        taxThisMonth = splitResult.taxThisMonth;
+        splitTaxBreakdown = splitResult.lines;
+        taxCalc = {
+          taxableYTD: splitResult.taxableYTD,
+          projectedAnnualTaxable: splitResult.projectedAnnualTaxable,
+          annualTax: splitResult.annualTaxProjected,
+        };
+      } else {
+        taxCalc = computeCumulativeTax({
+          taxYearStartDate: String(taxYear.startDate),
+          taxYearEndDate: String(taxYear.endDate),
+          period: run.period,
+          monthlyTaxable,
+          taxableYTDPrior,
+          taxDeductedYTDPrior,
+          remainingFullMonthBasic,
+          slabs: taxSlabs,
+        });
+        taxThisMonth = taxCalc.taxThisMonth;
+      }
+    }
+
     const deductions = {};
     if (taxThisMonth > 0) deductions.tax = taxThisMonth;
     const computedNet = Math.round((computedGross - sumPayrollDeductions(deductions)) * 100) / 100;
@@ -2703,6 +2760,7 @@ async function calculatePayrollItems(runId, orgId, { workingDaysPerMonth } = {})
       projectedAnnualTaxable: taxCalc ? taxCalc.projectedAnnualTaxable : 0,
       annualTaxProjected: taxCalc ? taxCalc.annualTax : 0,
       taxAmount: taxThisMonth,
+      splitTaxBreakdown,
     };
 
     const [item, created] = await PayrollItem.findOrCreate({
@@ -2732,11 +2790,23 @@ async function freezeDisbursementSplits(runId, orgId) {
   });
   for (const item of items) {
     if (!item.worker) continue;
-    const beneficiaries = await SalaryBeneficiary.findAll({
-      where: { workerId: item.worker.id, orgId, isActive: true },
-      order: [['sortOrder', 'ASC'], ['createdAt', 'ASC']],
-    });
-    const split = computeDisbursementSplit(item.worker, item.computedNet, beneficiaries);
+    // A percentage-only split already had tax computed per-share in
+    // calculatePayrollItems (see PayrollItem.splitTaxBreakdown) — those
+    // amounts are already each share's after-tax take-home, so they're used
+    // directly rather than re-deriving a split off computedNet (which would
+    // wrongly re-divide the COMBINED net by the gross-share percentages,
+    // ignoring that progressive tax brackets mean each share's real tax
+    // isn't the same fraction of the total tax as its fraction of the gross).
+    let split;
+    if (Array.isArray(item.splitTaxBreakdown) && item.splitTaxBreakdown.length) {
+      split = item.splitTaxBreakdown;
+    } else {
+      const beneficiaries = await SalaryBeneficiary.findAll({
+        where: { workerId: item.worker.id, orgId, isActive: true },
+        order: [['sortOrder', 'ASC'], ['createdAt', 'ASC']],
+      });
+      split = computeDisbursementSplit(item.worker, item.computedNet, beneficiaries);
+    }
     await item.update({ disbursementSplit: split });
   }
 }

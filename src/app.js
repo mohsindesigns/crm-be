@@ -459,6 +459,40 @@ app.schemaReady.then(async () => {
   }
 });
 
+// One-time backfill: add the `gmb_profile_setup` Stage (+ its transition into
+// `audit`) to every org's GMB WorkflowTemplate. Orgs provisioned before this
+// stage existed only have audit/optimization/review/recurring_posts — this
+// adds the missing row at orderIndex -1 without touching any other stage's
+// orderIndex or any in-progress project's currentStageKey, so existing GMB
+// projects keep running exactly where they are; only new projects start on
+// this stage (ProjectService picks the lowest orderIndex as the first stage).
+app.schemaReady.then(async () => {
+  try {
+    const templates = await db.WorkflowTemplate.findAll({ where: { serviceTypeKey: 'gmb' } });
+    for (const template of templates) {
+      const [, created] = await db.Stage.findOrCreate({
+        where: { templateId: template.id, key: 'gmb_profile_setup' },
+        defaults: {
+          templateId: template.id,
+          key: 'gmb_profile_setup',
+          name: 'GMB Profile',
+          ownerRoleSlot: 'project_strategist',
+          stageType: 'work',
+          advanceRule: 'single_action',
+          orderIndex: -1,
+        },
+      });
+      if (created) console.log(`[Schema] Added GMB Profile stage to workflow template ${template.id}.`);
+      await db.Transition.findOrCreate({
+        where: { templateId: template.id, fromStageKey: 'gmb_profile_setup', action: 'complete' },
+        defaults: { templateId: template.id, fromStageKey: 'gmb_profile_setup', action: 'complete', toStageKey: 'audit' },
+      });
+    }
+  } catch (err) {
+    console.error('[Schema] gmb_profile_setup stage backfill failed:', err.message);
+  }
+});
+
 // One-time backfill: pair every existing `blog_post` Task with a Blogs-tab row.
 // Blog tasks created by the recurring-task scheduler or the generic Create Task
 // modal never had one (nor a `pageName`), so a deliverable attached to them had

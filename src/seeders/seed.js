@@ -191,13 +191,20 @@ const LOGO_TRANSITIONS = [
 ];
 
 // ─── GMB Optimization ─────────────────────────────────────────────────────────
+// `gmb_profile_setup` sits at orderIndex -1, ahead of the original `audit` stage
+// (orderIndex 0) — deliberately not renumbering the rest, so this insertion
+// never has to touch any other stage's orderIndex (see the idempotent backfill
+// in app.js that adds this same stage/transition to orgs seeded before it
+// existed, without moving anything else).
 const GMB_STAGES = [
+  { key: 'gmb_profile_setup', name: 'GMB Profile', ownerRoleSlot: 'project_strategist', stageType: 'work', advanceRule: 'single_action', orderIndex: -1 },
   { key: 'audit', name: 'GMB Audit', ownerRoleSlot: 'project_strategist', stageType: 'work', advanceRule: 'single_action', orderIndex: 0 },
   { key: 'optimization', name: 'Optimization', ownerRoleSlot: 'project_strategist', stageType: 'work', advanceRule: 'all_tasks_done', orderIndex: 1 },
   { key: 'review', name: 'Review', ownerRoleSlot: 'project_manager', stageType: 'approval', advanceRule: 'single_action', orderIndex: 2 },
   { key: 'recurring_posts', name: 'Recurring Posts', ownerRoleSlot: 'project_strategist', stageType: 'work', advanceRule: 'single_action', isTerminal: true, orderIndex: 3 },
 ];
 const GMB_TRANSITIONS = [
+  { fromStageKey: 'gmb_profile_setup', action: 'complete', toStageKey: 'audit' },
   { fromStageKey: 'audit', action: 'complete', toStageKey: 'optimization' },
   { fromStageKey: 'optimization', action: 'complete', toStageKey: 'review' },
   { fromStageKey: 'review', action: 'approve', toStageKey: 'recurring_posts' },

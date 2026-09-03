@@ -74,6 +74,15 @@ module.exports = (sequelize, DataTypes) => {
     publishedUrl: {
       type: DataTypes.TEXT,
     },
+    // Designer's deliverable for assignedDesignerId's blog_image Task — same
+    // file-or-link pattern as fileUrl/fileName above, mirrored onto that Task
+    // as an Artifact by SeoService#submitBlogDesign so both surfaces agree.
+    designFileUrl: {
+      type: DataTypes.TEXT,
+    },
+    designFileName: {
+      type: DataTypes.STRING(255),
+    },
     // Content-parity workflow:
     //   draft    — planned on the sheet / assigned to a writer (like a Keyword row)
     //   pending  — writer submitted a deliverable; awaiting strategist/PM review

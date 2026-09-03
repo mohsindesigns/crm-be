@@ -195,12 +195,12 @@ async function ensureTaskDeliverableArtifact(task, fileUrl, fileName, uploadedBy
   });
 }
 
-async function markBlogTasksSubmitted(orgId, projectId, title, assigneeId, actorUserId) {
+async function markBlogTasksSubmitted(orgId, projectId, title, assigneeId, actorUserId, taskType = 'blog_post') {
   if (!assigneeId || !title) return;
   const openTasks = await Task.findAll({
     where: {
       projectId,
-      type: 'blog_post',
+      type: taskType,
       pageName: title,
       assigneeId,
       // `accepted` included too — a writer who clicked Accept on the task first
@@ -2255,6 +2255,70 @@ async function submitBlogDeliverable(projectId, data, orgId, caller) {
   return bt;
 }
 
+/**
+ * Designer counterpart to submitBlogDeliverable: attaches the design file/link
+ * for an already-approved blog row (assignedDesignerId can only be set once
+ * status is 'approved' — see updateBlogTask) and mirrors it onto the designer's
+ * blog_image Task as an Artifact, same as the writer's copy submission.
+ */
+async function submitBlogDesign(projectId, data, orgId, caller) {
+  const blogId = data.blogId;
+  if (!blogId) {
+    throw Object.assign(new Error('blogId is required.'), { status: 400 });
+  }
+  const bt = await BlogTask.findOne({
+    where: { id: blogId, projectId },
+    include: [{ model: Project, as: 'project', where: { orgId }, attributes: ['id', 'name'] }],
+  });
+  if (!bt) throw Object.assign(new Error('Blog row not found.'), { status: 404 });
+  if (bt.status !== 'approved') {
+    throw Object.assign(new Error('The blog copy must be approved before a design deliverable can be attached.'), { status: 400 });
+  }
+  if (!bt.assignedDesignerId) {
+    throw Object.assign(new Error('Assign a designer before attaching a design deliverable.'), { status: 400 });
+  }
+
+  const isManager = ['super_admin', 'admin'].includes(caller?.role?.key)
+    || !!caller?.role?.permissions?.['projects.manage'];
+  if (!isManager && bt.assignedDesignerId !== caller.id) {
+    throw Object.assign(new Error('You can only submit designs assigned to you.'), { status: 403 });
+  }
+
+  let fileUrl = String(data.fileUrl || '').trim() || null;
+  if (fileUrl && !/^https?:\/\//i.test(fileUrl) && !fileUrl.startsWith('/')) {
+    fileUrl = `https://${fileUrl}`;
+  }
+  const resolvedFileUrl = fileUrl || bt.designFileUrl || null;
+  if (!resolvedFileUrl) {
+    throw Object.assign(new Error('Attach a file or paste a design link.'), { status: 400 });
+  }
+  const resolvedFileName = fileUrl ? (data.fileName || null) : (bt.designFileName || null);
+
+  await bt.update({ designFileUrl: resolvedFileUrl, designFileName: resolvedFileName });
+
+  const designerTask = await ensureBlogImageTask(orgId, bt.project, bt.title, bt.assignedDesignerId, caller.id);
+  if (designerTask?.id) {
+    await ensureTaskDeliverableArtifact(designerTask, resolvedFileUrl, resolvedFileName, caller.id);
+  }
+  await markBlogTasksSubmitted(orgId, projectId, bt.title, bt.assignedDesignerId, caller.id, 'blog_image');
+
+  for (const slot of ['project_strategist', 'project_manager']) {
+    const assignment = await ProjectAssignment.findOne({ where: { projectId, roleSlot: slot } });
+    if (assignment?.userId && assignment.userId !== caller.id) {
+      NotificationService.notify(assignment.userId, orgId, {
+        type: 'blog_design_submitted',
+        title: `Design uploaded: "${bt.title}"`,
+        body: `${bt.project.name} — the blog image deliverable is ready.`,
+        refTable: 'projects',
+        refId: projectId,
+      });
+      break;
+    }
+  }
+
+  return bt;
+}
+
 async function createBlogTask(data, orgId) {
   await assertProjectAccess(data.projectId, orgId);
   return BlogTask.create(data);
@@ -2974,7 +3038,7 @@ module.exports = {
   bulkMarkBlogImplemented, reviewBlogImplementation,
   bulkMarkKeywordImplemented, reviewKeywordImplementation,
   listBlogTasks, createBlogTask, updateBlogTask,
-  listBlogSheet, createBlogSheetRow, submitBlogDeliverable, bulkImportBlogTasks,
+  listBlogSheet, createBlogSheetRow, submitBlogDeliverable, submitBlogDesign, bulkImportBlogTasks,
   reviewBlogTask, deleteBlogTask, deactivateBlogTask, setBlogTaskActive, bulkDeleteBlogTasks, bulkDeactivateBlogTasks, bulkActivateBlogTasks, syncApprovedBlogTasks,
   generateKeywordReportBuffer, generateBacklinkReportBuffer, generateKeywordCsv, generateBlogCsv,
 };
