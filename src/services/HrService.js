@@ -68,6 +68,7 @@ function normalizeWorkerUpdates(updates) {
   // than writing an empty string into the CHAR(36) column.
   if ('shiftScheduleId' in clean && !clean.shiftScheduleId) clean.shiftScheduleId = null;
   if ('taxExempt' in clean) clean.taxExempt = !!clean.taxExempt;
+  if ('noAttendanceDeduction' in clean) clean.noAttendanceDeduction = !!clean.noAttendanceDeduction;
   // Drop incomplete/garbage rows (blank name, non-numeric or zero amount)
   // before they ever reach the DB — calculatePayrollItems would silently
   // skip them anyway (see payrollCalc#computeSalaryComponents), so this just
@@ -183,6 +184,16 @@ async function updateWorker(id, updates, orgId, actorUserId = null) {
     clean.status = 'active';
     clean.pendingAmendmentDiff = null;
     clean.rejectionReason = null;
+  }
+
+  // Guards against the run's worker query (calculatePayrollItems) silently
+  // dropping a resigned employee entirely: it only includes an inactive
+  // worker for a run whose period covers their leavingDate, so status
+  // flipping to inactive with no leavingDate set (or one left over from a
+  // date the form doesn't clear) would zero out their final paycheck instead
+  // of prorating it. Stamp "today" only when the caller didn't supply one.
+  if (clean.status === 'inactive' && w.status !== 'inactive' && !clean.leavingDate && !w.leavingDate) {
+    clean.leavingDate = new Date().toISOString().slice(0, 10);
   }
 
   if (clean.profilePictureUrl !== undefined) {
@@ -2296,7 +2307,7 @@ function normalizeWorkingDays(value, fallback = 26) {
   return n;
 }
 
-async function createPayrollRun(period, orgId, createdBy, { workingDaysPerMonth, includeOvertime, deductAbsences } = {}) {
+async function createPayrollRun(period, orgId, createdBy, { workingDaysPerMonth, includeOvertime, deductAttendance } = {}) {
   const existing = await PayrollRun.findOne({ where: { orgId, period } });
   if (existing) throw Object.assign(new Error(`Payroll run for ${period} already exists`), { status: 409 });
   const settings = await getOrCreatePayrollSettings(orgId);
@@ -2307,7 +2318,7 @@ async function createPayrollRun(period, orgId, createdBy, { workingDaysPerMonth,
   return PayrollRun.create({
     orgId, period, createdBy, workingDaysPerMonth: wdpm,
     includeOvertime: includeOvertime !== false,
-    deductAbsences: deductAbsences !== false,
+    deductAttendance: deductAttendance !== false,
   });
 }
 
@@ -2324,8 +2335,8 @@ async function updatePayrollRun(id, orgId, updates = {}) {
   if (updates.includeOvertime != null) {
     patch.includeOvertime = !!updates.includeOvertime;
   }
-  if (updates.deductAbsences != null) {
-    patch.deductAbsences = !!updates.deductAbsences;
+  if (updates.deductAttendance != null) {
+    patch.deductAttendance = !!updates.deductAttendance;
   }
   if (Object.keys(patch).length === 0) {
     throw Object.assign(new Error('No valid fields to update.'), { status: 400 });
@@ -2417,7 +2428,7 @@ async function applyLatePenalty(orgId, worker, period, lateCount, penaltyDays, s
 //   net = gross − tax
 const PAYROLL_ADDITION_META_KEYS = new Set([
   'payableDays', 'workingDays', 'perDayRate', 'monthlySalary',
-  'halfDayCredit', 'holidayDays', 'formula', 'daysInMonth', 'nonTaxableComponents',
+  'halfDayCredit', 'holidayDays', 'weekendDays', 'formula', 'daysInMonth', 'nonTaxableComponents',
 ]);
 
 function sumPayrollMoneyAdditions(additions = {}) {
@@ -2490,6 +2501,16 @@ async function calculatePayrollItems(runId, orgId, { workingDaysPerMonth } = {})
     },
   });
 
+  // Per-worker, per-run override of the deductAttendance policy (set via the
+  // Actions column on the Payroll Items table) — null/undefined means "follow
+  // the run's global toggle", true/false pins this one worker for this run
+  // only. Fetched once, in bulk, rather than per worker.
+  const existingItems = await PayrollItem.findAll({
+    where: { payrollRunId: runId },
+    attributes: ['workerId', 'deductAttendanceOverride'],
+  });
+  const overrideByWorkerId = new Map(existingItems.map((i) => [i.workerId, i.deductAttendanceOverride]));
+
   const results = [];
   for (const worker of workers) {
     if (!worker.salaryBase) continue;
@@ -2509,7 +2530,12 @@ async function calculatePayrollItems(runId, orgId, { workingDaysPerMonth } = {})
     const markedAbsent = attendances.filter((a) => a.status === 'absent').length;
     const leaveDays = attendances.filter((a) => a.status === 'leave').length;
     const halfDays = attendances.filter((a) => a.status === 'half_day').length;
-    const holidayDays = attendances.filter((a) => a.status === 'holiday' || a.status === 'weekend').length;
+    const holidayDays = attendances.filter((a) => a.status === 'holiday').length;
+    // Named distinctly from the outer `weekendDays` (the org's configured
+    // off-days array, e.g. [0,6]) — reusing that name here would shadow it
+    // for the rest of this loop iteration and silently break isWeekendDate()
+    // for orgs with a non-default weekend configuration.
+    const weekendMarkedDays = attendances.filter((a) => a.status === 'weekend').length;
     const markedDates = new Set(attendances.map((a) => String(a.date).slice(0, 10)));
 
     // Any day in this worker's active range with no attendance row at all,
@@ -2547,13 +2573,23 @@ async function calculatePayrollItems(runId, orgId, { workingDaysPerMonth } = {})
     const latePenaltyDays = Math.floor(lateCount / latePenaltyPerN);
     const { unpaidDays: latePenaltyUnpaidDays } = await applyLatePenalty(orgId, worker, run.period, lateCount, latePenaltyDays, settings);
 
-    // Section 3-4: paid leave = present (no deduction); unpaid absence and the
-    // unworked half of a half-day reduce pay. When this run has absence
-    // deduction switched off, absentDays is still recorded/shown but doesn't
-    // reduce payableDays — half-day and late-penalty deductions still apply.
-    const unpaidAbsentDays = Math.round(
-      ((run.deductAbsences !== false ? absentDays : 0)
-        + halfDays * halfDayFactor + Number(latePenaltyUnpaidDays || 0)) * 1000,
+    // Section 3-4: paid leave = present (no deduction); unpaid absence, the
+    // unworked half of a half-day, and late-penalty days reduce pay.
+    // Deduction is skipped entirely (attendance/late counts are still
+    // recorded/shown as normal, only the pay impact is zeroed) when:
+    //   1. worker.noAttendanceDeduction is set — a permanent, every-run
+    //      exemption HR sets once on the employee's profile, or
+    //   2. this specific worker has a per-run override for this run (set from
+    //      the Actions column on Payroll Items) that resolves to false, or
+    //   3. no per-run override exists and the run's own deductAttendance
+    //      toggle is off.
+    // The per-run override (if any) always wins over the run-level toggle —
+    // it's a deliberate one-off exception for this one employee this month.
+    const perRunOverride = overrideByWorkerId.get(worker.id);
+    const runWantsDeduction = perRunOverride != null ? perRunOverride : run.deductAttendance !== false;
+    const skipAttendanceDeduction = !runWantsDeduction || !!worker.noAttendanceDeduction;
+    const unpaidAbsentDays = skipAttendanceDeduction ? 0 : Math.round(
+      (absentDays + halfDays * halfDayFactor + Number(latePenaltyUnpaidDays || 0)) * 1000,
     ) / 1000;
 
     const { payableDays } = computePayableDays({
@@ -2637,6 +2673,7 @@ async function calculatePayrollItems(runId, orgId, { workingDaysPerMonth } = {})
       monthlySalary,
       halfDayCredit: Math.round(halfDays * (1 - halfDayFactor) * 1000) / 1000,
       holidayDays,
+      weekendDays: weekendMarkedDays,
       formula: `(${monthlySalary} / ${daysInMonth}) × ${payableDays}`,
     };
     if (earned.overtime > 0) additions.overtime = earned.overtime;
@@ -2860,6 +2897,13 @@ async function upsertPayrollItem(payrollRunId, workerId, data, orgId) {
   if (data.leaveDays !== undefined) patch.leaveDays = data.leaveDays;
   if (data.halfDays !== undefined) patch.halfDays = data.halfDays;
   if (data.overtimeHours !== undefined) patch.overtimeHours = data.overtimeHours;
+  // null clears the override back to "follow the run's toggle"; true/false
+  // pins this worker for this run only. Only takes visible effect in
+  // computedNet once the run is recalculated — see calculatePayrollItems.
+  if (data.deductAttendanceOverride !== undefined) {
+    patch.deductAttendanceOverride = data.deductAttendanceOverride === null
+      ? null : !!data.deductAttendanceOverride;
+  }
 
   await item.update(patch);
   return item.reload();

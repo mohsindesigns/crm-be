@@ -1,9 +1,12 @@
 const { createPdfBuffer, fetchImageBuffer } = require('./PdfService');
 const { letterheadForOrg } = require('./letterhead');
-const { drawSalarySlip } = require('./SalarySlipPdf');
+const { drawSalarySlip, drawPaymentAdvice } = require('./SalarySlipPdf');
 const { formatPeriod } = require('../utils/formatPeriod');
+const { computeDisbursementSplit } = require('../utils/payrollCalc');
 const { getTaxYearForPeriod } = require('./HrService');
-const { PayrollItem, Worker, PayrollRun, User, WhiteLabelConfig, Company } = require('../models');
+const {
+  PayrollItem, Worker, PayrollRun, User, WhiteLabelConfig, Company, SalaryBeneficiary,
+} = require('../models');
 
 /**
  * Keys in PayrollItem.additions that describe HOW the pay was worked out rather
@@ -12,7 +15,7 @@ const { PayrollItem, Worker, PayrollRun, User, WhiteLabelConfig, Company } = req
  */
 const META_KEYS = new Set([
   'payableDays', 'workingDays', 'perDayRate', 'monthlySalary',
-  'halfDayCredit', 'holidayDays', 'formula', 'daysInMonth', 'nonTaxableComponents',
+  'halfDayCredit', 'holidayDays', 'weekendDays', 'formula', 'daysInMonth', 'nonTaxableComponents',
 ]);
 
 /**
@@ -89,11 +92,15 @@ function fmtDate(value) {
 }
 
 /** Last four digits only — a full account number has no business on a printout. */
+function maskAccountNumber(raw) {
+  const clean = String(raw || '').replace(/\s+/g, '');
+  if (!clean) return null;
+  const tail = clean.slice(-4);
+  return `${'X'.repeat(Math.max(0, Math.min(8, clean.length - 4)))}${tail}`;
+}
+
 function maskAccount(worker) {
-  const raw = String(worker.iban || worker.bankAccountNumber || '').replace(/\s+/g, '');
-  if (!raw) return null;
-  const tail = raw.slice(-4);
-  return `${'X'.repeat(Math.max(0, Math.min(8, raw.length - 4)))}${tail}`;
+  return maskAccountNumber(worker.iban || worker.bankAccountNumber);
 }
 
 async function generateSlipBuffer(payrollItemId, orgId) {
@@ -146,6 +153,35 @@ async function generateSlipBuffer(payrollItemId, orgId) {
   const totalDeductions = deductionRows.reduce((s, r) => s + r.amount, 0);
   const netSalary = item.computedNet != null ? Number(item.computedNet) : grossEarnings - totalDeductions;
 
+  // Payment split — a locked/paid run has the frozen snapshot taken at lock
+  // time (see HrService#freezeDisbursementSplits); a draft/open_for_review run
+  // has none yet, so it's computed live off the worker's current active
+  // SalaryBeneficiary rows with the same formula instead — otherwise HR
+  // viewing/downloading a slip before locking would see no split at all even
+  // though beneficiaries are configured, which is the whole point of showing
+  // it here. Once locked, always prefer the frozen snapshot (what was
+  // actually disbursed), never recompute off beneficiaries that may have
+  // since changed.
+  let paymentSplit = Array.isArray(item.disbursementSplit) ? item.disbursementSplit : [];
+  if (!paymentSplit.length) {
+    const activeBeneficiaries = await SalaryBeneficiary.findAll({
+      where: { workerId: worker.id, orgId, isActive: true },
+      order: [['sortOrder', 'ASC'], ['createdAt', 'ASC']],
+    });
+    if (activeBeneficiaries.length) {
+      try {
+        // A draft-run preview only — over-allocation here (e.g. a fixed
+        // beneficiary amount that no longer fits a lower-than-usual net this
+        // month) is a real problem, but the fix is on the Salary Split tab,
+        // not a reason to fail loading the slip. It still correctly blocks
+        // at lock time (HrService#freezeDisbursementSplits, unguarded).
+        paymentSplit = computeDisbursementSplit(worker, netSalary, activeBeneficiaries);
+      } catch {
+        paymentSplit = [];
+      }
+    }
+  }
+
   // Calendar days in the run's month, so "Days in Month" is the real figure
   // rather than the working-day divisor used for the rate.
   const period = String(item.run?.period || '');
@@ -179,18 +215,18 @@ async function generateSlipBuffer(payrollItemId, orgId) {
     // was produced. Printing the run's creation date would be worse: it would
     // read as a payment date that never happened.
     paymentDate: fmtDate(new Date()),
-    // Full per-recipient amounts belong on the internal disbursement sheet, not
-    // a document the employee might forward on (e.g. for a visa/loan
-    // application) — this just tells them their pay didn't go entirely to the
-    // account listed above. See PayrollItem.disbursementSplit.
     paymentMethod: (() => {
-      const split = Array.isArray(item.disbursementSplit) ? item.disbursementSplit : [];
-      const otherRecipients = split.filter((l) => l.beneficiaryId).length;
+      const otherRecipients = paymentSplit.filter((l) => l.beneficiaryId).length;
       if (otherRecipients > 0) {
         return `Bank Transfer · split across ${otherRecipients + 1} recipients`;
       }
       return worker.bankName ? `Bank Transfer · ${worker.bankName}` : 'Bank Transfer';
     })(),
+    // The actual per-recipient breakdown (name, relation, amount) — printed as
+    // its own section below when there's more than just the worker's own
+    // "Self" line, so an employee who's split their pay with family can see
+    // exactly who got what, same as the internal disbursement sheet shows HR.
+    paymentSplit: paymentSplit.length > 1 ? paymentSplit : null,
 
     earnings,
     deductions: deductionRows,
@@ -203,7 +239,11 @@ async function generateSlipBuffer(payrollItemId, orgId) {
     // month's tax off an annualized projection, not off this month's salary
     // in isolation, so the flat rupee figure alone is not auditable without
     // the fiscal-year window and the YTD numbers it was computed from.
-    taxBreakdown: item.taxAmount > 0 ? {
+    // Gated on the YTD/projected figures actually having data, NOT on this
+    // month's withholding being non-zero — a month where nothing was withheld
+    // (already covered YTD, or below threshold this month) still needs the
+    // yearly context shown, it just prints "Rs 0" for Taxable This Month.
+    taxBreakdown: (item.taxableYTD > 0 || item.projectedAnnualTaxable > 0 || item.taxAmount > 0) ? {
       taxYearLabel: taxYear?.label || null,
       taxYearStart: fmtDate(taxYear?.startDate),
       taxYearEnd: fmtDate(taxYear?.endDate),
@@ -216,14 +256,36 @@ async function generateSlipBuffer(payrollItemId, orgId) {
 
     daysInMonth,
     daysPresent: item.presentDays || 0,
-    holidays: additions.holidayDays || 0,
     paidLeaveDays: item.leaveDays || 0,
-    unpaidLeaveDays: (item.absentDays || 0) + (item.latePenaltyUnpaidDays || 0),
+    absentDays: item.absentDays || 0,
+    holidays: additions.holidayDays || 0,
+    weekends: additions.weekendDays || 0,
 
     signatureBuffer,
   };
 
-  const buffer = await createPdfBuffer((doc) => drawSalarySlip(doc, data), {
+  // Beneficiary lines (excluding the worker's own "Self" line) each get a
+  // payment-advice page appended after the main slip — see drawPaymentAdvice
+  // for why that's a plain remittance confirmation, not a duplicate payslip.
+  const beneficiaryLines = paymentSplit.filter((l) => l.beneficiaryId);
+
+  const buffer = await createPdfBuffer((doc) => {
+    drawSalarySlip(doc, data);
+    for (const line of beneficiaryLines) {
+      doc.addPage();
+      drawPaymentAdvice(doc, {
+        companyName: data.companyName,
+        companyTagline: data.companyTagline,
+        payPeriod: data.payPeriod,
+        employeeName: data.employeeName,
+        recipientName: line.name,
+        relation: line.relation,
+        amount: line.amount,
+        bankAccount: maskAccountNumber(line.iban || line.bankAccountNumber),
+        paymentDate: data.paymentDate,
+      });
+    }
+  }, {
     // No page margin — the slip's coloured bands run edge to edge, and the
     // renderer applies the reference's own 28pt inner padding.
     margin: 0,

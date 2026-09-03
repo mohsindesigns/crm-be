@@ -3,14 +3,14 @@ const { ensureColumns } = require('../utils/schemaSync');
 
 /**
  * One row per GMB (Google Business Profile) project — the listing details a
- * GMB specialist tracks outside of Google itself: the profile/website URLs,
- * the category and keyword sets currently targeted, and which service areas
- * out of the full coverage list are actively being worked right now.
+ * GMB specialist maintains outside of Google itself. Service areas live in
+ * their own child table (GmbServiceArea) because each area can independently
+ * be "targeted" with its own start date; everything else here is simple
+ * enough to store directly (single values or flat string lists).
  *
- * Phone numbers and addresses live in their own child tables (GmbPhoneNumber /
- * GmbAddress) rather than as JSON here, because a listing can carry several of
- * each with exactly one marked "currently active" — the same isPrimary shape
- * as `Company`.
+ * `status` is a lightweight draft/completed marker for this form only — it
+ * does NOT gate the project's real workflow stage (see workflow/engine.js);
+ * this page is a standalone form, not a stage in that state machine.
  */
 module.exports = (sequelize, DataTypes) => {
   const GmbProfile = sequelize.define('GmbProfile', {
@@ -30,36 +30,42 @@ module.exports = (sequelize, DataTypes) => {
       unique: true,
       references: { model: 'projects', key: 'id' },
     },
+    name: {
+      type: DataTypes.STRING(150),
+    },
+    address: {
+      type: DataTypes.STRING(300),
+    },
+    contactNumber: {
+      type: DataTypes.STRING(50),
+    },
+    // "Profile link" in the UI — kept as gmbProfileUrl internally, no rename.
     gmbProfileUrl: {
       type: DataTypes.TEXT,
     },
+    // "Website address" in the UI.
     websiteUrl: {
       type: DataTypes.TEXT,
     },
-    // Arrays of strings, all stored as JSON — none of these are single values.
-    primaryCategories: {
-      type: DataTypes.JSON,
+    primaryCategory: {
+      type: DataTypes.STRING(150),
     },
+    // Array of strings. Must exclude primaryCategory — enforced in GmbService.
     secondaryCategories: {
       type: DataTypes.JSON,
     },
-    // The full list of areas this listing covers.
-    serviceAreasTotal: {
+    // Array of strings — the "Services" multi-select.
+    services: {
       type: DataTypes.JSON,
     },
-    // Which of serviceAreasTotal are being actively worked right now — always
-    // a subset, enforced in GmbService rather than at the DB layer.
-    serviceAreasActive: {
-      type: DataTypes.JSON,
+    status: {
+      type: DataTypes.ENUM('draft', 'completed'),
+      allowNull: false,
+      defaultValue: 'draft',
     },
-    keywordsPrimary: {
-      type: DataTypes.JSON,
-    },
-    keywordsSecondary: {
-      type: DataTypes.JSON,
-    },
-    keywordsRanking: {
-      type: DataTypes.JSON,
+    updatedBy: {
+      type: DataTypes.CHAR(36),
+      references: { model: 'users', key: 'id' },
     },
   }, {
     tableName: 'gmb_profiles',
@@ -68,9 +74,8 @@ module.exports = (sequelize, DataTypes) => {
 
   GmbProfile.associate = (db) => {
     GmbProfile.belongsTo(db.Project, { foreignKey: 'projectId', as: 'project' });
-    GmbProfile.hasMany(db.GmbPhoneNumber, { foreignKey: 'gmbProfileId', as: 'phones' });
-    GmbProfile.hasMany(db.GmbAddress, { foreignKey: 'gmbProfileId', as: 'addresses' });
-    GmbProfile.hasMany(db.GmbKeywordRank, { foreignKey: 'gmbProfileId', as: 'keywordRanks' });
+    GmbProfile.belongsTo(db.User, { foreignKey: 'updatedBy', as: 'updatedByUser' });
+    GmbProfile.hasMany(db.GmbServiceArea, { foreignKey: 'gmbProfileId', as: 'serviceAreas' });
   };
 
   GmbProfile.ensureSchema = () => ensureColumns(GmbProfile);

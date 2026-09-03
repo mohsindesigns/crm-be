@@ -82,6 +82,14 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.BOOLEAN,
       defaultValue: false,
     },
+    // When true, calculatePayrollItems never deducts pay for this worker's
+    // unpaid absences or half-days, regardless of the per-run deductAbsences
+    // flag — an always-on, per-employee exemption HR sets once rather than
+    // remembering to flip a run-level toggle every month.
+    noAttendanceDeduction: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
     currency: {
       type: DataTypes.STRING(10),
       defaultValue: 'PKR',

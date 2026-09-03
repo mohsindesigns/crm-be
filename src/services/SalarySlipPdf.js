@@ -18,10 +18,15 @@
  *   │ rows…             │ rows…                    │ zebra striped
  *   │ Gross Earnings    │ Total Deductions         │ grey total band
  *   ├──────────────────────────────────────────────┤
- *   │  31     20     8      2      1               │ 5-cell attendance
+ *   │  31   20   8   1   1   1                      │ 6-cell attendance
  *   ├──────────────────────────────────────────────┤
  *   │ NET SALARY PAYABLE            Rs 121,419     │ navy band
  *   │ Amount in words: …                           │
+ *   ├──────────────────────────────────────────────┤
+ *   │ PAYMENT SPLIT (only if beneficiaries exist)   │ recipient rows
+ *   │ Self …                            Rs 91,419   │
+ *   │ Wife (Jane Doe) …                 Rs 30,000   │
+ *   ├──────────────────────────────────────────────┤
  *   │                        ____________________  │
  *   │                        Authorized Signatory  │
  *   └──────────────────────────────────────────────┘
@@ -205,15 +210,16 @@ function drawSalarySlip(doc, d) {
     y += boxH;
   }
 
-  // ── Attendance strip — five evenly spaced figures ─────────────────────────
+  // ── Attendance strip — six evenly spaced figures ──────────────────────────
   rule(y);
   const attH = 46;
   const cells = [
     [d.daysInMonth, 'Days in Month'],
     [d.daysPresent, 'Days Present'],
-    [d.holidays, 'Holidays'],
     [d.paidLeaveDays, 'Paid Leave'],
-    [d.unpaidLeaveDays, 'Unpaid Leave'],
+    [d.absentDays, 'Absent'],
+    [d.holidays, 'Holidays'],
+    [d.weekends, 'Weekends'],
   ];
   const cellW = inner / cells.length;
   cells.forEach(([n, label], i) => {
@@ -243,6 +249,28 @@ function drawSalarySlip(doc, d) {
   y += wordsH;
   rule(y);
 
+  // ── Payment split — only when net pay is disbursed across more than the
+  // worker's own account (SalaryBeneficiary rows configured for them). Shows
+  // exactly who got what, same amounts as the internal disbursement sheet —
+  // see SalarySlipService for why this can be a live estimate pre-lock.
+  if (Array.isArray(d.paymentSplit) && d.paymentSplit.length > 1) {
+    const splitRowH = 15;
+    const splitHeadH = 16;
+    const splitH = splitHeadH + splitRowH * d.paymentSplit.length + 6;
+    doc.rect(left, y, width, splitH).fill(BAND2);
+    rule(y, left, width, LINE);
+    text('PAYMENT SPLIT — a payment advice for each recipient below follows on its own page', PAD, y + 6, { size: 7.5, bold: true, color: MUTED, characterSpacing: 0.4 });
+    let sy = y + splitHeadH + 4;
+    d.paymentSplit.forEach((line) => {
+      const label = line.relation && line.relation !== 'Self' ? `${line.name} (${line.relation})` : line.name;
+      text(label, PAD, sy, { size: 8.5 });
+      rightText(money(line.amount), width - PAD, sy, { size: 8.5, bold: true });
+      sy += splitRowH;
+    });
+    y += splitH;
+    rule(y);
+  }
+
   // ── Signature + footer ────────────────────────────────────────────────────
   y += 46;
   const sigW = 190;
@@ -261,4 +289,109 @@ function drawSalarySlip(doc, d) {
   text(foot, (width - doc.widthOfString(foot)) / 2, y, { size: 7.5, color: MUTED });
 }
 
-module.exports = { drawSalarySlip, numberToWords };
+/**
+ * Payment advice for one salary-split beneficiary — NOT a duplicate payslip.
+ * A beneficiary (e.g. a spouse or parent an employee splits their pay with)
+ * isn't a separate employee: they have no gross salary, no attendance, and no
+ * tax liability of their own — that all belongs to the employee whose income
+ * this is a portion of. Printing a full earnings/tax breakdown in their name
+ * would misrepresent income that was never theirs, so this is deliberately a
+ * plain remittance confirmation: who, how much, on whose behalf, paid where.
+ *
+ * @param {object} doc PDFKit document — same page (margin 0) as drawSalarySlip
+ * @param {object} d   { companyName, companyTagline, payPeriod, employeeName,
+ *                        recipientName, relation, amount, bankAccount,
+ *                        paymentDate }
+ */
+function drawPaymentAdvice(doc, d) {
+  const left = 0;
+  const width = doc.page.width;
+  const inner = width - PAD * 2;
+  let y = 0;
+
+  const text = (str, x, ty, opts = {}) => {
+    doc.font(opts.bold ? 'Helvetica-Bold' : 'Helvetica')
+      .fontSize(opts.size || 10)
+      .fillColor(opts.color || INK)
+      .text(String(str ?? ''), x, ty, { lineBreak: false, ...opts });
+  };
+  const rightText = (str, rightX, ty, opts = {}) => {
+    const f = opts.bold ? 'Helvetica-Bold' : 'Helvetica';
+    doc.font(f).fontSize(opts.size || 10);
+    const w = doc.widthOfString(String(str ?? ''));
+    text(str, rightX - w, ty, opts);
+  };
+  const rule = (ty, x1 = PAD, x2 = width - PAD, color = LINE, dash = false) => {
+    doc.save().moveTo(x1, ty).lineTo(x2, ty).lineWidth(0.7).strokeColor(color);
+    if (dash) doc.dash(1, { space: 2 });
+    doc.stroke().undash().restore();
+  };
+
+  // ── Header band ───────────────────────────────────────────────────────────
+  const headH = 64;
+  doc.rect(left, y, width, headH).fill(NAVY);
+  text(d.companyName || 'Company', PAD, y + 17, { size: 17, bold: true, color: WHITE });
+  if (d.companyTagline) text(d.companyTagline, PAD, y + 40, { size: 8.5, color: '#c9d3e8' });
+  rightText('PAYMENT ADVICE', width - PAD, y + 18, { size: 10.5, bold: true, color: WHITE, characterSpacing: 1.6 });
+  rightText(`Pay Period: ${d.payPeriod || '—'}`, width - PAD, y + 36, { size: 8.5, color: '#c9d3e8' });
+  y += headH;
+
+  y += 16;
+  text(
+    `Confirms a portion of ${d.employeeName || 'the employee'}'s net salary for this period, `
+    + 'disbursed directly to the recipient below per the salary-split arrangement on file.',
+    PAD, y, { size: 8.5, color: MUTED, width: inner, lineBreak: true },
+  );
+  y += 26;
+  rule(y);
+
+  // ── Meta grid — two columns, dotted rule under each row ───────────────────
+  const metaRows = [
+    ['Recipient', d.recipientName, 'Relation to Employee', d.relation || '—'],
+    ['On Behalf Of', d.employeeName, 'Bank Account', d.bankAccount],
+    ['Payment Date', d.paymentDate, 'Pay Period', d.payPeriod],
+  ];
+  const colGap = 32;
+  const colW = (inner - colGap) / 2;
+  y += 12;
+  for (const [k1, v1, k2, v2] of metaRows) {
+    const rowH = 18;
+    const pairs = [[k1, v1, PAD, PAD + colW], [k2, v2, PAD + colW + colGap, width - PAD]];
+    for (const [k, v, x, rightX] of pairs) {
+      text(k, x, y + 4, { size: 9, color: MUTED });
+      rightText(v || '—', rightX, y + 4, { size: 9, bold: true });
+    }
+    y += rowH;
+    rule(y - 3, PAD, PAD + colW, LINE, true);
+    rule(y - 3, PAD + colW + colGap, width - PAD, LINE, true);
+  }
+  y += 20;
+
+  // ── Amount payable ───────────────────────────────────────────────────────
+  const netH = 46;
+  doc.rect(left, y, width, netH).fill(NAVY);
+  text('AMOUNT PAYABLE', PAD, y + 18, { size: 10.5, bold: true, color: WHITE, characterSpacing: 1.1 });
+  rightText(money(d.amount), width - PAD, y + 13, { size: 17, bold: true, color: WHITE });
+  y += netH;
+
+  const wordsH = 26;
+  text('Amount in words:', PAD, y + 9, { size: 8.5, color: MUTED });
+  doc.font('Helvetica').fontSize(8.5);
+  const lead = doc.widthOfString('Amount in words: ');
+  text(`${numberToWords(d.amount)} Rupees Only`, PAD + lead, y + 9, { size: 8.5, bold: true });
+  y += wordsH;
+  rule(y);
+
+  y += 20;
+  doc.font('Helvetica').fontSize(7.5);
+  const note = 'This is a payment advice, not a payslip — it carries no earnings, tax, or attendance figures of its own. '
+    + `Those all belong to ${d.employeeName || 'the employee'}'s own salary slip.`;
+  text(note, PAD, y, { size: 7.5, color: MUTED, width: inner, lineBreak: true });
+  y += 24;
+
+  doc.font('Helvetica').fontSize(7.5);
+  const foot = 'This is a system-generated payment advice.';
+  text(foot, (width - doc.widthOfString(foot)) / 2, y, { size: 7.5, color: MUTED });
+}
+
+module.exports = { drawSalarySlip, drawPaymentAdvice, numberToWords };

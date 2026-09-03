@@ -36,11 +36,11 @@ module.exports = (sequelize, DataTypes) => {
       allowNull: false,
       defaultValue: true,
     },
-    // Per-run switch: whether unpaid absences (marked + unmarked) reduce pay
-    // this month. Attendance-detected absentDays is still recorded either way —
-    // this only zeroes its contribution to unpaidAbsentDays in calculate.
-    // Half-day and late-penalty deductions are unaffected by this flag.
-    deductAbsences: {
+    // Per-run switch: whether unpaid absence, half-day, and late-penalty days
+    // reduce pay this month. Attendance is still recorded/shown either way —
+    // this only zeroes their contribution to unpaidAbsentDays in calculate.
+    // Overridable per employee — see PayrollItem.deductAttendanceOverride.
+    deductAttendance: {
       type: DataTypes.BOOLEAN,
       allowNull: false,
       defaultValue: true,

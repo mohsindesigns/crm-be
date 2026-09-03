@@ -148,6 +148,14 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.JSON,
       defaultValue: [],
     },
+    // Per-employee, per-run override of PayrollRun.deductAttendance — set from
+    // the Actions column on the Payroll Items table. null (the default) means
+    // "follow the run's toggle"; true/false pins this one worker for this run
+    // only, regardless of what the run-level toggle is set to. Preserved
+    // across recalculation — see HrService#calculatePayrollItems.
+    deductAttendanceOverride: {
+      type: DataTypes.BOOLEAN,
+    },
   }, {
     tableName: 'payroll_items',
   });

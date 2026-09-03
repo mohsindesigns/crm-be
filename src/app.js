@@ -347,10 +347,8 @@ app.schemaReady = (async () => {
     await db.Artifact.ensureSchema();   // adds taskId/taskEventId — depends on tasks
     await db.Notification.ensureSchema(); // widens refId to fit composite task deep-link refs
     await db.Backlink.ensureSchema();   // widens `linkType` ENUM + adds date/domain/status/spamScore
-    await db.GmbProfile.ensureSchema();      // new table; GMB Profile page — depends on projects
-    await db.GmbPhoneNumber.ensureSchema();  // new table; depends on gmb_profiles
-    await db.GmbAddress.ensureSchema();      // new table; depends on gmb_profiles
-    await db.GmbKeywordRank.ensureSchema();  // new table; ranking history for GmbProfile.keywordsRanking — depends on gmb_profiles
+    await db.GmbProfile.ensureSchema();      // GMB Profile page — depends on projects; adds name/address/contactNumber/primaryCategory/services/status/updatedBy
+    await db.GmbServiceArea.ensureSchema();  // new table; depends on gmb_profiles
     await db.ContentSubmission.ensureSchema(); // adds wordCount
     await db.BlogTask.ensureSchema();          // adds sheet columns + approval workflow fields + taskId link — depends on tasks
     await db.DocumentTemplate.ensureSchema();  // new table; Quotes & Agreements module
