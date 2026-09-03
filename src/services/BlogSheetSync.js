@@ -132,7 +132,9 @@ async function ensureSheetRowForTask(task, actorUserId = null, transaction = nul
 async function syncFromTask(task, {
   actorUserId = null, taskStatus = null, note = null, transaction = null,
 } = {}) {
-  if (!task || task.type !== 'blog_post') return null;
+  if (!task) return null;
+  if (task.type === 'blog_image') return syncDesignFromTask(task, transaction);
+  if (task.type !== 'blog_post') return null;
   const bt = await ensureSheetRowForTask(task, actorUserId, transaction);
   if (!bt) return null;
 
@@ -164,6 +166,39 @@ async function syncFromTask(task, {
   }
 
   if (Object.keys(patch).length) await bt.update(patch, { transaction });
+  return bt;
+}
+
+/**
+ * Design counterpart to syncFromTask above: mirrors the designer's latest
+ * deliverable onto BlogTask.designFileUrl/designFileName whenever a file is
+ * attached and submitted from the Task Detail page's own Deliverable panel,
+ * same "second fully-supported path" reasoning as the writer's copy — without
+ * this, a design submitted there never reached the Blogs tab's Design File
+ * column (only SeoService#submitBlogDesign's own sheet-card path did).
+ *
+ * Unlike the writer's half, this never touches `status` — the row's approve/
+ * reject lifecycle belongs to the copy, not the illustration, and a
+ * blog_image Task is never an orphan (ensureBlogImageTask always sets
+ * pageName and only ever creates one once the row is already 'approved'), so
+ * there's no ensure-row-exists step here either.
+ */
+async function syncDesignFromTask(task, transaction = null) {
+  const title = sheetTitleForTask(task);
+  if (!title) return null;
+
+  const rows = await db.BlogTask.findAll({
+    where: { projectId: task.projectId, title },
+    order: [['createdAt', 'DESC']],
+    transaction,
+  });
+  const bt = rows.find((r) => r.assignedDesignerId === task.assigneeId) || rows[0] || null;
+  if (!bt) return null;
+
+  const deliverable = await latestDeliverable(task.id, transaction);
+  if (deliverable && deliverable.fileUrl && deliverable.fileUrl !== bt.designFileUrl) {
+    await bt.update({ designFileUrl: deliverable.fileUrl, designFileName: deliverable.fileName || null }, { transaction });
+  }
   return bt;
 }
 

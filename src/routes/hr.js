@@ -551,6 +551,30 @@ router.post('/workers/:id/generate-document', rbac('hr.manage'), async (req, res
   } catch (e) { next(e); }
 });
 
+// Tax certificate — one row per payroll month in [from, to] ('YYYY-MM',
+// inclusive). Not persisted as an HrDocument like generate-document above:
+// unlike a letter, this always reflects live payroll data for whatever range
+// is picked, so there's no single "as issued" version to keep on file.
+router.get('/workers/:id/tax-certificate', rbac('hr.read'), async (req, res, next) => {
+  try {
+    const TaxCertificateService = require('../services/TaxCertificateService');
+    const { from, to, format = 'pdf' } = req.query;
+    if (!from || !to) return res.status(400).json({ message: 'from and to (YYYY-MM) are required.' });
+    if (format === 'csv') {
+      const { rows } = await TaxCertificateService.getTaxCertificateData(req.params.id, req.orgId, { from, to });
+      const csv = TaxCertificateService.generateTaxCertificateCsv(rows);
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="tax-certificate-${from}-to-${to}.csv"`);
+      res.send(csv);
+    } else {
+      const { buffer } = await TaxCertificateService.generateTaxCertificatePdf(req.params.id, req.orgId, { from, to });
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="tax-certificate-${from}-to-${to}.pdf"`);
+      res.send(buffer);
+    }
+  } catch (e) { next(e); }
+});
+
 // ─── Self-service (any authenticated user with a worker profile) ──────────────
 
 // Persist profile photo immediately after capture/upload (no full-form submit needed)

@@ -40,7 +40,7 @@ const safeDate = (v) => (v && v !== 'Invalid date' ? v : null);
 const DATE_FIELDS = ['joiningDate', 'leavingDate', 'probationEndDate', 'confirmationDate', 'dateOfBirth'];
 const NUMERIC_FIELDS = ['salaryBase', 'medicalAllowance'];
 const TEXT_FIELDS = [
-  'designation', 'department', 'profilePictureUrl', 'cnic', 'address', 'emergencyContact',
+  'designation', 'department', 'profilePictureUrl', 'cnic', 'cprNumber', 'address', 'emergencyContact',
   'emergencyPhone', 'bankName', 'bankBranchName', 'bankBranchCity',
   'bankAccountTitle', 'bankAccountNumber', 'iban', 'currency',
   'payModel', 'workerType', 'status',
@@ -2325,10 +2325,19 @@ async function createPayrollRun(period, orgId, createdBy, { workingDaysPerMonth,
 async function updatePayrollRun(id, orgId, updates = {}) {
   const run = await PayrollRun.findOne({ where: { id, orgId } });
   if (!run) throw Object.assign(new Error('Payroll run not found'), { status: 404 });
-  if (!['draft', 'open_for_review'].includes(run.status)) {
+
+  const patch = {};
+  // The tax deposit (and so the CPR receipt number for it) typically happens
+  // AFTER the run is locked/paid, so this is the one field on a payroll run
+  // that stays editable no matter the status — see PayrollRun.cprNumber.
+  if ('cprNumber' in updates) {
+    patch.cprNumber = updates.cprNumber ? String(updates.cprNumber).trim() : null;
+  }
+
+  const otherFieldsRequested = updates.workingDaysPerMonth != null || updates.includeOvertime != null || updates.deductAttendance != null;
+  if (otherFieldsRequested && !['draft', 'open_for_review'].includes(run.status)) {
     throw Object.assign(new Error('Working days can only be changed while the run is draft or open for review.'), { status: 400 });
   }
-  const patch = {};
   if (updates.workingDaysPerMonth != null && updates.workingDaysPerMonth !== '') {
     patch.workingDaysPerMonth = normalizeWorkingDays(updates.workingDaysPerMonth);
   }
@@ -2833,7 +2842,7 @@ async function advancePayrollStatus(id, status, orgId) {
     await freezeDisbursementSplits(id, orgId);
   }
 
-  await run.update({ status });
+  await run.update({ status, ...(status === 'paid' && !run.paidAt ? { paidAt: new Date() } : {}) });
 
   // Notify active employees when payroll opens for review
   if (status === 'open_for_review') {

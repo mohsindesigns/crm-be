@@ -49,6 +49,26 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.CHAR(36),
       references: { model: 'users', key: 'id' },
     },
+    // Set once, in advancePayrollStatus, the moment the run first transitions
+    // to 'paid' — the real-world disbursement date, used as "Payment Date" on
+    // the Tax Certificate (see HrService#generateTaxCertificate). Nothing
+    // else in this app tracked this before; SalarySlipService's own
+    // "Payment Date" field is a separate, cruder fallback (today's date, the
+    // slip's print date) for a run that hasn't reached 'paid' yet.
+    paidAt: {
+      type: DataTypes.DATE,
+    },
+    // This month's Computerized Payment Receipt number — the tax authority's
+    // receipt for depositing the tax withheld across this whole run, entered
+    // by HR once that deposit is actually made. That typically happens after
+    // the run is locked/paid, so unlike workingDaysPerMonth/includeOvertime/
+    // deductAttendance this is editable regardless of run status — see
+    // HrService#updatePayrollRun. Free text, no format validation ("we just
+    // save it there"). Printed as "CPR No" on the Tax Certificate — see
+    // TaxCertificateService.
+    cprNumber: {
+      type: DataTypes.STRING(100),
+    },
   }, {
     tableName: 'payroll_runs',
     indexes: [

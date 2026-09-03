@@ -115,6 +115,12 @@ module.exports = (sequelize, DataTypes) => {
     cnic: {
       type: DataTypes.STRING(20),
     },
+    // Free-text identifier used on the Tax Certificate (see
+    // HrService#generateTaxCertificate) — unlike cnic, this has no format
+    // validation; HR just enters and saves whatever the org uses.
+    cprNumber: {
+      type: DataTypes.STRING(50),
+    },
     address: {
       type: DataTypes.TEXT,
     },
