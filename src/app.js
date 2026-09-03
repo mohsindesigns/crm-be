@@ -20,6 +20,7 @@ const notificationsRouter = require('./routes/notifications');
 const adminRouter = require('./routes/admin');
 const mediaRouter = require('./routes/media');
 const seoRouter = require('./routes/seo');
+const gmbRouter = require('./routes/gmb');
 const hrRouter = require('./routes/hr');
 const analyticsRouter = require('./routes/analytics');
 const reportsRouter = require('./routes/reports');
@@ -136,6 +137,7 @@ app.use('/api/notifications', notificationsRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api/media', mediaRouter);
 app.use('/api/seo', seoRouter);
+app.use('/api/gmb', gmbRouter);
 app.use('/api/hr', hrRouter);
 app.use('/api/analytics', analyticsRouter);
 app.use('/api/reports', reportsRouter);
@@ -345,6 +347,10 @@ app.schemaReady = (async () => {
     await db.Artifact.ensureSchema();   // adds taskId/taskEventId — depends on tasks
     await db.Notification.ensureSchema(); // widens refId to fit composite task deep-link refs
     await db.Backlink.ensureSchema();   // widens `linkType` ENUM + adds date/domain/status/spamScore
+    await db.GmbProfile.ensureSchema();      // new table; GMB Profile page — depends on projects
+    await db.GmbPhoneNumber.ensureSchema();  // new table; depends on gmb_profiles
+    await db.GmbAddress.ensureSchema();      // new table; depends on gmb_profiles
+    await db.GmbKeywordRank.ensureSchema();  // new table; ranking history for GmbProfile.keywordsRanking — depends on gmb_profiles
     await db.ContentSubmission.ensureSchema(); // adds wordCount
     await db.BlogTask.ensureSchema();          // adds sheet columns + approval workflow fields + taskId link — depends on tasks
     await db.DocumentTemplate.ensureSchema();  // new table; Quotes & Agreements module

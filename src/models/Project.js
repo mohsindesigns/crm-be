@@ -90,6 +90,7 @@ module.exports = (sequelize, DataTypes) => {
     Project.hasMany(db.ProjectCycle, { foreignKey: 'projectId', as: 'cycles' });
     Project.hasMany(db.Keyword, { foreignKey: 'projectId', as: 'keywords' });
     Project.hasMany(db.Backlink, { foreignKey: 'projectId', as: 'backlinks' });
+    Project.hasOne(db.GmbProfile, { foreignKey: 'projectId', as: 'gmbProfile' });
     Project.hasMany(db.BlogTask, { foreignKey: 'projectId', as: 'blogs' });
     Project.hasMany(db.RecurringTaskRule, { foreignKey: 'projectId', as: 'recurringTaskRules' });
   };

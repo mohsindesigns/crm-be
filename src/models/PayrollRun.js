@@ -36,6 +36,15 @@ module.exports = (sequelize, DataTypes) => {
       allowNull: false,
       defaultValue: true,
     },
+    // Per-run switch: whether unpaid absences (marked + unmarked) reduce pay
+    // this month. Attendance-detected absentDays is still recorded either way —
+    // this only zeroes its contribution to unpaidAbsentDays in calculate.
+    // Half-day and late-penalty deductions are unaffected by this flag.
+    deductAbsences: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: true,
+    },
     createdBy: {
       type: DataTypes.CHAR(36),
       references: { model: 'users', key: 'id' },

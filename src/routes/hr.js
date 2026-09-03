@@ -355,9 +355,9 @@ router.get('/payroll', rbac('hr.read'), async (req, res, next) => {
 
 router.post('/payroll', rbac('hr.manage'), async (req, res, next) => {
   try {
-    const { period, workingDaysPerMonth, includeOvertime } = req.body;
+    const { period, workingDaysPerMonth, includeOvertime, deductAbsences } = req.body;
     if (!period) return res.status(400).json({ error: 'period is required (YYYY-MM)' });
-    res.status(201).json(await HrService.createPayrollRun(period, req.orgId, req.user.id, { workingDaysPerMonth, includeOvertime }));
+    res.status(201).json(await HrService.createPayrollRun(period, req.orgId, req.user.id, { workingDaysPerMonth, includeOvertime, deductAbsences }));
   } catch (e) { next(e); }
 });
 

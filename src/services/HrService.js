@@ -2296,7 +2296,7 @@ function normalizeWorkingDays(value, fallback = 26) {
   return n;
 }
 
-async function createPayrollRun(period, orgId, createdBy, { workingDaysPerMonth, includeOvertime } = {}) {
+async function createPayrollRun(period, orgId, createdBy, { workingDaysPerMonth, includeOvertime, deductAbsences } = {}) {
   const existing = await PayrollRun.findOne({ where: { orgId, period } });
   if (existing) throw Object.assign(new Error(`Payroll run for ${period} already exists`), { status: 409 });
   const settings = await getOrCreatePayrollSettings(orgId);
@@ -2307,6 +2307,7 @@ async function createPayrollRun(period, orgId, createdBy, { workingDaysPerMonth,
   return PayrollRun.create({
     orgId, period, createdBy, workingDaysPerMonth: wdpm,
     includeOvertime: includeOvertime !== false,
+    deductAbsences: deductAbsences !== false,
   });
 }
 
@@ -2322,6 +2323,9 @@ async function updatePayrollRun(id, orgId, updates = {}) {
   }
   if (updates.includeOvertime != null) {
     patch.includeOvertime = !!updates.includeOvertime;
+  }
+  if (updates.deductAbsences != null) {
+    patch.deductAbsences = !!updates.deductAbsences;
   }
   if (Object.keys(patch).length === 0) {
     throw Object.assign(new Error('No valid fields to update.'), { status: 400 });
@@ -2505,7 +2509,7 @@ async function calculatePayrollItems(runId, orgId, { workingDaysPerMonth } = {})
     const markedAbsent = attendances.filter((a) => a.status === 'absent').length;
     const leaveDays = attendances.filter((a) => a.status === 'leave').length;
     const halfDays = attendances.filter((a) => a.status === 'half_day').length;
-    const holidayDays = attendances.filter((a) => a.status === 'holiday').length;
+    const holidayDays = attendances.filter((a) => a.status === 'holiday' || a.status === 'weekend').length;
     const markedDates = new Set(attendances.map((a) => String(a.date).slice(0, 10)));
 
     // Any day in this worker's active range with no attendance row at all,
@@ -2544,9 +2548,12 @@ async function calculatePayrollItems(runId, orgId, { workingDaysPerMonth } = {})
     const { unpaidDays: latePenaltyUnpaidDays } = await applyLatePenalty(orgId, worker, run.period, lateCount, latePenaltyDays, settings);
 
     // Section 3-4: paid leave = present (no deduction); unpaid absence and the
-    // unworked half of a half-day reduce pay.
+    // unworked half of a half-day reduce pay. When this run has absence
+    // deduction switched off, absentDays is still recorded/shown but doesn't
+    // reduce payableDays — half-day and late-penalty deductions still apply.
     const unpaidAbsentDays = Math.round(
-      (absentDays + halfDays * halfDayFactor + Number(latePenaltyUnpaidDays || 0)) * 1000,
+      ((run.deductAbsences !== false ? absentDays : 0)
+        + halfDays * halfDayFactor + Number(latePenaltyUnpaidDays || 0)) * 1000,
     ) / 1000;
 
     const { payableDays } = computePayableDays({
