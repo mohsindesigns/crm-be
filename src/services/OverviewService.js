@@ -1122,24 +1122,24 @@ function buildAttention({ finance, delivery, people, approvals, growth }) {
   push('critical', 'Overdue invoices', 'Past their due date and still unpaid', '/invoices?status=overdue',
     finance.overdueInvoiceCount);
   push('critical', 'SLA breached', 'Projects past their stage SLA target', '/projects', delivery.sla.breached);
-  push('critical', 'Overdue projects', 'Delivery date has passed', '/projects', delivery.overdueProjectCount);
+  push('critical', 'Overdue projects', 'Delivery date has passed', '/projects?overdue=true', delivery.overdueProjectCount);
   push('critical', 'Overdue tasks', 'Past due and not finished', '/tasks?view=overdue', delivery.tasks.overdue);
 
   push('warning', 'Pending approvals', 'Waiting on a decision', '/approvals', approvals?.totals?.pending || 0);
   push('warning', 'Leave requests', 'Awaiting approval', '/hr?tab=leaves', people.leave.pending);
-  push('warning', 'Employees under review', 'Registration submitted, not yet onboarded', '/hr',
+  push('warning', 'Employees under review', 'Registration submitted, not yet onboarded', '/hr?status=under_review',
     people.headcount.byStatus.under_review || 0);
   push('warning', 'Contractor invoices', 'Submitted, awaiting review', '/hr?tab=contractor-invoices',
     people.contractorInvoices.submitted || 0);
-  push('warning', 'Unassigned tasks', 'Open with nobody on them', '/tasks?view=all', delivery.tasks.unassigned);
+  push('warning', 'Unassigned tasks', 'Open with nobody on them', '/tasks?view=all&assigneeId=unassigned', delivery.tasks.unassigned);
   push('warning', 'Attendance unmarked', 'Active staff with no attendance today', '/self-service?tab=attendance',
     people.attendanceToday.unmarked);
-  push('warning', 'Blocked projects', 'Marked blocked and not moving', '/projects', delivery.blocked);
+  push('warning', 'Blocked projects', 'Marked blocked and not moving', '/projects?status=blocked', delivery.blocked);
   push('warning', 'SLA at risk', 'Approaching their stage SLA target', '/projects', delivery.sla.atRisk);
 
   push('info', 'Retainers billing soon', 'Auto-invoice within 7 days', '/retainers', finance.retainers.dueSoon.length);
   push('info', 'Projects due this week', 'Delivery date within 7 days', '/projects', delivery.dueSoonProjectCount);
-  push('info', 'New leads', 'Not yet contacted', '/leads', growth.leads.byStatus.new || 0);
+  push('info', 'New leads', 'Not yet contacted', '/leads?status=new', growth.leads.byStatus.new || 0);
   push('info', 'Client requests pending', 'Requirement forms awaiting approval', '/projects',
     growth.clientRequests.pending_approval || 0);
   push('info', 'Probation ending', 'Confirmation due within 30 days', '/hr', people.probationEndingSoon);

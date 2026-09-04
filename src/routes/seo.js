@@ -246,6 +246,16 @@ router.post('/projects/:projectId/backlinks/bulk-deactivate', adminOnly, rbac('p
   } catch (e) { next(e); }
 });
 
+// Credits multiple backlinks to one link builder at once — same permission as
+// editing a single backlink's builder inline (PATCH /backlinks/:id above), not
+// adminOnly like delete/deactivate, since it changes nothing about the link
+// itself.
+router.post('/projects/:projectId/backlinks/bulk-assign', rbac('projects.act'), async (req, res, next) => {
+  try {
+    res.json(await SeoService.bulkAssignBacklinks(req.params.projectId, req.orgId, req.body?.ids, req.body?.assignedWriterId));
+  } catch (e) { next(e); }
+});
+
 router.post('/projects/:projectId/backlinks/import', rbac('projects.act'), upload.single('file'), async (req, res, next) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });

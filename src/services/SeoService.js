@@ -1100,6 +1100,29 @@ async function bulkDeactivateBacklinks(projectId, orgId, ids) {
   return { deactivated: deactivated.length, skipped };
 }
 
+/**
+ * Credits selected backlinks to one link builder in one pass — the bulk
+ * counterpart to editing the "Link builder" cell one row at a time. Unlike
+ * bulk-delete/bulk-deactivate, there's no isIndexed guard: crediting doesn't
+ * touch the live link, so it's safe on indexed rows too.
+ */
+async function bulkAssignBacklinks(projectId, orgId, ids, assignedWriterId) {
+  await assertProjectAccess(projectId, orgId);
+  const idList = Array.isArray(ids) ? [...new Set(ids.filter(Boolean))] : [];
+  if (!idList.length) {
+    throw Object.assign(new Error('No backlink IDs provided.'), { status: 400 });
+  }
+  if (idList.length > 200) {
+    throw Object.assign(new Error('You can change at most 200 backlinks at a time.'), { status: 400 });
+  }
+
+  const [assigned] = await Backlink.update(
+    { assignedWriterId: assignedWriterId || null },
+    { where: { id: idList, projectId } },
+  );
+  return { assigned };
+}
+
 async function bulkDeleteBacklinks(projectId, orgId, ids) {
   await assertProjectAccess(projectId, orgId);
   const idList = Array.isArray(ids) ? [...new Set(ids.filter(Boolean))] : [];
@@ -3032,7 +3055,7 @@ module.exports = {
   listKeywords, createKeyword, bulkImportKeywords, reviewKeywordBatch, updateKeyword, deleteKeyword, clearKeywords, bulkDeleteKeywords, bulkActivateKeywords, bulkDeactivateKeywords,
   addRankSnapshot, listRankings, recordRankings, deleteRankingDate, bulkImportRankings,
   listSupportingKeywordRankings, recordSupportingKeywordRankings, updateSupportingKeyword,
-  listBacklinks, createBacklink, updateBacklink, deleteBacklink, clearBacklinks, bulkDeleteBacklinks, bulkDeactivateBacklinks, bulkImportBacklinks, bulkUpdateBacklinkStatus,
+  listBacklinks, createBacklink, updateBacklink, deleteBacklink, clearBacklinks, bulkDeleteBacklinks, bulkDeactivateBacklinks, bulkAssignBacklinks, bulkImportBacklinks, bulkUpdateBacklinkStatus,
   listContent, createContent, reviewContent, deleteContent, bulkDeleteContent, syncApprovedContentTasks,
   bulkMarkImplemented, reviewImplementation,
   bulkMarkBlogImplemented, reviewBlogImplementation,
