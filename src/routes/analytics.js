@@ -7,6 +7,7 @@ const { isTruthy } = require('../services/SoftDeleteService');
 const rbac = require('../middleware/rbac');
 const AnalyticsService = require('../services/AnalyticsService');
 const SlaService = require('../services/SlaService');
+const OverviewService = require('../services/OverviewService');
 
 router.use(auth, tenancy);
 
@@ -26,6 +27,24 @@ router.get('/waiting-on-me', async (req, res, next) => {
 
 router.get('/business-overview', rbac('admin.access'), async (req, res, next) => {
   try { res.json(await AnalyticsService.getBusinessOverview(req.orgId)); } catch (e) { next(e); }
+});
+
+// ─── Overview page (admin command centre) ─────────────────────────────────────
+
+// One payload for the whole Overview page — money, delivery, people, pipeline,
+// SEO, the approval queue and the recent audit trail. Deliberately a single
+// endpoint rather than a dozen: the page is a snapshot of one moment, and
+// stitching twelve independently-cached responses together would show sections
+// that disagree with each other. See services/OverviewService.js.
+router.get('/overview', rbac('admin.access'), async (req, res, next) => {
+  try { res.json(await OverviewService.getOverview(req.orgId, req.user)); } catch (e) { next(e); }
+});
+
+// Split out because it does network I/O (a ping to the media service) and
+// information_schema reads that have nothing to do with the org's data — a slow
+// or unreachable media host must not delay the business numbers above.
+router.get('/overview/system', rbac('admin.access'), async (req, res, next) => {
+  try { res.json(await OverviewService.getSystemHealth(req.orgId)); } catch (e) { next(e); }
 });
 
 // ─── Analytics (admin only) ───────────────────────────────────────────────────

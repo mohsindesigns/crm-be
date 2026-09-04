@@ -689,6 +689,12 @@ const MODEL_FOR = {
   leave: db.LeaveRequest,
   contractor_invoice: db.ContractorInvoice,
   content_submission: db.ContentSubmission,
+  // Same table as content_submission — the implementation queue is a second
+  // review loop over the *same* ContentSubmission rows, keyed on
+  // `implementationStatus` instead of `status` (see the SOURCES entry). Missing
+  // this entry made every key in SOURCES-but-not-here throw on `.findAll` of
+  // undefined, taking down the whole inbox and its summary badge.
+  content_implementation: db.ContentSubmission,
   blog_task: db.BlogTask,
   keyword_batch: db.KeywordBatch,
   customer_document: db.CustomerDocument,
